@@ -1,8 +1,10 @@
 #include "gtest/gtest.h"
 #include "tiered_cache/tiered_backend.h"
+#include "tiered_cache/vram_cache_tier.h"
 #include "config_helper.h"
 #include <algorithm>
 #include <json/value.h>
+#include <cuda_runtime.h>
 
 static bool parseJsonString(const std::string &json_str, Json::Value &value,
                             std::string *error_msg = nullptr) {
@@ -169,6 +171,143 @@ TEST_F(TieredCacheTest, TieredBackendEdgeCases) {
     // This Put should fail because tier 1 is full.
     ASSERT_FALSE(backend->Put("key3", 1, src3));
     LOG(INFO) << "Test Put to a full tier successfully.";
+}
+
+//
+// Test Fixture for VRAM tests (DRAM + 2 VRAM Tiers)
+//
+class TieredCacheVramTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        google::InitGoogleLogging("TieredBackendVramTest");
+        FLAGS_logtostderr = 1;
+
+        // Check for CUDA device availability before proceeding
+        int deviceCount = 0;
+        cudaError_t err = cudaGetDeviceCount(&deviceCount);
+        if (err != cudaSuccess || deviceCount == 0) {
+            // Don't fail the test, skip it instead
+            GTEST_SKIP() << "Skipping VRAM test: No CUDA devices found or CUDA error: "
+                       << (err == cudaSuccess ? "No devices" : cudaGetErrorString(err));
+        }
+
+        backend = std::make_unique<TieredBackend>();
+
+        // 1. Create a JSON config with DRAM and *two* VRAM tiers.
+        //    VRAM (id: 3) has priority 0 (highest)
+        //    VRAM (id: 4) has priority 1
+        //    DRAM (id: 1) has priority 2
+        const std::string json_config_str = R"({
+            "tiers": [
+                {
+                    "id": 1,
+                    "type": "DRAM",
+                    "capacity": 1024,
+                    "priority": 2
+                },
+                {
+                    "id": 3,
+                    "type": "VRAM",
+                    "capacity": 2048,
+                    "priority": 0,
+                    "gpu_id": 0
+                },
+                {
+                    "id": 4,
+                    "type": "VRAM",
+                    "capacity": 2048,
+                    "priority": 1,
+                    "gpu_id": 1
+                }
+            ]
+        })";
+
+        Json::Value config;
+        ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+        // 2. Initialize the TieredBackend.
+        // This will be a valid test failure if cudaMalloc fails (e.g., OOM).
+        ASSERT_TRUE(backend->Init(config, nullptr));
+    }
+
+    void TearDown() override { google::ShutdownGoogleLogging(); }
+
+    std::unique_ptr<TieredBackend> backend;
+};
+
+// Test case for VRAM Tier operations
+// Covers Put (DRAM->VRAM), Move (VRAM->VRAM), Move (VRAM->DRAM), Get, and Delete.
+TEST_F(TieredCacheVramTest, VramBasicOps) {
+    const std::string key = "vram_key";
+    const std::string value(256, 'v'); // Use 256 bytes of 'v'
+
+    // Source data is on DRAM
+    DataSource src{value.data(), value.size(), MemoryType::DRAM};
+
+    // --- 1. Test Put to VRAM tier (ID 3) ---
+    ASSERT_TRUE(backend->Put(key, 3, src));
+    auto location = backend->FindKey(key);
+    ASSERT_TRUE(location.has_value());
+    ASSERT_EQ(location.value(), 3);
+    LOG(INFO) << "Test Put to VRAM (3) Successfully";
+
+    // --- 2. Test Get from VRAM (ID 3) ---
+    void* data_ptr = nullptr;
+    size_t read_size = 0;
+    ASSERT_TRUE(backend->Get(key, data_ptr, read_size));
+    ASSERT_NE(data_ptr, nullptr);
+    ASSERT_EQ(read_size, value.size());
+
+    // Verify content. Must copy from VRAM (device) to DRAM (host) for checking.
+    std::vector<char> host_buffer(read_size);
+    cudaError_t cpy_err = cudaMemcpy(host_buffer.data(), data_ptr, read_size, cudaMemcpyDeviceToHost);
+    ASSERT_EQ(cpy_err, cudaSuccess) << "Failed to copy data from VRAM 3 to host for verification.";
+
+    ASSERT_EQ(std::string(host_buffer.begin(), host_buffer.end()), value);
+    LOG(INFO) << "Test Get from VRAM (3) Successfully";
+
+    // --- 3. Test MoveData from VRAM (3) to VRAM (4) ---
+    // This relies on the DataCopier change (cudaMemcpyDeviceToDevice)
+    ASSERT_TRUE(backend->MoveData(key, 3, 4));
+    location = backend->FindKey(key);
+    ASSERT_TRUE(location.has_value());
+    ASSERT_EQ(location.value(), 4);
+    LOG(INFO) << "Moved data from VRAM (3) to VRAM (4)";
+
+    // --- 4. Test Get from VRAM (ID 4) ---
+    void* vram4_data_ptr = nullptr;
+    size_t vram4_read_size = 0;
+    ASSERT_TRUE(backend->Get(key, vram4_data_ptr, vram4_read_size));
+    ASSERT_NE(vram4_data_ptr, nullptr);
+    ASSERT_EQ(vram4_read_size, value.size());
+
+    // Verify content again from the new VRAM location
+    std::vector<char> vram4_host_buffer(vram4_read_size);
+    cpy_err = cudaMemcpy(vram4_host_buffer.data(), vram4_data_ptr, vram4_read_size, cudaMemcpyDeviceToHost);
+    ASSERT_EQ(cpy_err, cudaSuccess) << "Failed to copy data from VRAM 4 to host for verification.";
+
+    ASSERT_EQ(std::string(vram4_host_buffer.begin(), vram4_host_buffer.end()), value);
+    LOG(INFO) << "Test Get from VRAM (4) after VRAM-VRAM move Successfully";
+
+    // --- 5. Test MoveData from VRAM (4) to DRAM (1) ---
+    ASSERT_TRUE(backend->MoveData(key, 4, 1));
+    location = backend->FindKey(key);
+    ASSERT_TRUE(location.has_value());
+    ASSERT_EQ(location.value(), 1);
+    LOG(INFO) << "Moved data from VRAM (4) to DRAM (1)";
+
+    // --- 6. Get again, verifying data is now in DRAM tier 1 ---
+    void* moved_data_ptr = nullptr;
+    size_t moved_read_size = 0;
+    ASSERT_TRUE(backend->Get(key, moved_data_ptr, moved_read_size));
+    // Pointer is now to DRAM, so we can cast directly.
+    ASSERT_EQ(std::string(static_cast<char*>(moved_data_ptr), moved_read_size), value);
+    LOG(INFO) << "Test MoveData VRAM->DRAM Successfully";
+
+    // --- 7. Test Delete ---
+    ASSERT_TRUE(backend->Delete(key));
+    ASSERT_FALSE(backend->FindKey(key).has_value());
+    LOG(INFO) << "Test Delete after VRAM->DRAM move Successfully";
 }
 
 }  // namespace mooncake

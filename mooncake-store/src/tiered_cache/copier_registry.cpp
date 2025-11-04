@@ -30,4 +30,9 @@ CopierRegistrar::CopierRegistrar(MemoryType type, CopyFunction to_dram, CopyFunc
     CopierRegistry::GetInstance().RegisterMemoryType(type, std::move(to_dram), std::move(from_dram));
 }
 
+void CopierRegistrar::RegisterDirectPath(MemoryType src, MemoryType dest, CopyFunction func) {
+    // Register the direct path immediately
+    CopierRegistry::GetInstance().RegisterDirectPath(src, dest, std::move(func));
+}
+
 } // namespace mooncake

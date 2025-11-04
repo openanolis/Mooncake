@@ -20,6 +20,7 @@ class TieredBackend;
  */
 enum class MemoryType {
     DRAM,
+    VRAM,
     UNKNOWN
 };
 
@@ -27,6 +28,8 @@ static inline std::string MemoryTypeToString(MemoryType type) {
     switch (type) {
         case MemoryType::DRAM:
             return "DRAM";
+        case MemoryType::VRAM:
+            return "VRAM";
         default:
             return "UNKNOWN";
     }

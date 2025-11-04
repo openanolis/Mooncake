@@ -74,6 +74,7 @@ private:
 class CopierRegistrar {
 public:
     CopierRegistrar(MemoryType type, CopyFunction to_dram, CopyFunction from_dram);
+    void RegisterDirectPath(MemoryType src, MemoryType dest, CopyFunction func);
 };
 
 } // namespace mooncake

@@ -9,7 +9,7 @@ ENV GOROOT=/usr/local/go
 ENV PATH=$GOROOT/bin:$PATH
 
 RUN apt update \
-     && apt install -y unzip wget cmake git sudo \
+     && apt install -y unzip wget cmake git sudo cuda-toolkit-12 \
      && pip install pybind11
 
 # Execute installation in the container

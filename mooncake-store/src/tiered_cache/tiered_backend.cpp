@@ -1,6 +1,7 @@
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/cache_tier.h"
 #include "tiered_cache/dram_cache_tier.h"
+#include "tiered_cache/vram_cache_tier.h"
 
 #include <glog/logging.h>
 #include <fstream>
@@ -16,6 +17,7 @@ auto getTierType = [](const std::string& type) -> MemoryType {
     std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
                    [](unsigned char c){ return std::tolower(c); });
     if (lower_type == "dram") return MemoryType::DRAM;
+    if (lower_type == "vram") return MemoryType::VRAM;
     return MemoryType::UNKNOWN;
 };
 
@@ -58,6 +60,16 @@ bool TieredBackend::Init(Json::Value root, TransferEngine* engine) {
                     tier = std::make_unique<DramCacheTier>(id, capacity, tags, numa_node);
                 } else {
                     tier = std::make_unique<DramCacheTier>(id, capacity, tags);
+                }
+                break;
+            case MemoryType::VRAM:
+                int gpu_id;
+                if (tier_config.isMember("gpu_id")) {
+                    gpu_id = tier_config["gpu_id"].asInt();
+                    tier = std::make_unique<VramCacheTier>(id, capacity, tags, gpu_id);
+                } else {
+                    LOG(ERROR) << "VRAM tier requires gpu_id.";
+                    return false;
                 }
                 break;
             default:

@@ -34,7 +34,7 @@ DataCopierBuilder& DataCopierBuilder::AddDirectPath(MemoryType src_type, MemoryT
 }
 
 std::unique_ptr<DataCopier> DataCopierBuilder::Build() const {
-    const std::vector<MemoryType> all_types = { MemoryType::DRAM };
+    const std::vector<MemoryType> all_types = { MemoryType::DRAM, MemoryType::VRAM };
 
     for (const auto& type : all_types) {
         if (type == MemoryType::DRAM) continue;
