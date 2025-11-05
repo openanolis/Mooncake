@@ -6,7 +6,15 @@
 
 namespace mooncake {
 
+// DRAM <-> DRAM
+bool CopyDramToDram(const DataSource& src, void* dest) {
+    memcpy(dest, src.ptr, src.size);
+    return true;
+}
+
 DataCopierBuilder::DataCopierBuilder() {
+    // Add the default DRAM<->DRAM copier.
+    copy_matrix_[{MemoryType::DRAM, MemoryType::DRAM}] = CopyDramToDram;
 
     // Process all registrations from the global registry.
     const auto& registry = CopierRegistry::GetInstance();

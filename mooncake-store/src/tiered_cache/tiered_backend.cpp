@@ -1,5 +1,6 @@
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/cache_tier.h"
+#include "tiered_cache/dram_cache_tier.h"
 
 #include <glog/logging.h>
 #include <fstream>
@@ -9,6 +10,14 @@
 #include <cctype>
 
 namespace mooncake {
+
+auto getTierType = [](const std::string& type) -> MemoryType {
+    std::string lower_type = type;
+    std::transform(lower_type.begin(), lower_type.end(), lower_type.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    if (lower_type == "dram") return MemoryType::DRAM;
+    return MemoryType::UNKNOWN;
+};
 
 TieredBackend::TieredBackend() = default;
 
@@ -40,6 +49,21 @@ bool TieredBackend::Init(Json::Value root, TransferEngine* engine) {
             }
         }
         std::unique_ptr<CacheTier> tier;
+
+        switch (getTierType(type)) {
+            case MemoryType::DRAM:
+                int numa_node;
+                if (tier_config.isMember("numa")) {
+                    numa_node = tier_config["numa"].asInt();
+                    tier = std::make_unique<DramCacheTier>(id, capacity, tags, numa_node);
+                } else {
+                    tier = std::make_unique<DramCacheTier>(id, capacity, tags);
+                }
+                break;
+            default:
+                LOG(ERROR) << "Unknown tier type in config: " << type;
+                return false;
+        }
 
         if (!tier->Init(this, engine)) {
             LOG(ERROR) << "Failed to initialize tier " << id;
