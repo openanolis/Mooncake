@@ -33,6 +33,7 @@ add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(tiered_cache_test tiered_cache_test.cpp)
+add_store_test(lru_cache_scheduler_test lru_cache_scheduler_test.cpp)
 
 add_subdirectory(e2e)
 
