@@ -101,4 +101,23 @@ struct TensorMetadata {
     int64_t shape[4];
 };
 
+// Global metadata stored once per logical key
+// Contains information about the full tensor
+// Use packed struct to avoid alignment issues
+#pragma pack(push, 1)
+struct GlobalMetadata {
+    int32_t dtype;
+    int32_t ndim;
+    int32_t split_dim;
+    int64_t shape[4];  // Full tensor shape
+};
+#pragma pack(pop)
+
+// Chunk metadata stored per chunk
+// Contains information about a single chunk's position in the split dimension
+struct ChunkMetadata {
+    int64_t start_idx;  // Starting index in split_dim
+    int64_t size;       // Size in split_dim
+};
+
 }  // namespace mooncake

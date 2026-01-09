@@ -7,6 +7,9 @@
 #include "real_client.h"
 
 #include <cstdlib>  // for atexit
+#include <cstring>  // for memcpy
+#include <iomanip>  // for std::setfill, std::setw
+#include <sstream>  // for std::ostringstream
 
 #include "integration_utils.h"
 
@@ -290,10 +293,500 @@ class MooncakeStorePyWrapper {
         }
     }
 
+    // Helper function to get metadata key names
+    std::string get_chunk_meta_key_name(const std::string &base_key, int rank) {
+        return get_tp_key_name(base_key, rank) + "_meta";
+    }
+
+    std::string get_global_meta_key_name(const std::string &base_key) {
+        return base_key + "_global_meta";
+    }
+
+    // Helper function to store chunk and global metadata for TP tensors
+    int store_tensor_tp_metadata(const std::string &logical_key, int put_tp_rank,
+                                  int put_tp_size, int split_dim,
+                                  const TensorMetadata &tensor_meta,
+                                  const int64_t *full_shape,
+                                  const ReplicateConfig &config = ReplicateConfig{}) {
+        // Calculate start_idx and size in split_dim for this chunk
+        int64_t start_idx = 0;
+        int64_t dim_size = full_shape[split_dim];
+        int64_t base = dim_size / put_tp_size;
+        int extra = dim_size % put_tp_size;
+
+        // Calculate cumulative size of previous chunks
+        for (int r = 0; r < put_tp_rank; r++) {
+            int r_extra = (r < extra) ? 1 : 0;
+            start_idx += (base + r_extra);
+        }
+        int64_t chunk_size = tensor_meta.shape[split_dim];
+
+        // Store chunk metadata
+        ChunkMetadata chunk_meta;
+        chunk_meta.start_idx = start_idx;
+        chunk_meta.size = chunk_size;
+
+        std::string chunk_meta_key = get_chunk_meta_key_name(logical_key, put_tp_rank);
+        LOG(INFO) << "PUT chunk_meta: put_tp_rank=" << put_tp_rank 
+                  << ", key=" << chunk_meta_key 
+                  << ", size=" << sizeof(ChunkMetadata);
+        int ret;
+        {
+            py::gil_scoped_release release_gil;
+            ret = store_->put(
+                chunk_meta_key, 
+                std::span<const char>(
+                    reinterpret_cast<const char*>(&chunk_meta),
+                    sizeof(ChunkMetadata)),
+                config);
+        }
+        LOG(INFO) << "PUT chunk_meta: put returned=" << ret << " for key=" << chunk_meta_key;
+        if (ret != 0) {
+            LOG(ERROR) << "Failed to store chunk metadata for rank " << put_tp_rank;
+            return ret;
+        }
+
+        // Store global metadata (only once, when rank 0 writes)
+        if (put_tp_rank == 0) {
+            LOG(INFO) << "PUT global_meta: put_tp_rank=0, storing global metadata for logical_key=" << logical_key;
+            GlobalMetadata global_meta;
+            global_meta.dtype = tensor_meta.dtype;
+            global_meta.ndim = tensor_meta.ndim;
+            global_meta.split_dim = split_dim;
+            for (int i = 0; i < 4; i++) {
+                global_meta.shape[i] = full_shape[i];
+            }
+
+            std::string global_meta_key = get_global_meta_key_name(logical_key);
+            LOG(INFO) << "PUT global_meta: generated key=" << global_meta_key;
+            
+            // Allocate buffer and copy global_meta to it
+            size_t buffer_size = sizeof(GlobalMetadata);
+            char *buffer = new char[buffer_size];
+            memcpy(buffer, &global_meta, buffer_size);
+            
+            // Log the buffer contents
+            LOG(INFO) << "PUT global_meta: key=" << global_meta_key;
+            LOG(INFO) << "PUT global_meta: dtype=" << global_meta.dtype
+                      << ", ndim=" << global_meta.ndim
+                      << ", split_dim=" << global_meta.split_dim
+                      << ", shape=[" << global_meta.shape[0] << "," 
+                      << global_meta.shape[1] << "," 
+                      << global_meta.shape[2] << "," 
+                      << global_meta.shape[3] << "]";
+            LOG(INFO) << "PUT global_meta: sizeof(GlobalMetadata)=" << buffer_size;
+            LOG(INFO) << "PUT global_meta: buffer raw bytes (first 16, hex): "
+                      << std::hex
+                      << *(reinterpret_cast<uint32_t*>(buffer)) << " "
+                      << *(reinterpret_cast<uint32_t*>(buffer + 4)) << " "
+                      << *(reinterpret_cast<uint32_t*>(buffer + 8)) << " "
+                      << *(reinterpret_cast<uint32_t*>(buffer + 12)) << std::dec;
+            
+            // Log all bytes in the buffer
+            std::ostringstream hex_stream;
+            hex_stream << "PUT global_meta: buffer contents (all " << buffer_size << " bytes, hex): ";
+            for (size_t i = 0; i < buffer_size; i++) {
+                if (i > 0 && i % 16 == 0) {
+                    hex_stream << "\nPUT global_meta:   ";
+                }
+                hex_stream << std::hex << std::setfill('0') << std::setw(2) 
+                          << (static_cast<unsigned char>(buffer[i]) & 0xFF) << " ";
+            }
+            hex_stream << std::dec;
+            LOG(INFO) << hex_stream.str();
+            
+            {
+                py::gil_scoped_release release_gil;
+                // Use the buffer for put operation
+                LOG(INFO) << "PUT global_meta: calling store_->put with key=" << global_meta_key
+                          << ", buffer_size=" << buffer_size;
+                ret = store_->put(
+                    global_meta_key,
+                    std::span<const char>(buffer, buffer_size),
+                    config);
+            }
+            
+            // Clean up the buffer
+            delete[] buffer;
+            
+            LOG(INFO) << "PUT global_meta: put returned=" << ret;
+            if (ret != 0) {
+                LOG(ERROR) << "Failed to store global metadata, ret=" << ret;
+                return ret;
+            }
+        }
+
+        return 0;
+    }
+
+    // Put a single tensor chunk
+    int put_tensor_chunk_with_tp(const std::string &logical_key,
+                                 pybind11::object tensor_chunk,
+                                 int put_tp_rank, int put_tp_size = 1,
+                                 int split_dim = 0,
+                                 const ReplicateConfig &config = ReplicateConfig{}) {
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        if (put_tp_size <= 1) {
+            return put_tensor(logical_key, tensor_chunk);
+        }
+        if (put_tp_rank < 0 || put_tp_rank >= put_tp_size) {
+            LOG(ERROR) << "Invalid put_tp_rank: " << put_tp_rank
+                       << ", must be in range [0, " << put_tp_size << ")";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        // Extract tensor info
+        auto info = extract_tensor_info(tensor_chunk, logical_key);
+        if (!info.valid()) {
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        // Calculate full shape
+        int64_t full_shape[4] = {0};
+        for (int i = 0; i < info.metadata.ndim; i++) {
+            if (i == split_dim && split_dim >= 0 &&
+                split_dim < info.metadata.ndim) {
+                full_shape[i] = info.metadata.shape[i] * put_tp_size;
+            } else {
+                full_shape[i] = info.metadata.shape[i];
+            }
+        }
+
+        // Store the chunk data
+        std::string chunk_key = get_tp_key_name(logical_key, put_tp_rank);
+        int ret = put_tensor_impl(chunk_key, tensor_chunk, config);
+        if (ret != 0) {
+            return ret;
+        }
+
+        // Store chunk and global metadata
+        ret = store_tensor_tp_metadata(logical_key, put_tp_rank, put_tp_size,
+                                       split_dim, info.metadata, full_shape,
+                                       config);
+        if (ret != 0) {
+            return ret;
+        }
+
+        return 0;
+    }
+
     pybind11::object get_tensor_with_tp(const std::string &key, int tp_rank = 0,
                                         int tp_size = 1, int split_dim = 0) {
         if (tp_size <= 1) return get_tensor(key);
-        return get_tensor(get_tp_key_name(key, tp_rank));
+
+        // Read global metadata
+        std::string global_meta_key = get_global_meta_key_name(key);
+        LOG(INFO) << "GET global_meta: key=" << global_meta_key;
+        GlobalMetadata global_meta = {};  // Zero-initialize to avoid uninitialized values
+        {
+            py::gil_scoped_release release_gil;
+            int64_t meta_size = store_->getSize(global_meta_key);
+            LOG(INFO) << "GET global_meta: getSize returned=" << meta_size
+                      << ", sizeof(GlobalMetadata)=" << sizeof(GlobalMetadata);
+            if (meta_size <= 0 ||
+                static_cast<size_t>(meta_size) < sizeof(GlobalMetadata)) {
+                LOG(ERROR) << "GET global_meta: size check failed, falling back to direct read";
+                // Fallback: try direct read
+                return get_tensor(get_tp_key_name(key, tp_rank));
+            }
+
+            // Use get_buffer to read the data
+            LOG(INFO) << "GET global_meta: calling store_->get_buffer with key=" << global_meta_key;
+            auto buffer_handle = store_->get_buffer(global_meta_key);
+            if (!buffer_handle || buffer_handle->size() < sizeof(GlobalMetadata)) {
+                LOG(ERROR) << "GET global_meta: get_buffer failed or size too small"
+                          << ", buffer_handle=" << (buffer_handle ? "valid" : "null")
+                          << ", size=" << (buffer_handle ? buffer_handle->size() : 0);
+                return get_tensor(get_tp_key_name(key, tp_rank));
+            }
+            
+            LOG(INFO) << "GET global_meta: get_buffer returned size=" << buffer_handle->size()
+                      << ", expected size=" << sizeof(GlobalMetadata);
+            
+            // Debug: log raw buffer content (byte-by-byte for first 20 bytes)
+            char *buffer = new char[buffer_handle->size()];
+            memcpy(buffer, buffer_handle->ptr(), buffer_handle->size());
+            LOG(INFO) << "GET global_meta: raw buffer first 20 bytes (byte-by-byte, hex):";
+            for (size_t i = 0; i < 44 && i < buffer_handle->size(); i++) {
+                LOG(INFO) << "  [" << i << "] = 0x" << std::hex 
+                          << (static_cast<unsigned char>(buffer[i]) & 0xff) << std::dec;
+            }
+            
+            // put stores raw GlobalMetadata (44 bytes)
+            // get_buffer should return exactly 44 bytes for raw data
+            // Directly read from buffer
+            memcpy(&global_meta, buffer, sizeof(GlobalMetadata));
+            
+            LOG(INFO) << "GET global_meta: raw buffer first 44 bytes (hex, 4-byte chunks):";
+            for (size_t i = 0; i < sizeof(GlobalMetadata) && i < 44; i += 4) {
+                LOG(INFO) << "  offset " << i << ": " << std::hex 
+                          << *(reinterpret_cast<const uint32_t*>(buffer + i)) << std::dec;
+            }
+            LOG(INFO) << "GET global_meta: raw buffer first 16 bytes (dec, 4-byte chunks): "
+                      << *(reinterpret_cast<const int32_t*>(buffer)) << " "
+                      << *(reinterpret_cast<const int32_t*>(buffer + 4)) << " "
+                      << *(reinterpret_cast<const int32_t*>(buffer + 8)) << " "
+                      << *(reinterpret_cast<const int32_t*>(buffer + 12));
+            
+            // Debug: log what we read
+            LOG(INFO) << "GET global_meta: after memcpy: dtype=" << global_meta.dtype
+                      << ", ndim=" << global_meta.ndim
+                      << ", split_dim=" << global_meta.split_dim
+                      << ", shape=[" << global_meta.shape[0] << "," 
+                      << global_meta.shape[1] << "," 
+                      << global_meta.shape[2] << "," 
+                      << global_meta.shape[3] << "]";
+            
+            // buffer_handle is managed by shared_ptr, no need to manually delete
+        }
+
+        // Check split_dim consistency
+	LOG(INFO) << "get tensor: global_meta.split_dim: " << global_meta.split_dim << std::endl;
+        if (split_dim >= 0 && global_meta.split_dim != split_dim) {
+            LOG(ERROR) << "split_dim mismatch: stored=" << global_meta.split_dim
+                       << ", requested=" << split_dim;
+            return pybind11::none();
+        }
+        int actual_split_dim = global_meta.split_dim;
+
+        // Calculate reader range (handling non-divisible case)
+        int64_t dim_size = global_meta.shape[actual_split_dim];
+        int64_t base = dim_size / tp_size;
+        int extra = dim_size % tp_size;
+        int64_t r_size = base + (tp_rank < extra ? 1 : 0);
+        int64_t r_start = base * tp_rank + (tp_rank < extra ? tp_rank : extra);
+        int64_t r_end = r_start + r_size;
+
+        // Fast path: if put_tp_size == get_tp_size, directly read the chunk
+        // Check if the chunk for tp_rank exactly matches the reader's range
+        std::string chunk_meta_key = get_chunk_meta_key_name(key, tp_rank);
+        ChunkMetadata chunk_meta;
+        bool has_chunk_meta = false;
+        {
+            py::gil_scoped_release release_gil;
+            int64_t meta_size = store_->getSize(chunk_meta_key);
+            if (meta_size > 0 &&
+                static_cast<size_t>(meta_size) >= sizeof(ChunkMetadata)) {
+                constexpr size_t STACK_BUFFER_SIZE = 256;
+                char stack_buffer[STACK_BUFFER_SIZE];
+                char *buffer = (static_cast<size_t>(meta_size) <= STACK_BUFFER_SIZE)
+                                   ? stack_buffer
+                                   : new char[meta_size];
+
+                int64_t bytes_read =
+                    store_->get_into(chunk_meta_key, buffer, meta_size);
+                if (bytes_read > 0 &&
+                    static_cast<size_t>(bytes_read) >= sizeof(ChunkMetadata)) {
+                    memcpy(&chunk_meta, buffer, sizeof(ChunkMetadata));
+                    has_chunk_meta = true;
+                }
+
+                if (buffer != stack_buffer) {
+                    delete[] buffer;
+                }
+            }
+        }
+
+        // Fast path: if chunk exactly matches reader's range, put_tp_size == get_tp_size
+        if (has_chunk_meta && chunk_meta.start_idx == r_start &&
+            chunk_meta.size == r_size) {
+            // Direct read: put_tp_size == get_tp_size, no need to reconstruct
+            return get_tensor(get_tp_key_name(key, tp_rank));
+        }
+
+        // Calculate output shape
+        TensorMetadata output_meta;
+        output_meta.dtype = global_meta.dtype;
+        output_meta.ndim = global_meta.ndim;
+        for (int i = 0; i < 4; i++) {
+            if (i < global_meta.ndim) {
+                if (i == actual_split_dim) {
+                    output_meta.shape[i] = r_size;
+                } else {
+                    output_meta.shape[i] = global_meta.shape[i];
+                }
+            } else {
+                output_meta.shape[i] = -1;
+            }
+        }
+
+        // Calculate output size
+        size_t element_size = 0;
+        switch (global_meta.dtype) {
+            case 0: element_size = sizeof(float); break;
+            case 1: element_size = sizeof(double); break;
+            case 2: case 3: element_size = 1; break;
+            case 4: case 5: element_size = 2; break;
+            case 6: case 7: element_size = 4; break;
+            case 8: case 9: element_size = 8; break;
+            case 10: element_size = 1; break;
+            case 11: case 12: element_size = 2; break;
+            case 13: case 14: element_size = 1; break;
+            default: element_size = 4; break;
+        }
+
+        int64_t output_elements = 1;
+        for (int i = 0; i < global_meta.ndim; i++) {
+            output_elements *= output_meta.shape[i];
+        }
+        int64_t output_size = output_elements * element_size;
+
+        // Allocate output buffer
+        size_t total_buffer_size = sizeof(TensorMetadata) + output_size;
+        char *output_buffer = new char[total_buffer_size];
+        memcpy(output_buffer, &output_meta, sizeof(TensorMetadata));
+        char *output_data = output_buffer + sizeof(TensorMetadata);
+
+        // Iterate through writer chunks and copy overlapping parts
+        int writer_rank = 0;
+        bool found_any = false;
+
+        while (true) {
+            std::string chunk_key = get_tp_key_name(key, writer_rank);
+            std::string chunk_meta_key = get_chunk_meta_key_name(key, writer_rank);
+
+            // Read chunk metadata
+            ChunkMetadata chunk_meta;
+            bool has_chunk_meta = false;
+            {
+                py::gil_scoped_release release_gil;
+                int64_t meta_size = store_->getSize(chunk_meta_key);
+                if (meta_size > 0 &&
+                    static_cast<size_t>(meta_size) >= sizeof(ChunkMetadata)) {
+                    constexpr size_t STACK_BUFFER_SIZE = 256;
+                    char stack_buffer[STACK_BUFFER_SIZE];
+                    char *buffer = (static_cast<size_t>(meta_size) <= STACK_BUFFER_SIZE)
+                                       ? stack_buffer
+                                       : new char[meta_size];
+
+                    int64_t bytes_read =
+                        store_->get_into(chunk_meta_key, buffer, meta_size);
+                    if (bytes_read > 0 &&
+                        static_cast<size_t>(bytes_read) >= sizeof(ChunkMetadata)) {
+                        memcpy(&chunk_meta, buffer, sizeof(ChunkMetadata));
+                        has_chunk_meta = true;
+                    }
+
+                    if (buffer != stack_buffer) {
+                        delete[] buffer;
+                    }
+                }
+            }
+
+            if (!has_chunk_meta) {
+                break;  // No more chunks
+            }
+
+            int64_t w_start = chunk_meta.start_idx;
+            int64_t w_end = w_start + chunk_meta.size;
+
+            // Calculate intersection
+            int64_t inter_start = std::max(w_start, r_start);
+            int64_t inter_end = std::min(w_end, r_end);
+            if (inter_start >= inter_end) {
+                writer_rank++;
+                continue;  // No overlap
+            }
+
+            // Calculate source and destination offsets
+            int64_t src_start = inter_start - w_start;
+            int64_t dst_start = inter_start - r_start;
+            int64_t dst_end = inter_end - r_start;
+
+            // Copy data slice by slice
+            // For row-major storage, we need to consider all dimensions
+            // Calculate elements before and after split_dim
+            int64_t elements_before = 1;
+            for (int i = 0; i < actual_split_dim; i++) {
+                elements_before *= global_meta.shape[i];
+            }
+            int64_t elements_after = 1;
+            for (int i = actual_split_dim + 1; i < global_meta.ndim; i++) {
+                elements_after *= global_meta.shape[i];
+            }
+
+            // Size of one slice along split_dim (in bytes)
+            // A slice is a combination of all dimensions except split_dim
+            int64_t slice_size_bytes = elements_after * element_size;
+
+            // Calculate stride for split_dim in the chunk and output
+            // For chunk: stride = chunk_size * elements_after * element_size
+            // For output: stride = r_size * elements_after * element_size
+            int64_t chunk_stride_bytes = chunk_meta.size * slice_size_bytes;
+            int64_t output_stride_bytes = r_size * slice_size_bytes;
+
+            // Copy size along split_dim (number of slices to copy)
+            int64_t copy_slices = dst_end - dst_start;
+
+            // Source offset in chunk (skip TensorMetadata)
+            // Storage format: [TensorMetadata (40 bytes)][tensor data]
+            // So we need to add 40 bytes to skip the metadata when reading
+            constexpr size_t chunk_metadata_size = sizeof(TensorMetadata);  // 40 bytes
+
+            if (actual_split_dim == 0) {
+                // split_dim=0: data is contiguous, can use get_buffer_range directly
+                int64_t total_copy_size = copy_slices * slice_size_bytes;
+                // src_offset_bytes: offset from the beginning of the stored object
+                // = metadata_size (40 bytes) + offset in tensor data
+                int64_t src_offset_bytes = chunk_metadata_size + src_start * slice_size_bytes;
+                int64_t dst_offset_bytes = dst_start * slice_size_bytes;
+
+                py::gil_scoped_release release_gil;
+                int64_t bytes_read = store_->get_buffer_range(
+                    chunk_key, output_data, dst_offset_bytes, src_offset_bytes,
+                    total_copy_size);
+                py::gil_scoped_acquire acquire_gil;
+
+                if (bytes_read < 0 || bytes_read != total_copy_size) {
+                    writer_rank++;
+                    continue;
+                }
+            } else {
+                // split_dim > 0: need to copy slice by slice
+                // For each combination of dimensions before split_dim,
+                // copy the overlapping slices along split_dim
+                for (int64_t slice_idx = 0; slice_idx < elements_before; slice_idx++) {
+                    // Calculate offset for this slice in both chunk and output
+                    // src_slice_offset_bytes: offset from the beginning of the stored object
+                    // = metadata_size (40 bytes) + offset in tensor data
+                    int64_t src_slice_offset_bytes = chunk_metadata_size +
+                                                     slice_idx * chunk_stride_bytes +
+                                                     src_start * slice_size_bytes;
+                    int64_t dst_slice_offset_bytes = slice_idx * output_stride_bytes +
+                                                      dst_start * slice_size_bytes;
+                    int64_t copy_size = copy_slices * slice_size_bytes;
+
+                    py::gil_scoped_release release_gil;
+                    int64_t bytes_read = store_->get_buffer_range(
+                        chunk_key, output_data, dst_slice_offset_bytes,
+                        src_slice_offset_bytes, copy_size);
+                    py::gil_scoped_acquire acquire_gil;
+
+                    if (bytes_read < 0 || bytes_read != copy_size) {
+                        writer_rank++;
+                        break;  // Break inner loop, continue to next writer_rank
+                    }
+                }
+            }
+
+            found_any = true;
+            writer_rank++;
+        }
+
+        if (!found_any) {
+            delete[] output_buffer;
+            return pybind11::none();
+        }
+
+        // Convert to tensor
+        pybind11::object result =
+            buffer_to_tensor(nullptr, output_buffer, total_buffer_size);
+        delete[] output_buffer;
+        return result;
     }
 
     pybind11::list batch_get_tensor_with_tp(
@@ -538,9 +1031,10 @@ class MooncakeStorePyWrapper {
 
             for (int rank = 0; rank < tp_size; ++rank) {
                 pybind11::object chunk = chunks[rank].attr("contiguous")();
-                std::string tp_key = get_tp_key_name(key, rank);
-
-                int ret = put_tensor_impl(tp_key, chunk, config);
+                
+                // Call put_tensor_chunk_with_tp for each chunk
+                int ret = put_tensor_chunk_with_tp(key, chunk, rank, tp_size,
+                                                    split_dim, config);
                 if (ret != 0) return ret;
             }
             return 0;
@@ -1117,6 +1611,14 @@ PYBIND11_MODULE(store, m) {
              "tensor parallelism.\n"
              "The tensor is chunked immediately and stored as separate keys "
              "(e.g., key_tp_0).")
+        .def("put_tensor_chunk_with_tp",
+             &MooncakeStorePyWrapper::put_tensor_chunk_with_tp,
+             py::arg("key"), py::arg("tensor_chunk"), py::arg("put_tp_rank"),
+             py::arg("put_tp_size") = 1, py::arg("split_dim") = 0,
+             py::arg("config") = ReplicateConfig{},
+             "Put a single tensor chunk for a specific tp_rank.\n"
+             "This is used when each rank independently writes its own part.\n"
+             "Metadata is stored separately to support flexible reader TP sizes.")
         .def("batch_put_tensor_with_tp",
              &MooncakeStorePyWrapper::batch_put_tensor_with_tp,
              py::arg("base_keys"), py::arg("tensors_list"),
