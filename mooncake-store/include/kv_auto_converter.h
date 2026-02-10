@@ -1,13 +1,14 @@
 // ============================================================================
 // C2C: Cross-model KV Cache converter for Mooncake
 // ============================================================================
-// Based on thu-nics/C2C method for cross-model KV Cache conversion
-// Formula: output = gate * sigmoid(scalar) * projector(source_kv)
-//
-// Transparent to upper-layer frameworks, Mooncake handles internally:
-// 1. Detect model name in key during batch_put_from
-// 2. Match conversion rule and trigger background conversion
-// 3. Auto put converted KV after completion
+// Full C2CProjector architecture (thu-nics/C2C):
+//   h = Linear(src_kv)                           # input proj, NO activation
+//   h = h + w2(GELU(w1(RMSNorm(h))))             # mlp1 blocks
+//   proj = proj_mlp2(h)                           # N blocks RMSNorm+GELU+residual
+//   out = Linear(proj)                            # proj_out -> [tgt_dim]
+//   scalar = sigmoid(scalar_head(scalar_mlp2(h))) # per-head weights
+//   gate = (gate_logit > 0) ? 1.0 : 0.0          # binary gate
+//   output = gate * scalar * out                  # per-head scaled projection
 // ============================================================================
 #pragma once
 
@@ -54,27 +55,47 @@ struct KVConversionRule {
                                  // priority over file)
 
     // =========================================================================
-    // C2C projector parameters (per-layer projector)
+    // C2C projector parameters
     // =========================================================================
     int32_t num_layers{0};
-    int32_t src_dim{0};  // source KV dim (num_heads * head_dim)
-    int32_t tgt_dim{0};  // target KV dim
-    int32_t hidden_dim{0};
+    int32_t src_dim{0};           // source KV dim (num_heads * head_dim)
+    int32_t tgt_dim{0};           // target KV dim
+    int32_t hidden_dim{0};        // projector hidden dim
+    int32_t inter_dim{0};         // MLP intermediate dim (mlp1, proj_mlp2)
+    int32_t scalar_inter_dim{0};  // scalar path intermediate dim
+    int32_t num_kv_heads{0};      // target model KV heads (for scalar broadcast)
+    int32_t head_dim{0};          // target model head dim
+    int32_t num_mlp1_blocks{0};
+    int32_t num_proj_mlp2_blocks{0};
+    int32_t num_scalar_mlp2_blocks{0};
+
+    // RMSNorm + FFN block: norm -> GELU(w1) -> w2 + residual
+    struct MLPBlock {
+        std::vector<float> norm_weight;  // [hidden_dim] RMSNorm
+        std::vector<float> w1_weight;    // [hidden_dim, inter_dim] pre-transposed
+        std::vector<float> w2_weight;    // [inter_dim, hidden_dim] pre-transposed
+    };
 
     struct LayerWeights {
         float key_gate_logit{0.0f};
         float value_gate_logit{0.0f};
-        float key_gate{0.0f};    // sigmoid(key_gate_logit), precomputed
-        float value_gate{0.0f};  // sigmoid(value_gate_logit), precomputed
-        std::vector<float> key_in_weight,
-            key_in_bias;  // [hidden, src] (transposed)
-        std::vector<float> key_mlp1_weight,
-            key_mlp1_bias;  // [hidden, hidden] (transposed)
-        std::vector<float> key_proj_weight,
-            key_proj_bias;  // [tgt, hidden] (transposed)
+
+        // Input projection (NO activation)
+        std::vector<float> key_in_weight, key_in_bias;      // [hidden, src]
         std::vector<float> value_in_weight, value_in_bias;
-        std::vector<float> value_mlp1_weight, value_mlp1_bias;
-        std::vector<float> value_proj_weight, value_proj_bias;
+
+        // MLP1 blocks (shared embedding)
+        std::vector<MLPBlock> key_mlp1, value_mlp1;
+
+        // Projection path: proj_mlp2 blocks + proj_out
+        std::vector<MLPBlock> key_proj_mlp2, value_proj_mlp2;
+        std::vector<float> key_proj_out_weight, key_proj_out_bias;    // [hidden, tgt]
+        std::vector<float> value_proj_out_weight, value_proj_out_bias;
+
+        // Scalar path: scalar_mlp2 blocks + scalar_head
+        std::vector<MLPBlock> key_scalar_mlp2, value_scalar_mlp2;
+        std::vector<float> key_scalar_head_weight, key_scalar_head_bias;    // [hidden, num_heads]
+        std::vector<float> value_scalar_head_weight, value_scalar_head_bias;
     };
     std::vector<LayerWeights> layers;
 
@@ -153,9 +174,9 @@ class KVAutoConverter {
     static std::string url_to_cache_path(const std::string& url);
 
     void c2c_project_layer(const float* src, float* out,
+                           const KVConversionRule& rule,
                            const KVConversionRule::LayerWeights& weights,
-                           bool is_key, int num_tokens, int src_dim,
-                           int tgt_dim, int hidden_dim, float* h1, float* h2);
+                           bool is_key, int num_tokens);
 
     std::unordered_map<std::string, KVModelInfo> models_;
     std::unordered_map<std::string, KVConversionRule> rules_;
