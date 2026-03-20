@@ -109,8 +109,8 @@ class RealClient : public PyClient {
     int64_t get_into(const std::string &key, void *buffer, size_t size);
 
     int64_t get_into_range(const std::string &key, void *buffer,
-                           size_t dst_offset, size_t src_offset, size_t size)
-        override;
+                           size_t dst_offset, size_t src_offset,
+                           size_t size) override;
 
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple

@@ -712,9 +712,9 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 }
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
-                                         const QueryResult& query_result,
-                                         std::vector<Slice>& slices,
-                                         uint64_t src_offset) {
+                                          const QueryResult& query_result,
+                                          std::vector<Slice>& slices,
+                                          uint64_t src_offset) {
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
     if (err != ErrorCode::OK) {
@@ -1039,8 +1039,8 @@ ErrorCode Client::BatchTransferReadRanges(
         LOG(ERROR) << "TransferSubmitter not initialized";
         return ErrorCode::INVALID_PARAMS;
     }
-    auto future =
-        transfer_submitter_->submitBatchReadRanges(dest_buffer, key_ranges);
+    auto future = transfer_submitter_->submitBatchReadRanges(
+        dest_buffer, key_ranges, protocol_ == "rdma");
     if (!future) {
         LOG(ERROR) << "Failed to submit batch read ranges";
         return ErrorCode::TRANSFER_FAIL;
@@ -2236,17 +2236,16 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     return TransferData(replica_descriptor, slices, TransferRequest::READ);
 }
 
-ErrorCode Client::TransferReadRange(const Replica::Descriptor& replica_descriptor,
-                                    std::vector<Slice>& slices,
-                                    uint64_t src_offset) {
+ErrorCode Client::TransferReadRange(
+    const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
+    uint64_t src_offset) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return ErrorCode::INVALID_PARAMS;
     }
 
-    auto future =
-        transfer_submitter_->submitRangeRead(replica_descriptor, slices,
-                                            src_offset);
+    auto future = transfer_submitter_->submitRangeRead(replica_descriptor,
+                                                       slices, src_offset);
     if (!future) {
         LOG(ERROR) << "Failed to submit range read operation";
         return ErrorCode::TRANSFER_FAIL;

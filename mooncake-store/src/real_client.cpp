@@ -1856,8 +1856,8 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
 int64_t RealClient::get_into_range(const std::string &key, void *buffer,
                                    size_t dst_offset, size_t src_offset,
                                    size_t size) {
-    return to_py_ret(get_into_range_internal(key, buffer, dst_offset,
-                                             src_offset, size));
+    return to_py_ret(
+        get_into_range_internal(key, buffer, dst_offset, src_offset, size));
 }
 
 std::string RealClient::get_hostname() const { return local_hostname; }
@@ -2099,11 +2099,9 @@ RealClient::batch_get_into_dummy_helper(
     return batch_get_into_internal(keys, buffers, sizes);
 }
 
-tl::expected<int64_t, ErrorCode>
-RealClient::get_into_range_dummy_helper(const std::string &key,
-                                        uint64_t dummy_buffer,
-                                        size_t dst_offset, size_t src_offset,
-                                        size_t size, const UUID &client_id) {
+tl::expected<int64_t, ErrorCode> RealClient::get_into_range_dummy_helper(
+    const std::string &key, uint64_t dummy_buffer, size_t dst_offset,
+    size_t src_offset, size_t size, const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -2120,9 +2118,9 @@ RealClient::get_into_range_dummy_helper(const std::string &key,
         if (dummy_addr >= shm.dummy_base_addr &&
             dummy_addr + dst_offset + size <=
                 shm.dummy_base_addr + shm.shm_size) {
-            real_buffer = reinterpret_cast<void *>(
-                dummy_addr + shm.shm_addr_offset +
-                static_cast<uint64_t>(dst_offset));
+            real_buffer =
+                reinterpret_cast<void *>(dummy_addr + shm.shm_addr_offset +
+                                         static_cast<uint64_t>(dst_offset));
             found = true;
             break;
         }
