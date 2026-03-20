@@ -108,6 +108,10 @@ class RealClient : public PyClient {
      */
     int64_t get_into(const std::string &key, void *buffer, size_t size);
 
+    int64_t get_into_range(const std::string &key, void *buffer,
+                           size_t dst_offset, size_t src_offset, size_t size)
+        override;
+
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
      * keys (batch version)
@@ -238,6 +242,22 @@ class RealClient : public PyClient {
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys);
 
+    /**
+     * @brief Batch get multiple non-contiguous ranges from multiple keys into
+     * a single buffer.
+     * @param keys Keys (may repeat for multiple ranges from same key)
+     * @param dest_buffer Base pointer of destination buffer
+     * @param dest_offsets Dest offset for each range
+     * @param src_offsets Source offset in object for each range
+     * @param sizes Size in bytes for each range
+     * @return Vector of int64_t: bytes read per range, or negative error code
+     */
+    std::vector<int64_t> batch_get_buffer_ranges(
+        const std::vector<std::string> &keys, void *dest_buffer,
+        const std::vector<size_t> &dest_offsets,
+        const std::vector<size_t> &src_offsets,
+        const std::vector<size_t> &sizes);
+
     int remove(const std::string &key, bool force = false);
 
     long removeByRegex(const std::string &str, bool force = false);
@@ -353,6 +373,10 @@ class RealClient : public PyClient {
         const std::vector<uint64_t> &buffers, const std::vector<size_t> &sizes,
         const UUID &client_id);
 
+    tl::expected<int64_t, ErrorCode> get_into_range_dummy_helper(
+        const std::string &key, uint64_t buffer, size_t dst_offset,
+        size_t src_offset, size_t size, const UUID &client_id);
+
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_dummy_helper(
         const std::vector<std::string> &keys,
         const std::vector<uint64_t> &dummy_buffers,
@@ -407,6 +431,10 @@ class RealClient : public PyClient {
     tl::expected<int64_t, ErrorCode> get_into_internal(const std::string &key,
                                                        void *buffer,
                                                        size_t size);
+
+    tl::expected<int64_t, ErrorCode> get_into_range_internal(
+        const std::string &key, void *buffer, size_t dst_offset,
+        size_t src_offset, size_t size);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,

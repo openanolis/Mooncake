@@ -159,6 +159,15 @@ class PyClient {
     virtual int64_t get_into(const std::string &key, void *buffer,
                              size_t size) = 0;
 
+    /**
+     * Read a range [src_offset, src_offset+size) from key into
+     * (buffer + dst_offset). For zero-copy, buffer must be registered.
+     * @return bytes read on success, negative on error
+     */
+    virtual int64_t get_into_range(const std::string &key, void *buffer,
+                                  size_t dst_offset, size_t src_offset,
+                                  size_t size) = 0;
+
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers,
@@ -169,6 +178,12 @@ class PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         bool prefer_same_node) = 0;
+
+    virtual std::vector<int64_t> batch_get_buffer_ranges(
+        const std::vector<std::string> &keys, void *dest_buffer,
+        const std::vector<size_t> &dest_offsets,
+        const std::vector<size_t> &src_offsets,
+        const std::vector<size_t> &sizes) = 0;
 
     virtual int put_from(const std::string &key, void *buffer, size_t size,
                          const ReplicateConfig &config = ReplicateConfig{}) = 0;

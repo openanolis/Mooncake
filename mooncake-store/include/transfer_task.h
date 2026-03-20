@@ -385,6 +385,14 @@ class TransferSubmitter {
                                          std::vector<Slice>& slices,
                                          TransferRequest::OpCode op_code);
 
+    /**
+     * @brief Submit a range read: read [src_offset, src_offset+size) from
+     * object into slice.ptr. Slices must total exactly `size` bytes.
+     */
+    std::optional<TransferFuture> submitRangeRead(
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        uint64_t src_offset);
+
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
@@ -395,6 +403,21 @@ class TransferSubmitter {
         const std::vector<std::string>& keys,
         const std::vector<uint64_t>& pointers,
         const std::unordered_map<std::string, Slice>& batched_slices);
+
+    /**
+     * @brief Submit batch read of multiple non-contiguous ranges from
+     * multiple keys in a single transfer batch.
+     * @param dest_buffer Base pointer of destination buffer
+     * @param key_ranges For each key: (replica, [(dest_offset, src_offset,
+     * size), ...])
+     * @return TransferFuture or nullopt on failure
+     */
+    std::optional<TransferFuture> submitBatchReadRanges(
+        void* dest_buffer,
+        const std::vector<
+            std::pair<Replica::Descriptor,
+                      std::vector<std::tuple<size_t, size_t, size_t>>>>&
+            key_ranges);
 
    private:
     TransferEngine& engine_;
@@ -422,19 +445,23 @@ class TransferSubmitter {
 
     /**
      * @brief Submit memcpy operation asynchronously
+     * @param src_offset Optional offset in source buffer (default 0)
      */
     std::optional<TransferFuture> submitMemcpyOperation(
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code);
+        const TransferRequest::OpCode op_code,
+        uint64_t src_offset = 0);
 
     /**
      * @brief Submit transfer engine operation asynchronously
+     * @param src_offset Optional offset in source buffer (default 0)
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code);
+        const TransferRequest::OpCode op_code,
+        uint64_t src_offset = 0);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,

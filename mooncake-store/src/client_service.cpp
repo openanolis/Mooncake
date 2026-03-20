@@ -711,6 +711,45 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
+                                         const QueryResult& query_result,
+                                         std::vector<Slice>& slices,
+                                         uint64_t src_offset) {
+    Replica::Descriptor replica;
+    ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
+    if (err != ErrorCode::OK) {
+        if (err == ErrorCode::INVALID_REPLICA) {
+            LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
+        }
+        return tl::unexpected(err);
+    }
+    if (!replica.is_memory_replica()) {
+        LOG(ERROR) << "Range read only supported for memory replicas, key="
+                   << object_key;
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
+    auto t0_get = std::chrono::steady_clock::now();
+    err = TransferReadRange(replica, slices, src_offset);
+    auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - t0_get)
+                      .count();
+    if (metrics_) {
+        metrics_->transfer_metric.get_latency_us.observe(us_get);
+    }
+
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "transfer_read_range_failed key=" << object_key;
+        return tl::unexpected(err);
+    }
+    if (query_result.IsLeaseExpired()) {
+        LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
+                     << object_key;
+        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+    }
+    return {};
+}
+
 struct BatchGetOperation {
     std::vector<Replica::Descriptor> replicas;
     std::vector<std::vector<Slice>> batched_slices;
@@ -989,6 +1028,24 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
     }
     return results;
+}
+
+ErrorCode Client::BatchTransferReadRanges(
+    void* dest_buffer,
+    const std::vector<std::pair<
+        Replica::Descriptor, std::vector<std::tuple<size_t, size_t, size_t>>>>&
+        key_ranges) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    auto future =
+        transfer_submitter_->submitBatchReadRanges(dest_buffer, key_ranges);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit batch read ranges";
+        return ErrorCode::TRANSFER_FAIL;
+    }
+    return future->get();
 }
 
 bool Client::RedirectToHotCache(const std::string& key,
@@ -2177,6 +2234,25 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     }
 
     return TransferData(replica_descriptor, slices, TransferRequest::READ);
+}
+
+ErrorCode Client::TransferReadRange(const Replica::Descriptor& replica_descriptor,
+                                    std::vector<Slice>& slices,
+                                    uint64_t src_offset) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto future =
+        transfer_submitter_->submitRangeRead(replica_descriptor, slices,
+                                            src_offset);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit range read operation";
+        return ErrorCode::TRANSFER_FAIL;
+    }
+
+    return future->get();
 }
 
 void Client::PollAndDispatchTasks() {
