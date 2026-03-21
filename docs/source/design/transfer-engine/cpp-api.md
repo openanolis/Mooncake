@@ -78,6 +78,7 @@ struct TransferRequest
     uint64_t target_offset;
     size_t length;
     int advise_retry_cnt = 0;
+    uint64_t task_group_id = kNoTaskGroup;
 };
 ```
 
@@ -87,6 +88,12 @@ struct TransferRequest
   - RAM space type, covering DRAM/VRAM. As mentioned earlier, there is only one segment under the same process (or `TransferEngine` instance), which contains various types of Buffers (DRAM/VRAM). In this case, the segment name passed to the `openSegment` interface is equivalent to the server hostname. `target_offset` is the virtual address of the target server.
   - NVMeOF space type, where each file corresponds to a segment. In this case, the segment name passed to the `openSegment` interface is equivalent to the unique identifier of the file. `target_offset` is the offset of the target file.
 - `length` represents the amount of data transferred. TransferEngine may further split this into multiple read/write requests internally.
+- `task_group_id` is optional and is used by scatter-style callers that want
+  several contiguous `TransferRequest`s to be tracked as one logical task. The
+  default value `TransferRequest::kNoTaskGroup` means "do not group". When a
+  batch of RDMA requests carries the same non-default `task_group_id` on
+  adjacent entries routed to the same transport, Transfer Engine submits them as
+  one task and reports status at that grouped-task granularity.
 
 #### TransferEngine::allocateBatchID
 
@@ -98,6 +105,10 @@ Allocates a `BatchID`. A maximum of `batch_size` `TransferRequest`s can be submi
 
 - `batch_size`: The maximum number of `TransferRequest`s that can be submitted under the same `BatchID`;
 - Return value: If successful, returns a `BatchID`; on failure, returns an invalid handle (for example `INVALID_BATCH_ID`).
+
+When `task_group_id` is used, `batch_size` should be interpreted as the number
+of logical tasks rather than the raw number of vector entries. For example, four
+adjacent RDMA requests tagged as two groups consume two batch slots, not four.
 
 #### TransferEngine::submitTransfer
 
@@ -111,6 +122,12 @@ Submits new `TransferRequest` tasks to `batch_id`. The task is asynchronously su
 - `batch_id`: The `BatchID` it belongs to;
 - `entries`: Array of `TransferRequest`;
 - Return value: If successful, returns an OK status; otherwise, returns a non-OK status.
+
+For ordinary callers, each entry is one task. For grouped scatter/gather-style
+callers, adjacent RDMA entries that share the same non-default
+`task_group_id` and resolve to the same transport are submitted as one logical
+task. This reduces control overhead and keeps `getTransferStatus()` aligned with
+the higher-level scatter operation rather than each micro-range.
 
 #### TransferEngine::getTransferStatus
 

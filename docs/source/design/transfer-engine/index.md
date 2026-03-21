@@ -46,6 +46,30 @@ With the help of Transfer Engine, Mooncake Store can achieve local DRAM/VRAM rea
 
 The BatchTransfer API uses an array of requests, which specify the operation type (READ or WRITE), data length, and local and remote memory addresses. The transfer operation is applicable to DRAM and GPU VRAM. The completion of these operations can be asynchronously monitored through the `getTransferStatus` API.
 
+### Grouped scatter-style submissions
+
+Some upper layers issue many small RDMA reads that are logically part of one
+scatter/gather step. Transfer Engine supports tagging adjacent requests with the
+same `task_group_id` so they are submitted and tracked as one logical task
+instead of many unrelated micro-operations.
+
+This is especially useful for batched range-read paths in Mooncake Store:
+
+- the caller still builds regular `TransferRequest` entries
+- related RDMA entries can share one `task_group_id`
+- batch sizing and completion tracking then operate at grouped-task granularity
+  instead of raw request count
+
+Ungrouped requests keep the original one-entry-per-task behavior.
+
+Measured cross-node RDMA runs show a consistent latency trade-off for grouped
+scatter reads: fixed overhead plus per-range overhead dominate small and
+medium-sized transfers, while very large transfers are primarily
+bandwidth-bound and tail behavior becomes workload- and run-dependent. See
+[Transfer Engine Benchmarking & Tuning Guide](transfer-engine-bench-tuning.md)
+for the benchmark matrix, the fitted model, and the standalone
+`scatter_range_bench` validation tool.
+
 ### Topology Aware Path Selection
 Modern inference servers often consist of multiple CPU sockets, DRAM, GPUs, and RDMA NIC devices. Although it's technically possible to transfer data from local DRAM or VRAM to a remote location using any RDMA NIC, these transfers can be limited by the bandwidth constraints of the Ultra Path Interconnect (UPI) or PCIe Switch. To overcome these limitations, Transfer Engine implements a topology-aware path selection algorithm.
 
