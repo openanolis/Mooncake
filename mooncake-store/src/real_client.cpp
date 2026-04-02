@@ -51,6 +51,111 @@ bool checkAcl(aclError result, const char *message) {
     return true;
 }
 #endif
+
+uintptr_t alignDownAddress(uintptr_t value, size_t alignment) {
+    if (alignment == 0) {
+        return value;
+    }
+    return value - value % alignment;
+}
+
+size_t getRegisterBufferGranularity() {
+    if (std::getenv("MC_STORE_USE_HUGEPAGE") != nullptr) {
+        return get_hugepage_size_from_env();
+    }
+    return static_cast<size_t>(getpagesize());
+}
+
+using RegisteredMemoryChunks = std::vector<std::pair<void *, size_t>>;
+
+RegisteredMemoryChunks buildRegisterBufferChunks(void *buffer, size_t size,
+                                                 size_t max_chunk_size) {
+    RegisteredMemoryChunks chunks;
+    if (buffer == nullptr || size == 0) {
+        return chunks;
+    }
+
+    if (max_chunk_size == 0 || size <= max_chunk_size) {
+        chunks.emplace_back(buffer, size);
+        return chunks;
+    }
+
+    const size_t granularity = getRegisterBufferGranularity();
+    uintptr_t current = reinterpret_cast<uintptr_t>(buffer);
+    const uintptr_t end = current + size;
+
+    while (current < end) {
+        uintptr_t chunk_end =
+            std::min(current + static_cast<uintptr_t>(max_chunk_size), end);
+        if (chunk_end < end && granularity > 0 &&
+            max_chunk_size >= granularity) {
+            uintptr_t aligned_end = alignDownAddress(chunk_end, granularity);
+            if (aligned_end > current) {
+                chunk_end = aligned_end;
+            }
+        }
+        if (chunk_end <= current) {
+            chunk_end =
+                std::min(current + static_cast<uintptr_t>(max_chunk_size), end);
+        }
+        chunks.emplace_back(reinterpret_cast<void *>(current),
+                            static_cast<size_t>(chunk_end - current));
+        current = chunk_end;
+    }
+
+    return chunks;
+}
+
+tl::expected<RegisteredMemoryChunks, ErrorCode> registerLocalMemoryChunks(
+    const std::shared_ptr<Client> &client, void *buffer, size_t size,
+    const char *log_prefix) {
+    const size_t max_chunk_size =
+        static_cast<size_t>(globalConfig().max_mr_size);
+    auto chunks = buildRegisterBufferChunks(buffer, size, max_chunk_size);
+    std::vector<void *> registered_chunks;
+    registered_chunks.reserve(chunks.size());
+
+    for (const auto &[chunk_ptr, chunk_size] : chunks) {
+        auto result = client->RegisterLocalMemory(
+            chunk_ptr, chunk_size, kWildcardLocation, false, true);
+        if (!result.has_value()) {
+            LOG(ERROR) << log_prefix
+                       << " register chunk failed: addr=" << chunk_ptr
+                       << ", size=" << chunk_size
+                       << ", error=" << toString(result.error());
+            for (auto it = registered_chunks.rbegin();
+                 it != registered_chunks.rend(); ++it) {
+                auto rollback = client->unregisterLocalMemory(*it, true);
+                if (!rollback.has_value()) {
+                    LOG(ERROR)
+                        << log_prefix << " rollback chunk failed: addr=" << *it
+                        << ", error=" << toString(rollback.error());
+                }
+            }
+            return tl::unexpected(result.error());
+        }
+        registered_chunks.push_back(chunk_ptr);
+    }
+
+    return chunks;
+}
+
+tl::expected<void, ErrorCode> unregisterLocalMemoryChunks(
+    const std::shared_ptr<Client> &client, const RegisteredMemoryChunks &chunks,
+    const char *log_prefix) {
+    for (auto it = chunks.rbegin(); it != chunks.rend(); ++it) {
+        auto [chunk_ptr, chunk_size] = *it;
+        auto unregister_result = client->unregisterLocalMemory(chunk_ptr, true);
+        if (!unregister_result.has_value()) {
+            LOG(ERROR) << log_prefix
+                       << " unregister chunk failed: addr=" << chunk_ptr
+                       << ", size=" << chunk_size
+                       << ", error=" << toString(unregister_result.error());
+            return tl::unexpected(unregister_result.error());
+        }
+    }
+    return {};
+}
 }  // namespace
 
 PyClient::~PyClient() {}
@@ -422,14 +527,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
-        auto result = client_->RegisterLocalMemory(
-            client_buffer_allocator_->getBase(), local_buffer_size,
-            kWildcardLocation, false, true);
-        if (!result.has_value()) {
+        auto register_result = registerLocalMemoryChunks(
+            client_, client_buffer_allocator_->getBase(), local_buffer_size,
+            "client local buffer");
+        if (!register_result.has_value()) {
             LOG(ERROR) << "Failed to register local memory: "
-                       << toString(result.error());
-            return tl::unexpected(result.error());
+                       << toString(register_result.error());
+            return tl::unexpected(register_result.error());
         }
+        local_buffer_chunks_ = std::move(register_result.value());
     } else {
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
@@ -715,12 +821,18 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
     if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
         protocol != "cxl") {
-        auto unregister_result = client_->unregisterLocalMemory(
-            client_buffer_allocator_->getBase(), true);
+        auto unregister_result =
+            local_buffer_chunks_.empty()
+                ? client_->unregisterLocalMemory(
+                      client_buffer_allocator_->getBase(), true)
+                : unregisterLocalMemoryChunks(client_, local_buffer_chunks_,
+                                              "client local buffer");
         if (!unregister_result) {
             LOG(WARNING)
                 << "Failed to unregister client local buffer on tear down: "
                 << toString(unregister_result.error());
+        } else {
+            local_buffer_chunks_.clear();
         }
     }
     // Reset all resources
@@ -1973,8 +2085,28 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_->RegisterLocalMemory(buffer, size, kWildcardLocation, false,
-                                        true);
+    if (buffer == nullptr || size == 0) {
+        LOG(ERROR) << "Invalid buffer registration params: buffer=" << buffer
+                   << ", size=" << size;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+    if (registered_buffer_chunks_.find(buffer) !=
+        registered_buffer_chunks_.end()) {
+        LOG(ERROR) << "Buffer is already registered: " << buffer;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto register_result =
+        registerLocalMemoryChunks(client_, buffer, size, "register_buffer");
+    if (!register_result.has_value()) {
+        return tl::unexpected(register_result.error());
+    }
+
+    registered_buffer_chunks_.emplace(buffer,
+                                      std::move(register_result.value()));
+    return {};
 }
 
 int RealClient::register_buffer(void *buffer, size_t size) {
@@ -1987,6 +2119,19 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+
+    std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+    auto registered_it = registered_buffer_chunks_.find(buffer);
+    if (registered_it != registered_buffer_chunks_.end()) {
+        auto unregister_result = unregisterLocalMemoryChunks(
+            client_, registered_it->second, "register_buffer");
+        if (!unregister_result.has_value()) {
+            return tl::unexpected(unregister_result.error());
+        }
+        registered_buffer_chunks_.erase(registered_it);
+        return {};
+    }
+
     auto unregister_result = client_->unregisterLocalMemory(buffer, true);
     if (!unregister_result) {
         LOG(ERROR) << "Unregister buffer failed with error: "

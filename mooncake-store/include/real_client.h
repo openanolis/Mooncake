@@ -4,9 +4,13 @@
 #include <boost/lockfree/queue.hpp>
 #include <csignal>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "pyclient.h"
@@ -577,6 +581,10 @@ class RealClient : public PyClient {
     std::string local_hostname;
     std::string local_rpc_addr;
     bool use_hugepage_ = false;
+    std::vector<std::pair<void *, size_t>> local_buffer_chunks_;
+    mutable std::shared_mutex registered_buffer_mutex_;
+    std::unordered_map<void *, std::vector<std::pair<void *, size_t>>>
+        registered_buffer_chunks_;
 
     struct MappedShm {
         std::string shm_name;

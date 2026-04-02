@@ -7,6 +7,7 @@
 #include <random>
 #include <barrier>
 
+#include "config.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
 
@@ -27,6 +28,19 @@ class GLogMuter {
 
    private:
     int original_log_level_;
+};
+
+class MaxMrSizeGuard {
+   public:
+    explicit MaxMrSizeGuard(uint64_t max_mr_size)
+        : original_max_mr_size_(globalConfig().max_mr_size) {
+        globalConfig().max_mr_size = max_mr_size;
+    }
+
+    ~MaxMrSizeGuard() { globalConfig().max_mr_size = original_max_mr_size_; }
+
+   private:
+    uint64_t original_max_mr_size_;
 };
 
 class RealClientTest : public ::testing::Test {
@@ -974,6 +988,7 @@ TEST_F(RealClientTest, ErrBufferRegistrationErrors) {
 
     // Normal register then duplicate register
     {
+        MaxMrSizeGuard max_mr_size_guard(256);
         char buf[1024];
         EXPECT_EQ(py_client_->register_buffer(buf, sizeof(buf)), 0)
             << "First registration should succeed";
@@ -988,7 +1003,42 @@ TEST_F(RealClientTest, ErrBufferRegistrationErrors) {
         // Cleanup
         EXPECT_EQ(py_client_->unregister_buffer(buf), 0)
             << "Unregistration should succeed";
+
+        EXPECT_EQ(py_client_->register_buffer(buf, sizeof(buf)), 0)
+            << "Re-registration after cleanup should succeed";
+        EXPECT_EQ(py_client_->unregister_buffer(buf), 0)
+            << "Second cleanup should also succeed";
     }
+}
+
+TEST_F(RealClientTest, LocalBufferRegistrationSplitsByMaxMrSize) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    constexpr size_t kChunkSize = 16 * 1024 * 1024;
+    constexpr size_t kLocalBufferSize = 2 * kChunkSize;
+    MaxMrSizeGuard max_mr_size_guard(kChunkSize);
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE", kChunkSize,
+                               kLocalBufferSize, FLAGS_protocol, rdma_devices,
+                               master_address_),
+        0);
+
+    const std::string key = "local_buffer_chunked_register";
+    const std::string value = "chunked-local-buffer";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    std::span<const char> data(value.data(), value.size());
+
+    ASSERT_EQ(py_client_->put(key, data, config), 0);
+    auto buffer_handle = py_client_->get_buffer(key);
+    ASSERT_NE(buffer_handle, nullptr);
+    std::string got(static_cast<const char*>(buffer_handle->ptr()),
+                    buffer_handle->size());
+    EXPECT_EQ(got, value);
 }
 
 }  // namespace testing
