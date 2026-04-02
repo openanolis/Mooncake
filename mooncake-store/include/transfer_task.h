@@ -356,12 +356,89 @@ class FilereadWorkerPool {
 };
 
 /**
+ * @brief Handle for tracking per-chunk completion of a progressive get
+ *
+ * Each chunk maps 1:1 to a TransferEngine task within a single batch.
+ * Callers poll individual chunk completion to overlap transfer with compute.
+ */
+class ChunkedReadSession;
+
+class ProgressiveGetHandle {
+   public:
+    explicit ProgressiveGetHandle(std::shared_ptr<ChunkedReadSession> session);
+
+    ~ProgressiveGetHandle();
+
+    // Non-copyable, movable
+    ProgressiveGetHandle(const ProgressiveGetHandle&) = delete;
+    ProgressiveGetHandle& operator=(const ProgressiveGetHandle&) = delete;
+    ProgressiveGetHandle(ProgressiveGetHandle&& other) noexcept;
+    ProgressiveGetHandle& operator=(ProgressiveGetHandle&& other) noexcept;
+
+    size_t num_chunks() const;
+
+    /**
+     * @brief Check if a specific chunk has completed (non-blocking)
+     */
+    bool is_chunk_ready(size_t chunk_index);
+
+    /**
+     * @brief Count how many chunks have completed so far (non-blocking)
+     */
+    size_t completed_count();
+
+    /**
+     * @brief Block until chunk_index is done; return error code
+     */
+    ErrorCode wait_chunk(size_t chunk_index);
+
+    /**
+     * @brief Block until all chunks done
+     */
+    ErrorCode wait_all();
+
+   private:
+    std::shared_ptr<ChunkedReadSession> session_;
+};
+
+class ScatterReadHandle {
+   public:
+    explicit ScatterReadHandle(std::shared_ptr<ChunkedReadSession> session);
+
+    ~ScatterReadHandle();
+
+    // Non-copyable, movable
+    ScatterReadHandle(const ScatterReadHandle&) = delete;
+    ScatterReadHandle& operator=(const ScatterReadHandle&) = delete;
+    ScatterReadHandle(ScatterReadHandle&& other) noexcept;
+    ScatterReadHandle& operator=(ScatterReadHandle&& other) noexcept;
+
+    size_t num_chunks() const;
+    bool is_chunk_ready(size_t chunk_index);
+    size_t completed_count();
+    ErrorCode wait_chunk(size_t chunk_index);
+    ErrorCode wait_all();
+
+   private:
+    std::shared_ptr<ChunkedReadSession> session_;
+};
+
+/**
  * @brief Submitter class for asynchronous transfer operations
  *
  * This class analyzes transfer requirements, selects optimal strategies, and
  * immediately submits operations returning TransferFuture objects for result
  * tracking.
  */
+struct TransferTaskTestHooks {
+    std::function<bool()> fail_next_progressive_submit;
+    std::function<bool()> fail_next_streaming_scatter_submit;
+    std::function<void(BatchID)> on_batch_allocated;
+    std::function<void(BatchID)> on_batch_freed;
+};
+
+void SetTransferTaskTestHooks(TransferTaskTestHooks* hooks);
+
 class TransferSubmitter {
    public:
     explicit TransferSubmitter(TransferEngine& engine,
@@ -385,6 +462,14 @@ class TransferSubmitter {
                                          std::vector<Slice>& slices,
                                          TransferRequest::OpCode op_code);
 
+    /**
+     * @brief Submit a range read: read [src_offset, src_offset+size) from
+     * object into slice.ptr. Slices must total exactly `size` bytes.
+     */
+    std::optional<TransferFuture> submitRangeRead(
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        uint64_t src_offset);
+
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
@@ -395,6 +480,43 @@ class TransferSubmitter {
         const std::vector<std::string>& keys,
         const std::vector<uint64_t>& pointers,
         const std::unordered_map<std::string, Slice>& batched_slices);
+
+    /**
+     * @brief Submit batch read of multiple non-contiguous ranges from
+     * multiple keys in a single transfer batch.
+     * @param dest_buffer Base pointer of destination buffer
+     * @param key_ranges For each key: (replica, [(dest_offset, src_offset,
+     * size), ...])
+     * @return TransferFuture or nullopt on failure
+     */
+    std::optional<TransferFuture> submitBatchReadRanges(
+        void* dest_buffer,
+        const std::vector<
+            std::pair<Replica::Descriptor,
+                      std::vector<std::tuple<size_t, size_t, size_t>>>>&
+            key_ranges,
+        bool enable_task_grouping = false);
+
+    /**
+     * @brief Submit a progressive read that splits the transfer into
+     * independently trackable chunks.
+     * @param replica Source replica descriptor
+     * @param dest_buffer Destination buffer
+     * @param total_size Total bytes to read
+     * @param chunk_size Size of each chunk (last chunk may be smaller)
+     * @return ProgressiveGetHandle for per-chunk polling, or nullopt on failure
+     */
+    std::optional<ProgressiveGetHandle> submitProgressiveRead(
+        const Replica::Descriptor& replica, void* dest_buffer,
+        size_t total_size, size_t chunk_size);
+
+    std::optional<ScatterReadHandle> submitStreamingBatchReadRanges(
+        void* dest_buffer,
+        const std::vector<
+            std::pair<Replica::Descriptor,
+                      std::vector<std::tuple<size_t, size_t, size_t>>>>&
+            key_ranges,
+        bool enable_task_grouping = false);
 
    private:
     TransferEngine& engine_;
@@ -422,19 +544,21 @@ class TransferSubmitter {
 
     /**
      * @brief Submit memcpy operation asynchronously
+     * @param src_offset Optional offset in source buffer (default 0)
      */
     std::optional<TransferFuture> submitMemcpyOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code);
+        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
+        uint64_t src_offset = 0);
 
     /**
      * @brief Submit transfer engine operation asynchronously
+     * @param src_offset Optional offset in source buffer (default 0)
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code);
+        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
+        uint64_t src_offset = 0);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
@@ -447,7 +571,7 @@ class TransferSubmitter {
                                TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests);
+        std::vector<TransferRequest>& requests, size_t batch_task_count = 0);
 };
 
 }  // namespace mooncake

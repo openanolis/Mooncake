@@ -1,8 +1,14 @@
 #include "transfer_task.h"
 
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cassert>
+#include <climits>
 #include <cstdlib>
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -304,21 +310,14 @@ void TransferEngineOperationState::wait_for_completion() {
     bool completed;
     bool failed = false;
 
-    // Fast path: if already finished, avoid taking the mutex and waiting.
-    // Use acquire here to pair with the writer's release-store, because this
-    // path may skip taking the mutex. It ensures all prior updates are visible.
     completed = batch_desc.is_finished.load(std::memory_order_acquire);
     if (!completed) {
-        // Use the same mutex as the notifier when updating the predicate to
-        // avoid missed notifications. The predicate is re-checked under the
-        // lock. Under the mutex, relaxed is sufficient; the mutex acquire
-        // orders prior writes.
-        std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
+        std::unique_lock<std::mutex> lock(batch_desc.lifecycle_mutex);
         completed = batch_desc.completion_cv.wait_for(
             lock, std::chrono::seconds(timeout_seconds), [&batch_desc] {
                 return batch_desc.is_finished.load(std::memory_order_relaxed);
             });
-    }  // Explicitly release completion_mutex before acquiring mutex_
+    }
 
     // Once completion is observed, read failure flag.
     if (completed) {
@@ -342,34 +341,619 @@ void TransferEngineOperationState::wait_for_completion() {
                    << " seconds for batch " << batch_id_;
     }
 #else
-    VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
+    VLOG(1) << "Starting transfer engine futex wait for batch " << batch_id_;
 
-    constexpr int64_t kOneSecondInNano = 1000 * 1000 * 1000;
-    const int64_t start_ts = getCurrentTimeInNano();
+    auto& batch_desc = Transport::toBatchDesc(batch_id_);
+    auto* futex_word =
+        reinterpret_cast<uint32_t*>(&batch_desc.finished_task_count);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(timeout_seconds);
 
     while (true) {
-        if (getCurrentTimeInNano() - start_ts >
-            timeout_seconds * kOneSecondInNano) {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            check_task_status();
+            if (result_.has_value()) {
+                VLOG(1) << "Transfer engine operation completed for batch "
+                        << batch_id_ << " with result: "
+                        << static_cast<int>(result_.value());
+                break;
+            }
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
             LOG(ERROR) << "Failed to complete transfers after "
                        << timeout_seconds << " seconds for batch " << batch_id_;
             set_result_internal(ErrorCode::TRANSFER_FAIL);
             return;
         }
 
-        std::unique_lock<std::mutex> lock(mutex_);
-        check_task_status();
-        if (result_.has_value()) {
-            VLOG(1) << "Transfer engine operation completed for batch "
-                    << batch_id_
-                    << " with result: " << static_cast<int>(result_.value());
-            break;
-        }
-        // Continue polling
-        VLOG(1) << "Transfer engine operation still pending for batch "
-                << batch_id_;
+        uint32_t snapshot = __atomic_load_n(futex_word, __ATOMIC_ACQUIRE);
+        // 100ms timeout as fallback for transports (e.g. TENT) that may not
+        // wake via the standard Slice completion path.
+        struct timespec ts = {0, 100 * 1000 * 1000};
+        ::syscall(SYS_futex, futex_word, FUTEX_WAIT_PRIVATE, snapshot, &ts,
+                  nullptr, 0);
     }
 #endif
 }
+
+// ============================================================================
+// ProgressiveGetHandle Implementation
+// ============================================================================
+
+namespace {
+constexpr size_t kProgressiveGetWindowChunks = 8;
+constexpr int64_t kProgressiveGetTimeoutSeconds = 60;
+
+TransferTaskTestHooks* g_transfer_task_test_hooks = nullptr;
+
+}  // namespace
+
+void SetTransferTaskTestHooks(TransferTaskTestHooks* hooks) {
+    g_transfer_task_test_hooks = hooks;
+}
+
+namespace {
+
+using ScatterRange = std::tuple<size_t, size_t, size_t>;
+using ScatterKeyRanges =
+    std::vector<std::pair<Replica::Descriptor, std::vector<ScatterRange>>>;
+
+struct ScatterReadBuildResult {
+    std::vector<TransferRequest> flat_requests;
+    std::vector<std::vector<TransferRequest>> logical_groups;
+};
+
+std::optional<ScatterReadBuildResult> buildScatterReadRequests(
+    TransferEngine& engine, void* dest_buffer,
+    const ScatterKeyRanges& key_ranges, bool enable_task_grouping,
+    const char* log_context) {
+    ScatterReadBuildResult result;
+    size_t total_ranges = 0;
+    for (const auto& [_, ranges] : key_ranges) {
+        total_ranges += ranges.size();
+    }
+    result.flat_requests.reserve(total_ranges);
+    if (enable_task_grouping) {
+        result.logical_groups.reserve(key_ranges.size());
+    }
+
+    uint64_t next_task_group_id = 0;
+    char* dest_base = static_cast<char*>(dest_buffer);
+
+    for (const auto& [replica, ranges] : key_ranges) {
+        if (!replica.is_memory_replica()) {
+            LOG(ERROR) << log_context << ": disk replicas not supported";
+            return std::nullopt;
+        }
+        const auto& handle = replica.get_memory_descriptor().buffer_descriptor;
+        if (handle.transport_endpoint_.empty()) {
+            LOG(ERROR) << log_context << ": empty transport endpoint";
+            return std::nullopt;
+        }
+
+        SegmentHandle seg = engine.openSegment(handle.transport_endpoint_);
+        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+            LOG(ERROR) << log_context << ": failed to open segment for "
+                       << handle.transport_endpoint_;
+            return std::nullopt;
+        }
+
+        uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
+        std::vector<TransferRequest> group_requests;
+        if (enable_task_grouping) {
+            group_requests.reserve(ranges.size());
+        }
+        const uint64_t task_group_id = enable_task_grouping
+                                           ? next_task_group_id++
+                                           : TransferRequest::kNoTaskGroup;
+
+        for (const auto& [dest_offset, src_offset, size] : ranges) {
+            if (size == 0) {
+                continue;
+            }
+            TransferRequest request;
+            request.opcode = TransferRequest::READ;
+            request.source = dest_base + dest_offset;
+            request.target_id = seg;
+            request.target_offset = base_address + src_offset;
+            request.length = size;
+            request.task_group_id = task_group_id;
+            result.flat_requests.emplace_back(request);
+            if (enable_task_grouping) {
+                group_requests.emplace_back(request);
+            }
+        }
+
+        if (enable_task_grouping && !group_requests.empty()) {
+            result.logical_groups.emplace_back(std::move(group_requests));
+        }
+    }
+
+    return result;
+}
+}  // namespace
+
+using ChunkSubmitFailureHook = std::function<bool()>;
+
+class ChunkedReadSession {
+   public:
+    ChunkedReadSession(size_t num_chunks, ErrorCode result)
+        : num_chunks_(num_chunks),
+          chunk_done_(num_chunks, 1),
+          chunk_results_(num_chunks, result),
+          completed_count_(num_chunks),
+          submitted_chunks_(num_chunks),
+          sealed_(true),
+          precompleted_(true) {}
+
+    ChunkedReadSession(TransferEngine& engine, BatchID batch_id,
+                       std::vector<std::vector<TransferRequest>> chunk_groups,
+                       size_t initial_window, std::string submit_context,
+                       ChunkSubmitFailureHook fail_next_submit)
+        : engine_(&engine),
+          batch_id_(batch_id),
+          num_chunks_(chunk_groups.size()),
+          chunk_groups_(std::move(chunk_groups)),
+          chunk_done_(num_chunks_, 0),
+          chunk_results_(num_chunks_, ErrorCode::OK),
+          completed_count_(0),
+          window_size_(std::max<size_t>(1, initial_window)),
+          submit_context_(std::move(submit_context)),
+          fail_next_submit_(std::move(fail_next_submit)) {}
+
+    ~ChunkedReadSession() { cleanup(); }
+
+    bool submit_initial_window() {
+        if (precompleted_) {
+            return true;
+        }
+        maybe_submit_more(window_size_);
+        return !submit_failed_;
+    }
+
+    size_t num_chunks() const { return num_chunks_; }
+
+    bool is_chunk_ready(size_t chunk_index) {
+        if (chunk_index >= num_chunks_) {
+            return false;
+        }
+        return poll_chunk(chunk_index);
+    }
+
+    size_t completed_count() {
+        if (precompleted_) {
+            return completed_count_.load(std::memory_order_relaxed);
+        }
+        maybe_submit_more(submitted_chunks_.load(std::memory_order_acquire) +
+                          window_size_);
+        size_t current = completed_count_.load(std::memory_order_relaxed);
+        if (current == num_chunks_) {
+            return current;
+        }
+        size_t observed_finished = observed_batch_finished_count();
+        if (observed_finished > current) {
+            return drain_completed_chunks(observed_finished);
+        }
+        return current;
+    }
+
+    ErrorCode wait_chunk(size_t chunk_index) {
+        if (chunk_index >= num_chunks_) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+        if (precompleted_) {
+            return chunk_results_[chunk_index];
+        }
+
+        maybe_submit_more(chunk_index + 1);
+        if (poll_chunk(chunk_index)) {
+            return chunk_results_[chunk_index];
+        }
+
+        auto& batch_desc = Transport::toBatchDesc(batch_id_);
+        auto* futex_word =
+            reinterpret_cast<uint32_t*>(&batch_desc.finished_task_count);
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::seconds(kProgressiveGetTimeoutSeconds);
+
+        while (true) {
+            uint32_t snapshot = __atomic_load_n(futex_word, __ATOMIC_ACQUIRE);
+
+            maybe_submit_more(chunk_index + 1);
+            size_t observed_finished = observed_batch_finished_count();
+            if (observed_finished >
+                completed_count_.load(std::memory_order_relaxed)) {
+                drain_completed_chunks(observed_finished);
+                if (chunk_done_[chunk_index]) {
+                    return chunk_results_[chunk_index];
+                }
+            }
+
+            if (materialize_chunk_result(chunk_index)) {
+                return chunk_results_[chunk_index];
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                break;
+            }
+            auto remaining =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(deadline -
+                                                                     now);
+            struct timespec ts;
+            ts.tv_sec = remaining.count() / 1000000000LL;
+            ts.tv_nsec = remaining.count() % 1000000000LL;
+
+            ::syscall(SYS_futex, futex_word, FUTEX_WAIT_PRIVATE, snapshot, &ts,
+                      nullptr, 0);
+        }
+
+        mark_chunk_done(chunk_index, ErrorCode::TRANSFER_FAIL);
+        seal_batch();
+        return ErrorCode::TRANSFER_FAIL;
+    }
+
+    ErrorCode wait_all() {
+        if (precompleted_) {
+            return aggregate_result();
+        }
+
+        maybe_submit_more(num_chunks_);
+        auto& batch_desc = Transport::toBatchDesc(batch_id_);
+        auto* futex_word =
+            reinterpret_cast<uint32_t*>(&batch_desc.finished_task_count);
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::seconds(kProgressiveGetTimeoutSeconds);
+
+        size_t current = completed_count_.load(std::memory_order_relaxed);
+        while (current < num_chunks_) {
+            maybe_submit_more(num_chunks_);
+            size_t observed_finished = observed_batch_finished_count();
+            if (observed_finished > current) {
+                current = drain_completed_chunks(observed_finished);
+                continue;
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                break;
+            }
+
+            uint32_t snapshot = __atomic_load_n(futex_word, __ATOMIC_ACQUIRE);
+            auto remaining =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(deadline -
+                                                                     now);
+            struct timespec ts;
+            ts.tv_sec = remaining.count() / 1000000000LL;
+            ts.tv_nsec = remaining.count() % 1000000000LL;
+
+            ::syscall(SYS_futex, futex_word, FUTEX_WAIT_PRIVATE, snapshot, &ts,
+                      nullptr, 0);
+            current = completed_count_.load(std::memory_order_relaxed);
+        }
+
+        if (observed_batch_finished_count() ==
+            submitted_chunks_.load(std::memory_order_acquire)) {
+            drain_completed_chunks(num_chunks_, true);
+        }
+
+        if (completed_count_.load(std::memory_order_relaxed) != num_chunks_) {
+            mark_remaining_chunks_failed();
+        }
+
+        seal_batch();
+        return aggregate_result();
+    }
+
+   private:
+    void cleanup() {
+        if (precompleted_ || !engine_ || batch_id_ == INVALID_BATCH_ID) {
+            return;
+        }
+
+        wait_all();
+        BatchID batch_id = batch_id_;
+        Status free_status = engine_->freeBatchID(batch_id);
+        if (!free_status.ok()) {
+            LOG(ERROR) << "Failed to free chunked read batch " << batch_id
+                       << ": " << free_status.message();
+        } else if (g_transfer_task_test_hooks &&
+                   g_transfer_task_test_hooks->on_batch_freed) {
+            g_transfer_task_test_hooks->on_batch_freed(batch_id);
+        }
+        chunk_groups_.clear();
+        engine_ = nullptr;
+        batch_id_ = INVALID_BATCH_ID;
+    }
+
+    void maybe_submit_more(size_t required_chunks) {
+        if (precompleted_) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(submit_mutex_);
+        if (sealed_) {
+            return;
+        }
+
+        size_t submitted = submitted_chunks_.load(std::memory_order_acquire);
+        size_t target = std::min(
+            num_chunks_, std::max(required_chunks, submitted + window_size_));
+        if (target <= submitted) {
+            return;
+        }
+
+        std::vector<TransferRequest> window;
+        size_t raw_request_count = 0;
+        for (size_t i = submitted; i < target; ++i) {
+            raw_request_count += chunk_groups_[i].size();
+        }
+        window.reserve(raw_request_count);
+        for (size_t i = submitted; i < target; ++i) {
+            window.insert(window.end(), chunk_groups_[i].begin(),
+                          chunk_groups_[i].end());
+        }
+
+        if (fail_next_submit_ && fail_next_submit_()) {
+            submit_failed_ = true;
+            for (size_t i = submitted; i < num_chunks_; ++i) {
+                mark_chunk_done(i, ErrorCode::TRANSFER_FAIL);
+            }
+            submitted_chunks_.store(num_chunks_, std::memory_order_release);
+            seal_batch_locked();
+            return;
+        }
+
+        Status s = engine_->submitTransfer(batch_id_, window);
+        if (!s.ok()) {
+            LOG(ERROR) << "Failed to submit " << submit_context_
+                       << " window for batch " << batch_id_ << ": "
+                       << s.message();
+            submit_failed_ = true;
+            for (size_t i = submitted; i < num_chunks_; ++i) {
+                mark_chunk_done(i, ErrorCode::TRANSFER_FAIL);
+            }
+            submitted_chunks_.store(num_chunks_, std::memory_order_release);
+            seal_batch_locked();
+            return;
+        }
+
+        submitted_chunks_.store(target, std::memory_order_release);
+        if (target == num_chunks_) {
+            seal_batch_locked();
+        }
+    }
+
+    void seal_batch() {
+        if (precompleted_) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(submit_mutex_);
+        seal_batch_locked();
+    }
+
+    void seal_batch_locked() {
+        if (sealed_) {
+            return;
+        }
+        auto& batch_desc = Transport::toBatchDesc(batch_id_);
+        {
+            std::lock_guard<std::mutex> lifecycle_lock(
+                batch_desc.lifecycle_mutex);
+            batch_desc.sealed.store(true, std::memory_order_release);
+            batch_desc.publish_completion_if_ready_locked();
+        }
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        batch_desc.completion_cv.notify_all();
+#endif
+        sealed_ = true;
+    }
+
+    size_t observed_batch_finished_count() const {
+        const auto& batch_desc = Transport::toBatchDesc(batch_id_);
+        size_t finished = static_cast<size_t>(
+            batch_desc.finished_task_count.load(std::memory_order_acquire));
+        size_t submitted = submitted_chunks_.load(std::memory_order_acquire);
+        return std::min(finished, submitted);
+    }
+
+    void mark_chunk_done(size_t chunk_index, ErrorCode result) {
+        if (chunk_done_[chunk_index]) {
+            return;
+        }
+        chunk_done_[chunk_index] = 1;
+        chunk_results_[chunk_index] = result;
+        completed_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    bool materialize_chunk_result(size_t chunk_index) {
+        if (chunk_done_[chunk_index]) {
+            return true;
+        }
+        if (chunk_index >= submitted_chunks_.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        TransferStatus status;
+        Status s = engine_->getTransferStatus(batch_id_, chunk_index, status);
+        if (!s.ok()) {
+            LOG(ERROR)
+                << "Failed to get chunked read transfer status for batch "
+                << batch_id_ << " chunk " << chunk_index;
+            mark_chunk_done(chunk_index, ErrorCode::TRANSFER_FAIL);
+            return true;
+        }
+
+        switch (status.s) {
+            case TransferStatusEnum::COMPLETED:
+                mark_chunk_done(chunk_index, ErrorCode::OK);
+                return true;
+            case TransferStatusEnum::FAILED:
+            case TransferStatusEnum::CANCELED:
+            case TransferStatusEnum::INVALID:
+            case TransferStatusEnum::TIMEOUT:
+                mark_chunk_done(chunk_index, ErrorCode::TRANSFER_FAIL);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    size_t drain_completed_chunks(size_t observed_finished_count,
+                                  bool force_full_scan = false) {
+        size_t completed = completed_count_.load(std::memory_order_relaxed);
+        if (completed >= num_chunks_) {
+            return completed;
+        }
+        if (observed_finished_count <= completed && !force_full_scan) {
+            return completed;
+        }
+
+        size_t submitted = submitted_chunks_.load(std::memory_order_acquire);
+        size_t scan_limit =
+            force_full_scan ? submitted : observed_finished_count;
+        if (scan_limit == 0) {
+            return completed;
+        }
+
+        size_t idx = drain_cursor_ < submitted ? drain_cursor_ : 0;
+        size_t scanned = 0;
+        while (scanned < submitted &&
+               (force_full_scan || completed < scan_limit)) {
+            if (!chunk_done_[idx] && materialize_chunk_result(idx)) {
+                completed = completed_count_.load(std::memory_order_relaxed);
+            }
+            idx = (idx + 1) % submitted;
+            ++scanned;
+        }
+
+        drain_cursor_ = submitted == 0 ? 0 : idx;
+        return completed_count_.load(std::memory_order_relaxed);
+    }
+
+    void mark_remaining_chunks_failed() {
+        for (size_t i = 0; i < num_chunks_; ++i) {
+            if (!chunk_done_[i]) {
+                mark_chunk_done(i, ErrorCode::TRANSFER_FAIL);
+            }
+        }
+        drain_cursor_ = num_chunks_;
+    }
+
+    ErrorCode aggregate_result() const {
+        for (size_t i = 0; i < num_chunks_; ++i) {
+            if (chunk_results_[i] != ErrorCode::OK) {
+                return chunk_results_[i];
+            }
+        }
+        return ErrorCode::OK;
+    }
+
+    bool poll_chunk(size_t chunk_index) {
+        if (chunk_done_[chunk_index]) {
+            return true;
+        }
+        maybe_submit_more(chunk_index + 1);
+
+        size_t observed_finished = observed_batch_finished_count();
+        size_t completed = completed_count_.load(std::memory_order_relaxed);
+        if (observed_finished > completed) {
+            completed = drain_completed_chunks(observed_finished);
+        }
+
+        if (chunk_done_[chunk_index]) {
+            return true;
+        }
+        if (completed >= num_chunks_) {
+            return false;
+        }
+        if (observed_finished == completed) {
+            return false;
+        }
+
+        return materialize_chunk_result(chunk_index);
+    }
+
+    TransferEngine* engine_ = nullptr;
+    BatchID batch_id_ = INVALID_BATCH_ID;
+    size_t num_chunks_ = 0;
+    std::vector<std::vector<TransferRequest>> chunk_groups_;
+    std::vector<uint8_t> chunk_done_;
+    std::vector<ErrorCode> chunk_results_;
+    std::atomic<size_t> completed_count_{0};
+    std::atomic<size_t> submitted_chunks_{0};
+    size_t drain_cursor_{0};
+    size_t window_size_ = 1;
+    bool sealed_ = false;
+    bool precompleted_ = false;
+    bool submit_failed_ = false;
+    std::string submit_context_;
+    ChunkSubmitFailureHook fail_next_submit_;
+    std::mutex submit_mutex_;
+};
+
+ProgressiveGetHandle::ProgressiveGetHandle(
+    std::shared_ptr<ChunkedReadSession> session)
+    : session_(std::move(session)) {}
+
+ProgressiveGetHandle::~ProgressiveGetHandle() = default;
+
+ProgressiveGetHandle::ProgressiveGetHandle(
+    ProgressiveGetHandle&& other) noexcept = default;
+
+ProgressiveGetHandle& ProgressiveGetHandle::operator=(
+    ProgressiveGetHandle&& other) noexcept = default;
+
+size_t ProgressiveGetHandle::num_chunks() const {
+    return session_->num_chunks();
+}
+
+bool ProgressiveGetHandle::is_chunk_ready(size_t chunk_index) {
+    return session_->is_chunk_ready(chunk_index);
+}
+
+size_t ProgressiveGetHandle::completed_count() {
+    return session_->completed_count();
+}
+
+ErrorCode ProgressiveGetHandle::wait_chunk(size_t chunk_index) {
+    return session_->wait_chunk(chunk_index);
+}
+
+ErrorCode ProgressiveGetHandle::wait_all() { return session_->wait_all(); }
+
+ScatterReadHandle::ScatterReadHandle(
+    std::shared_ptr<ChunkedReadSession> session)
+    : session_(std::move(session)) {}
+
+ScatterReadHandle::~ScatterReadHandle() = default;
+
+ScatterReadHandle::ScatterReadHandle(ScatterReadHandle&& other) noexcept =
+    default;
+
+ScatterReadHandle& ScatterReadHandle::operator=(
+    ScatterReadHandle&& other) noexcept = default;
+
+size_t ScatterReadHandle::num_chunks() const { return session_->num_chunks(); }
+
+bool ScatterReadHandle::is_chunk_ready(size_t chunk_index) {
+    return session_->is_chunk_ready(chunk_index);
+}
+
+size_t ScatterReadHandle::completed_count() {
+    return session_->completed_count();
+}
+
+ErrorCode ScatterReadHandle::wait_chunk(size_t chunk_index) {
+    return session_->wait_chunk(chunk_index);
+}
+
+ErrorCode ScatterReadHandle::wait_all() { return session_->wait_all(); }
 
 // ============================================================================
 // TransferFuture Implementation
@@ -473,6 +1057,51 @@ std::optional<TransferFuture> TransferSubmitter::submit(
     return future;
 }
 
+std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
+    const Replica::Descriptor& replica, std::vector<Slice>& slices,
+    uint64_t src_offset) {
+    std::optional<TransferFuture> future;
+
+    if (replica.is_memory_replica()) {
+        auto& mem_desc = replica.get_memory_descriptor();
+        auto& handle = mem_desc.buffer_descriptor;
+
+        size_t slices_size = 0;
+        for (const auto& s : slices) slices_size += s.size;
+        if (src_offset + slices_size > handle.size_) {
+            LOG(ERROR) << "Range read overflow: src_offset=" << src_offset
+                       << " + slices_size=" << slices_size
+                       << " > handle.size_=" << handle.size_;
+            return std::nullopt;
+        }
+
+        TransferStrategy strategy = selectStrategy(handle, slices);
+
+        if (strategy == TransferStrategy::LOCAL_MEMCPY) {
+            future = submitMemcpyOperation(handle, slices,
+                                           TransferRequest::READ, src_offset);
+        } else if (strategy == TransferStrategy::TRANSFER_ENGINE) {
+            future = submitTransferEngineOperation(
+                handle, slices, TransferRequest::READ, src_offset);
+        } else {
+            LOG(ERROR) << "Range read only supports LOCAL_MEMCPY or "
+                          "TRANSFER_ENGINE, got: "
+                       << strategy;
+            return std::nullopt;
+        }
+    } else if (replica.is_disk_replica() || replica.is_local_disk_replica()) {
+        LOG(ERROR)
+            << "Range read not supported for disk replicas (use full read)";
+        return std::nullopt;
+    }
+
+    if (future.has_value()) {
+        updateTransferMetrics(slices, TransferRequest::READ);
+    }
+
+    return future;
+}
+
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
@@ -542,16 +1171,47 @@ TransferSubmitter::submit_batch_get_offload_object(
     return submitTransfer(requests);
 }
 
+std::optional<TransferFuture> TransferSubmitter::submitBatchReadRanges(
+    void* dest_buffer,
+    const std::vector<std::pair<
+        Replica::Descriptor, std::vector<std::tuple<size_t, size_t, size_t>>>>&
+        key_ranges,
+    bool enable_task_grouping) {
+    auto build_result =
+        buildScatterReadRequests(engine_, dest_buffer, key_ranges,
+                                 enable_task_grouping, "submitBatchReadRanges");
+    if (!build_result) {
+        return std::nullopt;
+    }
+
+    auto& requests = build_result->flat_requests;
+    if (requests.empty()) {
+        return TransferFuture(std::make_shared<EmptyOperationState>());
+    }
+
+    const size_t grouped_task_count = build_result->logical_groups.size();
+    auto future =
+        submitTransfer(requests, enable_task_grouping ? grouped_task_count : 0);
+    if (future && transfer_metric_) {
+        size_t total_bytes = 0;
+        for (const auto& request : requests) {
+            total_bytes += request.length;
+        }
+        transfer_metric_->total_read_bytes.inc(total_bytes);
+    }
+    return future;
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code) {
+    const TransferRequest::OpCode op_code, uint64_t src_offset) {
     auto state = std::make_shared<MemcpyOperationState>();
 
     // Create memcpy operations
     std::vector<MemcpyOperation> operations;
     operations.reserve(slices.size());
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-    uint64_t offset = 0;
+    uint64_t offset = src_offset;
 
     for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];
@@ -562,13 +1222,11 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         const void* src;
 
         if (op_code == TransferRequest::READ) {
-            // READ: from handle (remote buffer) to slice (local
-            // buffer)
+            // READ: from handle (remote buffer) to slice (local buffer)
             dest = slice.ptr;
             src = reinterpret_cast<const void*>(base_address + offset);
         } else {
-            // WRITE: from slice (local buffer) to handle (remote
-            // buffer)
+            // WRITE: from slice (local buffer) to handle (remote buffer)
             dest = reinterpret_cast<void*>(base_address + offset);
             src = slice.ptr;
         }
@@ -588,9 +1246,11 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests) {
-    // Allocate batch ID
-    const size_t batch_size = requests.size();
+    std::vector<TransferRequest>& requests, size_t batch_task_count) {
+    // Allocate batch ID using the actual logical task count when callers
+    // intentionally group multiple requests into one transfer task.
+    const size_t batch_size =
+        batch_task_count == 0 ? requests.size() : batch_task_count;
     BatchID batch_id = engine_.allocateBatchID(batch_size);
     if (batch_id == INVALID_BATCH_ID) {
         LOG(ERROR) << "Failed to allocate batch ID";
@@ -624,7 +1284,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code) {
+    const TransferRequest::OpCode op_code, uint64_t src_offset) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
@@ -642,7 +1302,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     std::vector<TransferRequest> requests;
     requests.reserve(slices.size());
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-    uint64_t offset = 0;
+    uint64_t offset = src_offset;
 
     for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];
@@ -754,6 +1414,151 @@ bool TransferSubmitter::validateTransferParams(
         return false;
     }
     return true;
+}
+
+std::optional<ScatterReadHandle>
+TransferSubmitter::submitStreamingBatchReadRanges(
+    void* dest_buffer,
+    const std::vector<std::pair<
+        Replica::Descriptor, std::vector<std::tuple<size_t, size_t, size_t>>>>&
+        key_ranges,
+    bool enable_task_grouping) {
+    auto build_result = buildScatterReadRequests(
+        engine_, dest_buffer, key_ranges, enable_task_grouping,
+        "submitStreamingBatchReadRanges");
+    if (!build_result) {
+        return std::nullopt;
+    }
+
+    auto chunk_groups = std::move(build_result->logical_groups);
+    auto& requests = build_result->flat_requests;
+    if (requests.empty()) {
+        return ScatterReadHandle(
+            std::make_shared<ChunkedReadSession>(0, ErrorCode::OK));
+    }
+
+    if (!enable_task_grouping) {
+        chunk_groups.reserve(requests.size());
+        for (auto& request : requests) {
+            chunk_groups.push_back({request});
+        }
+    }
+
+    BatchID batch_id = engine_.allocateBatchID(chunk_groups.size());
+    if (batch_id == INVALID_BATCH_ID) {
+        LOG(ERROR)
+            << "submitStreamingBatchReadRanges: failed to allocate batch ID";
+        return std::nullopt;
+    }
+    if (g_transfer_task_test_hooks &&
+        g_transfer_task_test_hooks->on_batch_allocated) {
+        g_transfer_task_test_hooks->on_batch_allocated(batch_id);
+    }
+
+    auto session = std::make_shared<ChunkedReadSession>(
+        engine_, batch_id, std::move(chunk_groups),
+        std::min<size_t>(requests.size() == 0 ? 1 : requests.size(),
+                         kProgressiveGetWindowChunks),
+        "streaming scatter transfer", []() {
+            return g_transfer_task_test_hooks &&
+                   g_transfer_task_test_hooks
+                       ->fail_next_streaming_scatter_submit &&
+                   g_transfer_task_test_hooks
+                       ->fail_next_streaming_scatter_submit();
+        });
+    if (!session->submit_initial_window()) {
+        session.reset();
+        return std::nullopt;
+    }
+
+    if (transfer_metric_) {
+        size_t total_bytes = 0;
+        for (const auto& request : requests) {
+            total_bytes += request.length;
+        }
+        transfer_metric_->total_read_bytes.inc(total_bytes);
+    }
+
+    return ScatterReadHandle(std::move(session));
+}
+
+std::optional<ProgressiveGetHandle> TransferSubmitter::submitProgressiveRead(
+    const Replica::Descriptor& replica, void* dest_buffer, size_t total_size,
+    size_t chunk_size) {
+    if (!replica.is_memory_replica()) {
+        LOG(ERROR) << "submitProgressiveRead: only memory replicas supported";
+        return std::nullopt;
+    }
+    if (chunk_size == 0 || total_size == 0) {
+        LOG(ERROR) << "submitProgressiveRead: invalid sizes (total_size="
+                   << total_size << ", chunk_size=" << chunk_size << ")";
+        return std::nullopt;
+    }
+
+    const auto& handle = replica.get_memory_descriptor().buffer_descriptor;
+    if (handle.transport_endpoint_.empty()) {
+        LOG(ERROR) << "submitProgressiveRead: empty transport endpoint";
+        return std::nullopt;
+    }
+
+    size_t num_chunks = (total_size + chunk_size - 1) / chunk_size;
+    uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
+    char* dest_base = static_cast<char*>(dest_buffer);
+
+    SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
+    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+        LOG(ERROR) << "submitProgressiveRead: failed to open segment for "
+                   << handle.transport_endpoint_;
+        return std::nullopt;
+    }
+
+    std::vector<std::vector<TransferRequest>> chunk_groups;
+    chunk_groups.reserve(num_chunks);
+    std::vector<TransferRequest> requests;
+    requests.reserve(num_chunks);
+
+    for (size_t i = 0; i < num_chunks; ++i) {
+        size_t offset = i * chunk_size;
+        size_t length = std::min(chunk_size, total_size - offset);
+
+        TransferRequest request;
+        request.opcode = TransferRequest::READ;
+        request.source = dest_base + offset;
+        request.target_id = seg;
+        request.target_offset = base_address + offset;
+        request.length = length;
+        requests.emplace_back(request);
+        chunk_groups.push_back({request});
+    }
+
+    BatchID batch_id = engine_.allocateBatchID(num_chunks);
+    if (batch_id == INVALID_BATCH_ID) {
+        LOG(ERROR) << "submitProgressiveRead: failed to allocate batch ID";
+        return std::nullopt;
+    }
+    if (g_transfer_task_test_hooks &&
+        g_transfer_task_test_hooks->on_batch_allocated) {
+        g_transfer_task_test_hooks->on_batch_allocated(batch_id);
+    }
+
+    auto session = std::make_shared<ChunkedReadSession>(
+        engine_, batch_id, std::move(chunk_groups),
+        std::min(num_chunks, kProgressiveGetWindowChunks),
+        "progressive transfer", []() {
+            return g_transfer_task_test_hooks &&
+                   g_transfer_task_test_hooks->fail_next_progressive_submit &&
+                   g_transfer_task_test_hooks->fail_next_progressive_submit();
+        });
+    if (!session->submit_initial_window()) {
+        session.reset();
+        return std::nullopt;
+    }
+
+    if (transfer_metric_) {
+        transfer_metric_->total_read_bytes.inc(total_size);
+    }
+
+    return ProgressiveGetHandle(std::move(session));
 }
 
 void TransferSubmitter::updateTransferMetrics(const std::vector<Slice>& slices,

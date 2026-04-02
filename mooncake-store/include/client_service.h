@@ -165,6 +165,10 @@ class Client {
     tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                       const QueryResult& query_result,
                                       std::vector<Slice>& slices);
+    tl::expected<void, ErrorCode> Get(const std::string& object_key,
+                                      const QueryResult& query_result,
+                                      std::vector<Slice>& slices,
+                                      uint64_t src_offset);
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
@@ -177,6 +181,43 @@ class Client {
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
         bool prefer_same_node = false);
+
+    /**
+     * @brief Start a progressive (chunked) get for per-chunk completion
+     * tracking
+     * @param key Object key
+     * @param dest_buffer Destination buffer (must be registered)
+     * @param buffer_size Size of the destination buffer
+     * @param chunk_size Size per chunk; the transfer is split into
+     *        ceil(object_size/chunk_size) independently trackable tasks
+     * @return ProgressiveGetHandle for per-chunk polling, or nullopt on failure
+     */
+    std::optional<ProgressiveGetHandle> ProgressiveGet(const std::string& key,
+                                                       void* dest_buffer,
+                                                       size_t buffer_size,
+                                                       size_t chunk_size);
+
+    std::optional<ScatterReadHandle> StreamingBatchTransferReadRanges(
+        void* dest_buffer,
+        const std::vector<
+            std::pair<Replica::Descriptor,
+                      std::vector<std::tuple<size_t, size_t, size_t>>>>&
+            key_ranges);
+
+    /**
+     * @brief Batch transfer read of multiple non-contiguous ranges from
+     * multiple keys in a single transfer batch.
+     * @param dest_buffer Base pointer of destination buffer
+     * @param key_ranges For each key: (replica, [(dest_offset, src_offset,
+     * size), ...])
+     * @return ErrorCode::OK on success
+     */
+    ErrorCode BatchTransferReadRanges(
+        void* dest_buffer,
+        const std::vector<
+            std::pair<Replica::Descriptor,
+                      std::vector<std::tuple<size_t, size_t, size_t>>>>&
+            key_ranges);
 
     /**
      * @brief Stores data with replication
@@ -513,6 +554,9 @@ class Client {
                             std::vector<Slice>& slices);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices);
+    ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
+                                std::vector<Slice>& slices,
+                                uint64_t src_offset);
 
     /**
      * @brief Prepare and use the storage backend for persisting data

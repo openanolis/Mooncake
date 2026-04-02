@@ -15,7 +15,7 @@ function(add_store_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-function(add_ha_test name)
+function(add_hot_standby_ut_test name)
   add_executable(${name} ${ARGN})
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(
@@ -77,6 +77,21 @@ add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
 add_store_test(health_check_test health_check_test.cpp)
+add_store_test(progressive_get_test progressive_get_test.cpp)
+add_store_test(scatter_streaming_test scatter_streaming_test.cpp)
+
+add_executable(cross_node_bench cross_node_bench.cpp)
+target_link_libraries(
+  cross_node_bench
+  PUBLIC mooncake_store
+         transfer_engine
+         cachelib_memory_allocator
+         ${ETCD_WRAPPER_LIB}
+         glog
+         gflags
+         ibverbs
+         pthread)
+
 add_subdirectory(e2e)
 
 add_executable(high_availability_test ha/leadership/high_availability_test.cpp)
@@ -119,27 +134,18 @@ target_link_libraries(
          gflags
          pthread)
 
-# HA tests
-add_ha_test(standby_state_machine_test
-            ha/standby/standby_state_machine_test.cpp)
-add_ha_test(ha_metric_manager_test
-            ha/standby/ha_metric_manager_test.cpp)
-add_ha_test(hot_standby_service_test
-            ha/standby/hot_standby_service_test.cpp)
-add_ha_test(hot_standby_snapshot_bootstrap_test
-            ha/standby/hot_standby_snapshot_bootstrap_test.cpp)
-add_ha_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)
-add_ha_test(oplog_manager_test ha/oplog/oplog_manager_test.cpp)
-add_ha_test(oplog_watcher_test ha/oplog/oplog_watcher_test.cpp)
-add_ha_test(etcd_oplog_store_test ha/oplog/etcd_oplog_store_test.cpp)
-add_ha_test(catalog_backed_snapshot_provider_test
-            ha/snapshot/catalog_backed_snapshot_provider_test.cpp)
-if(STORE_USE_REDIS)
-  foreach(target catalog_backed_snapshot_provider_test
-                 hot_standby_snapshot_bootstrap_test)
-    target_include_directories(${target} PRIVATE
-                               ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
-    target_link_libraries(${target}
-                          PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
-  endforeach()
-endif()
+# Hot standby UTs (tests/hot_standby_ut)
+add_hot_standby_ut_test(standby_state_machine_test
+                        hot_standby_ut/standby_state_machine_test.cpp)
+add_hot_standby_ut_test(oplog_applier_test
+                        hot_standby_ut/oplog_applier_test.cpp)
+add_hot_standby_ut_test(oplog_manager_test
+                        hot_standby_ut/oplog_manager_test.cpp)
+add_hot_standby_ut_test(oplog_watcher_test
+                        hot_standby_ut/oplog_watcher_test.cpp)
+add_hot_standby_ut_test(ha_metric_manager_test
+                        hot_standby_ut/ha_metric_manager_test.cpp)
+add_hot_standby_ut_test(hot_standby_service_test
+                        hot_standby_ut/hot_standby_service_test.cpp)
+add_hot_standby_ut_test(etcd_oplog_store_test
+                        hot_standby_ut/etcd_oplog_store_test.cpp)
