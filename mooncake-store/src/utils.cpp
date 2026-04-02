@@ -12,7 +12,9 @@
 
 #include <algorithm>
 #include <memory>
+#include <optional>
 #include <random>
+#include <sstream>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -345,6 +347,22 @@ static std::string SanitizeKey(const std::string &key) {
             kInvalidChars.find(c) != std::string_view::npos ? '_' : c);
     }
     return sanitized_key;
+}
+
+std::string BuildCanonicalObjectKey(
+    const std::string& logical_key, const std::string& tenant_id,
+    const std::string& domain_id, const std::optional<std::string>& version,
+    const std::optional<std::string>& sharing_scope) {
+    std::ostringstream oss;
+    oss << "v1|tenant=" << tenant_id << "|domain=" << domain_id
+        << "|key=" << logical_key;
+    if (version.has_value()) {
+        oss << "|version=" << *version;
+    }
+    if (sharing_scope.has_value()) {
+        oss << "|scope=" << *sharing_scope;
+    }
+    return oss.str();
 }
 
 std::string ResolvePathFromKey(const std::string &key,

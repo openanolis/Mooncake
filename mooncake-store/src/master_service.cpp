@@ -36,7 +36,8 @@ static const std::string SNAPSHOT_BACKUP_SAVE_DIR =
     "mooncake_snapshot_save_backup";
 static const std::string SNAPSHOT_BACKUP_RESTORE_DIR =
     "mooncake_snapshot_restore_backup";
-static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
+static const std::string SNAPSHOT_SERIALIZER_VERSION = "2.0.0";
+static const std::string SNAPSHOT_SERIALIZER_VERSION_V1 = "1.0.0";
 static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
 
 namespace {
@@ -684,6 +685,8 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
                 results.emplace(key, std::move(replica_list));
                 metadata.GrantLease(default_kv_lease_ttl_,
                                     default_kv_soft_pin_ttl_);
+                const_cast<MasterService::ObjectMetadata&>(metadata)
+                    .UpdateLastAccessed(std::chrono::system_clock::now());
             }
         }
     }
@@ -724,6 +727,8 @@ auto MasterService::GetReplicaList(const std::string& key)
     // Grant a lease to the object so it will not be removed
     // when the client is reading it.
     metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+    const_cast<MasterService::ObjectMetadata&>(metadata).UpdateLastAccessed(
+        std::chrono::system_clock::now());
 
     return GetReplicaListResponse(std::move(replica_list),
                                   default_kv_lease_ttl_);
@@ -755,11 +760,26 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             << ", slice_length=" << slice_length << ", config=" << config
             << ", action=put_start_begin";
 
+    const auto normalized_tenant_id =
+        config.tenant_id.empty() ? std::string("default") : config.tenant_id;
+    const auto normalized_domain_id =
+        config.domain_id.empty() ? std::string("default") : config.domain_id;
+    auto normalized_pin = config.pin;
+    if (config.with_hard_pin) {
+        normalized_pin.mode = PinMode::HARD;
+    } else if (config.with_soft_pin && normalized_pin.mode == PinMode::NONE) {
+        normalized_pin.mode = PinMode::SOFT;
+        normalized_pin.ttl_ms = default_kv_soft_pin_ttl_;
+    }
+    const auto now = std::chrono::system_clock::now();
+    const auto canonical_key =
+        BuildCanonicalObjectKey(key, normalized_tenant_id, normalized_domain_id,
+                                config.version, config.sharing_scope);
+
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // Lock the shard and check if object already exists
     MetadataShardAccessorRW shard(this, getShardIndex(key));
 
-    const auto now = std::chrono::system_clock::now();
     auto it = shard->metadata.find(key);
     if (it != shard->metadata.end() && !CleanupStaleHandles(it->second)) {
         auto& metadata = it->second;
@@ -833,8 +853,15 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     // PutEnd is called.
     shard->metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
-        std::forward_as_tuple(client_id, now, total_length, std::move(replicas),
-                              config.with_soft_pin, config.with_hard_pin));
+        std::forward_as_tuple(
+            client_id, now, total_length, std::move(replicas),
+            config.with_soft_pin || normalized_pin.mode == PinMode::SOFT,
+            config.with_hard_pin || normalized_pin.mode == PinMode::HARD, key,
+            canonical_key, normalized_tenant_id, normalized_domain_id,
+            config.version, config.sharing_scope, config.data_type,
+            config.qos_tier, config.access_mode, config.type_hints,
+            config.retention, normalized_pin, config.group_path,
+            config.generation, now, now));
     // Also insert the metadata into processing set for monitoring.
     shard->processing_keys.insert(key);
 
@@ -893,6 +920,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+    metadata.UpdateLastAccessed(std::chrono::system_clock::now());
     return {};
 }
 
@@ -902,10 +930,15 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
+        const auto now = std::chrono::system_clock::now();
+        const auto object_size =
+            replica.get_descriptor().get_local_disk_descriptor().object_size;
         accessor.Create(
-            client_id,
-            replica.get_descriptor().get_local_disk_descriptor().object_size,
-            std::vector<Replica>{}, false);
+            client_id, object_size, std::vector<Replica>{}, false, false, key,
+            BuildCanonicalObjectKey(key, "default", "default"), "default",
+            "default", std::nullopt, std::nullopt, ObjectDataType::UNKNOWN,
+            QoSTier::SHARED, AccessMode::NORMAL, {}, RetentionSpec{}, PinSpec{},
+            "", 0, now, now);
     }
     auto& metadata = accessor.Get();
     if (replica.type() != ReplicaType::LOCAL_DISK) {
@@ -2713,9 +2746,11 @@ void MasterService::RestoreState() {
                        << ", starting fresh";
             return;
         }
-        if (version != SNAPSHOT_SERIALIZER_VERSION) {
+        if (version != SNAPSHOT_SERIALIZER_VERSION &&
+            version != SNAPSHOT_SERIALIZER_VERSION_V1) {
             LOG(ERROR) << "[Restore] Incompatible snapshot version: " << version
-                       << ", expected: " << SNAPSHOT_SERIALIZER_VERSION
+                       << ", expected one of: " << SNAPSHOT_SERIALIZER_VERSION
+                       << ", " << SNAPSHOT_SERIALIZER_VERSION_V1
                        << ", starting fresh";
             return;
         }
@@ -3637,7 +3672,15 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
                 metadata_ptr->size, metadata_ptr->PopReplicas(),
                 metadata_ptr->soft_pin_timeout.has_value(),
-                metadata_ptr->IsHardPinned()));
+                metadata_ptr->IsHardPinned(), metadata_ptr->logical_key,
+                metadata_ptr->canonical_key, metadata_ptr->tenant_id,
+                metadata_ptr->domain_id, metadata_ptr->version,
+                metadata_ptr->sharing_scope, metadata_ptr->data_type,
+                metadata_ptr->qos_tier, metadata_ptr->access_mode,
+                metadata_ptr->type_hints, metadata_ptr->retention,
+                metadata_ptr->pin, metadata_ptr->group_path,
+                metadata_ptr->generation, metadata_ptr->created_at,
+                metadata_ptr->last_accessed_at));
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
@@ -3650,54 +3693,108 @@ tl::expected<void, SerializationError>
 MasterService::MetadataSerializer::SerializeMetadata(
     const MasterService::ObjectMetadata& metadata,
     MsgpackPacker& packer) const {
-    // Pack ObjectMetadata using array structure for efficiency
-    // Format: [client_id, put_start_time, size, lease_timeout,
-    // has_soft_pin_timeout, soft_pin_timeout, replicas_count, replicas...,
-    // hard_pinned]
+    const auto serialize_timepoint_ms =
+        [](const std::chrono::system_clock::time_point& tp) {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       tp.time_since_epoch())
+                .count();
+        };
 
-    size_t array_size = 8;  // client_id, put_start_time, size, lease_timeout,
-                            // has_soft_pin_timeout, soft_pin_timeout,
-                            // replicas_count + hard_pinned
-    array_size += metadata.CountReplicas();  // One element per replica
-    packer.pack_array(array_size);
+    packer.pack_map(22);
 
-    // Serialize client_id
     std::string client_id = UuidToString(metadata.client_id);
+    packer.pack("client_id");
     packer.pack(client_id);
 
-    // Serialize put_start_time (convert to timestamp)
-    auto put_start_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              metadata.put_start_time.time_since_epoch())
-                              .count();
-    packer.pack(put_start_time);
+    packer.pack("put_start_time_ms");
+    packer.pack(serialize_timepoint_ms(metadata.put_start_time));
 
-    // Serialize size
+    packer.pack("size");
     packer.pack(static_cast<uint64_t>(metadata.size));
 
-    // Serialize lease_timeout (convert to timestamp)
-    auto lease_timestamp =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            metadata.lease_timeout.time_since_epoch())
-            .count();
-    packer.pack(lease_timestamp);
+    packer.pack("lease_timeout_ms");
+    packer.pack(serialize_timepoint_ms(metadata.lease_timeout));
 
-    // Serialize soft_pin_timeout (if exists)
+    packer.pack("soft_pin_timeout_ms");
     if (metadata.soft_pin_timeout.has_value()) {
-        packer.pack(true);  // Mark soft_pin_timeout exists
-        auto soft_pin_timestamp =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                metadata.soft_pin_timeout.value().time_since_epoch())
-                .count();
-        packer.pack(soft_pin_timestamp);
+        packer.pack(serialize_timepoint_ms(metadata.soft_pin_timeout.value()));
     } else {
-        packer.pack(false);        // Mark soft_pin_timeout does not exist
-        packer.pack(uint64_t(0));  // Placeholder
+        packer.pack_nil();
     }
 
-    // Serialize replicas count
-    packer.pack(static_cast<uint32_t>(metadata.CountReplicas()));
+    packer.pack("hard_pinned");
+    packer.pack(metadata.IsHardPinned());
 
-    // Serialize replicas
+    packer.pack("logical_key");
+    packer.pack(metadata.logical_key);
+
+    packer.pack("canonical_key");
+    packer.pack(metadata.canonical_key);
+
+    packer.pack("tenant_id");
+    packer.pack(metadata.tenant_id);
+
+    packer.pack("domain_id");
+    packer.pack(metadata.domain_id);
+
+    packer.pack("version");
+    if (metadata.version.has_value()) {
+        packer.pack(*metadata.version);
+    } else {
+        packer.pack_nil();
+    }
+
+    packer.pack("sharing_scope");
+    if (metadata.sharing_scope.has_value()) {
+        packer.pack(*metadata.sharing_scope);
+    } else {
+        packer.pack_nil();
+    }
+
+    packer.pack("data_type");
+    packer.pack(static_cast<uint8_t>(metadata.data_type));
+
+    packer.pack("qos_tier");
+    packer.pack(static_cast<uint8_t>(metadata.qos_tier));
+
+    packer.pack("access_mode");
+    packer.pack(static_cast<uint8_t>(metadata.access_mode));
+
+    packer.pack("type_hints");
+    packer.pack(metadata.type_hints);
+
+    packer.pack("retention");
+    packer.pack_array(4);
+    packer.pack(static_cast<uint8_t>(metadata.retention.policy));
+    packer.pack(metadata.retention.ttl_ms);
+    packer.pack(metadata.retention.keep_last_n);
+    packer.pack(metadata.retention.delete_recursively);
+
+    packer.pack("pin");
+    packer.pack_array(8);
+    packer.pack(static_cast<uint8_t>(metadata.pin.mode));
+    packer.pack(metadata.pin.ttl_ms);
+    packer.pack(metadata.pin.refresh_on_read);
+    packer.pack(metadata.pin.refresh_on_batch_get);
+    packer.pack(metadata.pin.protect_from_eviction);
+    packer.pack(metadata.pin.protect_from_offload);
+    packer.pack(metadata.pin.protect_from_auto_retention_cleanup);
+    packer.pack(metadata.pin.explicit_delete_requires_force);
+
+    packer.pack("group_path");
+    packer.pack(metadata.group_path);
+
+    packer.pack("generation");
+    packer.pack(metadata.generation);
+
+    packer.pack("created_at_ms");
+    packer.pack(metadata.CreatedAtMs());
+
+    packer.pack("last_accessed_at_ms");
+    packer.pack(metadata.LastAccessedAtMs());
+
+    packer.pack("replicas");
+    packer.pack_array(metadata.CountReplicas());
     for (const auto& replica : metadata.GetAllReplicas()) {
         auto result = Serializer<Replica>::serialize(
             replica, service_->segment_manager_.getView(), packer);
@@ -3706,24 +3803,135 @@ MasterService::MetadataSerializer::SerializeMetadata(
         }
     }
 
-    packer.pack(metadata.IsHardPinned());
-
     return {};
 }
 
 tl::expected<std::unique_ptr<MasterService::ObjectMetadata>, SerializationError>
 MasterService::MetadataSerializer::DeserializeMetadata(
     const msgpack::object& obj) const {
-    // Check if input is a valid array
+    if (obj.type == msgpack::type::MAP) {
+        std::unordered_map<std::string, msgpack::object> fields;
+        fields.reserve(obj.via.map.size);
+        for (uint32_t i = 0; i < obj.via.map.size; ++i) {
+            auto& kv = obj.via.map.ptr[i];
+            fields.emplace(kv.key.as<std::string>(), kv.val);
+        }
+
+        UUID client_id;
+        StringToUuid(fields.at("client_id").as<std::string>(), client_id);
+        const auto put_start_time_timestamp =
+            fields.at("put_start_time_ms").as<int64_t>();
+        const auto size = static_cast<size_t>(fields.at("size").as<uint64_t>());
+        const auto lease_timestamp =
+            fields.at("lease_timeout_ms").as<int64_t>();
+
+        std::optional<int64_t> soft_pin_timestamp;
+        const auto soft_pin_it = fields.find("soft_pin_timeout_ms");
+        if (soft_pin_it != fields.end() &&
+            soft_pin_it->second.type != msgpack::type::NIL) {
+            soft_pin_timestamp = soft_pin_it->second.as<int64_t>();
+        }
+
+        auto replicas_obj = fields.at("replicas");
+        if (replicas_obj.type != msgpack::type::ARRAY) {
+            return tl::unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "deserialize ObjectMetadata replicas is not an array"));
+        }
+
+        std::vector<Replica> replicas;
+        replicas.reserve(replicas_obj.via.array.size);
+        for (uint32_t i = 0; i < replicas_obj.via.array.size; ++i) {
+            auto result = Serializer<Replica>::deserialize(
+                replicas_obj.via.array.ptr[i],
+                service_->segment_manager_.getView());
+            if (!result) {
+                return tl::unexpected(result.error());
+            }
+            replicas.emplace_back(std::move(*result.value()));
+        }
+
+        auto metadata = std::make_unique<ObjectMetadata>(
+            client_id,
+            std::chrono::system_clock::time_point(
+                std::chrono::milliseconds(put_start_time_timestamp)),
+            size, std::move(replicas), soft_pin_timestamp.has_value(),
+            fields.at("hard_pinned").as<bool>());
+        metadata->lease_timeout = std::chrono::system_clock::time_point(
+            std::chrono::milliseconds(lease_timestamp));
+        if (soft_pin_timestamp.has_value()) {
+            metadata->soft_pin_timeout.emplace(
+                std::chrono::system_clock::time_point(
+                    std::chrono::milliseconds(*soft_pin_timestamp)));
+        }
+        metadata->logical_key = fields.at("logical_key").as<std::string>();
+        metadata->canonical_key = fields.at("canonical_key").as<std::string>();
+        metadata->tenant_id = fields.at("tenant_id").as<std::string>();
+        metadata->domain_id = fields.at("domain_id").as<std::string>();
+        if (auto it = fields.find("version");
+            it != fields.end() && it->second.type != msgpack::type::NIL) {
+            metadata->version = it->second.as<std::string>();
+        }
+        if (auto it = fields.find("sharing_scope");
+            it != fields.end() && it->second.type != msgpack::type::NIL) {
+            metadata->sharing_scope = it->second.as<std::string>();
+        }
+        metadata->data_type =
+            static_cast<ObjectDataType>(fields.at("data_type").as<uint8_t>());
+        metadata->qos_tier =
+            static_cast<QoSTier>(fields.at("qos_tier").as<uint8_t>());
+        metadata->access_mode =
+            static_cast<AccessMode>(fields.at("access_mode").as<uint8_t>());
+        metadata->type_hints =
+            fields.at("type_hints")
+                .as<std::unordered_map<std::string, std::string>>();
+        auto retention_obj = fields.at("retention");
+        if (retention_obj.type == msgpack::type::ARRAY &&
+            retention_obj.via.array.size == 4) {
+            metadata->retention.policy = static_cast<RetentionPolicy>(
+                retention_obj.via.array.ptr[0].as<uint8_t>());
+            metadata->retention.ttl_ms =
+                retention_obj.via.array.ptr[1].as<uint64_t>();
+            metadata->retention.keep_last_n =
+                retention_obj.via.array.ptr[2].as<uint32_t>();
+            metadata->retention.delete_recursively =
+                retention_obj.via.array.ptr[3].as<bool>();
+        }
+        auto pin_obj = fields.at("pin");
+        if (pin_obj.type == msgpack::type::ARRAY &&
+            pin_obj.via.array.size == 8) {
+            metadata->pin.mode =
+                static_cast<PinMode>(pin_obj.via.array.ptr[0].as<uint8_t>());
+            metadata->pin.ttl_ms = pin_obj.via.array.ptr[1].as<uint64_t>();
+            metadata->pin.refresh_on_read = pin_obj.via.array.ptr[2].as<bool>();
+            metadata->pin.refresh_on_batch_get =
+                pin_obj.via.array.ptr[3].as<bool>();
+            metadata->pin.protect_from_eviction =
+                pin_obj.via.array.ptr[4].as<bool>();
+            metadata->pin.protect_from_offload =
+                pin_obj.via.array.ptr[5].as<bool>();
+            metadata->pin.protect_from_auto_retention_cleanup =
+                pin_obj.via.array.ptr[6].as<bool>();
+            metadata->pin.explicit_delete_requires_force =
+                pin_obj.via.array.ptr[7].as<bool>();
+        }
+        metadata->group_path = fields.at("group_path").as<std::string>();
+        metadata->generation = fields.at("generation").as<uint64_t>();
+        metadata->created_at =
+            std::chrono::system_clock::time_point(std::chrono::milliseconds(
+                fields.at("created_at_ms").as<int64_t>()));
+        metadata->last_accessed_at =
+            std::chrono::system_clock::time_point(std::chrono::milliseconds(
+                fields.at("last_accessed_at_ms").as<int64_t>()));
+        return metadata;
+    }
+
     if (obj.type != msgpack::type::ARRAY) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize ObjectMetadata state is not an array"));
     }
 
-    // Need at least 7 elements: client_id, put_start_time, size, lease_timeout,
-    // has_soft_pin_timeout, soft_pin_timeout, replicas_count
-    // (8th element = hard_pinned is optional for backward compat)
     if (obj.via.array.size < 7) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
@@ -3733,31 +3941,16 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     msgpack::object* array = obj.via.array.ptr;
     uint32_t index = 0;
 
-    // Deserialize client_id string
     std::string client_id_str = array[index++].as<std::string>();
     UUID client_id;
     StringToUuid(client_id_str, client_id);
-
-    // Deserialize put_start_time
     uint64_t put_start_time_timestamp = array[index++].as<uint64_t>();
-
-    // Deserialize size
     auto size = static_cast<size_t>(array[index++].as<uint64_t>());
-
-    // Deserialize lease_timeout
     uint64_t lease_timestamp = array[index++].as<uint64_t>();
-
-    // Deserialize soft_pin_timeout flag
     bool has_soft_pin_timeout = array[index++].as<bool>();
-
-    // Deserialize soft_pin_timeout value
     uint64_t soft_pin_timestamp = array[index++].as<uint64_t>();
-
-    // Deserialize replicas count
     uint32_t replicas_count = array[index++].as<uint32_t>();
 
-    // Array size: 7 + replicas_count (old format) or 8 + replicas_count (new
-    // format with hard_pinned)
     if (obj.via.array.size != 7 + replicas_count &&
         obj.via.array.size != 8 + replicas_count) {
         return tl::unexpected(SerializationError(
@@ -3765,10 +3958,8 @@ MasterService::MetadataSerializer::DeserializeMetadata(
             "deserialize ObjectMetadata array size mismatch"));
     }
 
-    // Deserialize replicas
     std::vector<Replica> replicas;
     replicas.reserve(replicas_count);
-
     for (uint32_t i = 0; i < replicas_count; i++) {
         auto result = Serializer<Replica>::deserialize(
             array[index++], service_->segment_manager_.getView());
@@ -3778,13 +3969,11 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         replicas.emplace_back(std::move(*result.value()));
     }
 
-    // Deserialize hard_pinned (if present, otherwise default to false)
     bool is_hard_pinned = false;
     if (index < obj.via.array.size) {
         is_hard_pinned = array[index++].as<bool>();
     }
 
-    // Create ObjectMetadata instance
     bool enable_soft_pin = has_soft_pin_timeout;
     auto metadata = std::make_unique<ObjectMetadata>(
         client_id,
@@ -3793,13 +3982,18 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         size, std::move(replicas), enable_soft_pin, is_hard_pinned);
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
-
-    // Set soft_pin_timeout (if exists)
     if (has_soft_pin_timeout) {
         metadata->soft_pin_timeout.emplace(
             std::chrono::system_clock::time_point(
                 std::chrono::milliseconds(soft_pin_timestamp)));
     }
+    metadata->logical_key = "";
+    metadata->canonical_key = "";
+    metadata->tenant_id = "default";
+    metadata->domain_id = "default";
+    metadata->created_at = std::chrono::system_clock::time_point(
+        std::chrono::milliseconds(put_start_time_timestamp));
+    metadata->last_accessed_at = metadata->created_at;
 
     return metadata;
 }

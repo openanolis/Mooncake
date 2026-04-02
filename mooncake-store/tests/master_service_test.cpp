@@ -2342,6 +2342,49 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
               << "Unmount time: " << unmount_duration.count() << "ms\n";
 }
 
+TEST_F(MasterServiceTest, GetReplicaListByRegexExtendsLease) {
+    const uint64_t kv_lease_ttl = 50;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    std::string key = "regex_leased_key";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto put_start_result =
+        service_->PutStart(client_id, key, slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    auto regex_get_result = service_->GetReplicaListByRegex("^regex_leased_.*");
+    ASSERT_TRUE(regex_get_result.has_value());
+    ASSERT_TRUE(regex_get_result->contains(key));
+
+    auto remove_result = service_->Remove(key);
+    EXPECT_FALSE(remove_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_result.error());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    auto regex_get_result2 =
+        service_->GetReplicaListByRegex("^regex_leased_.*");
+    ASSERT_TRUE(regex_get_result2.has_value());
+    ASSERT_TRUE(regex_get_result2->contains(key));
+
+    auto remove_result2 = service_->Remove(key);
+    EXPECT_FALSE(remove_result2.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_result2.error());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    auto remove_result3 = service_->Remove(key);
+    EXPECT_TRUE(remove_result3.has_value());
+}
+
 TEST_F(MasterServiceTest, RemoveLeasedObject) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()

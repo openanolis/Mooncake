@@ -79,6 +79,127 @@ inline std::ostream& operator<<(std::ostream& os,
 }
 
 /**
+ * @brief Governance-oriented object data type.
+ */
+enum class ObjectDataType : uint8_t {
+    UNKNOWN = 0,
+    KVCACHE = 1,
+    TENSOR = 2,
+    WEIGHT = 3,
+    SAMPLE = 4,
+    ACTIVATION = 5,
+    GRADIENT = 6,
+    OPTIMIZER_STATE = 7,
+    METADATA = 8,
+};
+
+/**
+ * @brief QoS tier used for future governance and reclaim policies.
+ */
+enum class QoSTier : uint8_t {
+    RESERVED = 0,
+    PROTECTED = 1,
+    SHARED = 2,
+    EPHEMERAL = 3,
+};
+
+/**
+ * @brief Object access mode.
+ */
+enum class AccessMode : uint8_t {
+    NORMAL = 0,
+    READ_ONLY = 1,
+};
+
+/**
+ * @brief Retention policy for object lifecycle management.
+ */
+enum class RetentionPolicy : uint8_t {
+    EXPLICIT_DELETE = 0,
+    TTL = 1,
+    KEEP_LAST_N = 2,
+};
+
+/**
+ * @brief Pin mode for object lifecycle protection.
+ */
+enum class PinMode : uint8_t {
+    NONE = 0,
+    SOFT = 1,
+    HARD = 2,
+};
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const ObjectDataType& data_type) noexcept {
+    return os << static_cast<int>(data_type);
+}
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const QoSTier& qos_tier) noexcept {
+    return os << static_cast<int>(qos_tier);
+}
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const AccessMode& access_mode) noexcept {
+    return os << static_cast<int>(access_mode);
+}
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const RetentionPolicy& policy) noexcept {
+    return os << static_cast<int>(policy);
+}
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const PinMode& pin_mode) noexcept {
+    return os << static_cast<int>(pin_mode);
+}
+
+struct RetentionSpec {
+    RetentionPolicy policy{RetentionPolicy::EXPLICIT_DELETE};
+    uint64_t ttl_ms{0};
+    uint32_t keep_last_n{0};
+    bool delete_recursively{false};
+    YLT_REFL(RetentionSpec, policy, ttl_ms, keep_last_n, delete_recursively);
+};
+
+struct PinSpec {
+    PinMode mode{PinMode::NONE};
+    uint64_t ttl_ms{0};
+    bool refresh_on_read{true};
+    bool refresh_on_batch_get{true};
+    bool protect_from_eviction{true};
+    bool protect_from_offload{true};
+    bool protect_from_auto_retention_cleanup{true};
+    bool explicit_delete_requires_force{true};
+    YLT_REFL(PinSpec, mode, ttl_ms, refresh_on_read, refresh_on_batch_get,
+             protect_from_eviction, protect_from_offload,
+             protect_from_auto_retention_cleanup,
+             explicit_delete_requires_force);
+};
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const RetentionSpec& retention) noexcept {
+    os << "{ policy: " << retention.policy << ", ttl_ms: "
+       << retention.ttl_ms << ", keep_last_n: " << retention.keep_last_n
+       << ", delete_recursively: " << retention.delete_recursively << " }";
+    return os;
+}
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const PinSpec& pin) noexcept {
+    os << "{ mode: " << pin.mode << ", ttl_ms: " << pin.ttl_ms
+       << ", refresh_on_read: " << pin.refresh_on_read
+       << ", refresh_on_batch_get: " << pin.refresh_on_batch_get
+       << ", protect_from_eviction: " << pin.protect_from_eviction
+       << ", protect_from_offload: " << pin.protect_from_offload
+       << ", protect_from_auto_retention_cleanup: "
+       << pin.protect_from_auto_retention_cleanup
+       << ", explicit_delete_requires_force: "
+       << pin.explicit_delete_requires_force << " }";
+    return os;
+}
+
+/**
  * @brief Configuration for replica management
  */
 struct ReplicateConfig {
@@ -90,6 +211,19 @@ struct ReplicateConfig {
     std::string preferred_segment{};  // Deprecated: Single preferred segment
                                       // for backward compatibility
     bool prefer_alloc_in_same_node{false};
+
+    std::string tenant_id{"default"};
+    std::string domain_id{"default"};
+    std::optional<std::string> version{};
+    std::optional<std::string> sharing_scope{};
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    QoSTier qos_tier{QoSTier::SHARED};
+    AccessMode access_mode{AccessMode::NORMAL};
+    std::unordered_map<std::string, std::string> type_hints{};
+    RetentionSpec retention{};
+    PinSpec pin{};
+    std::string group_path{};
+    uint64_t generation{0};
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
@@ -107,10 +241,29 @@ struct ReplicateConfig {
                << config.preferred_segment;
         }
         os << ", prefer_alloc_in_same_node: "
-           << config.prefer_alloc_in_same_node << " }";
+           << config.prefer_alloc_in_same_node
+           << ", tenant_id: " << config.tenant_id
+           << ", domain_id: " << config.domain_id
+           << ", version: "
+           << (config.version.has_value() ? *config.version : "nullopt")
+           << ", sharing_scope: "
+           << (config.sharing_scope.has_value() ? *config.sharing_scope
+                                                : "nullopt")
+           << ", data_type: " << config.data_type
+           << ", qos_tier: " << config.qos_tier
+           << ", access_mode: " << config.access_mode
+           << ", retention: " << config.retention
+           << ", pin: " << config.pin
+           << ", group_path: " << config.group_path
+           << ", generation: " << config.generation << " }";
         return os;
     }
 };
+
+YLT_REFL(ReplicateConfig, replica_num, with_soft_pin, with_hard_pin,
+         preferred_segments, preferred_segment, prefer_alloc_in_same_node,
+         tenant_id, domain_id, version, sharing_scope, data_type, qos_tier,
+         access_mode, type_hints, retention, pin, group_path, generation);
 
 struct MemoryReplicaData {
     std::unique_ptr<AllocatedBuffer> buffer;

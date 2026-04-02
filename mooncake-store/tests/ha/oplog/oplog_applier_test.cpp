@@ -101,6 +101,34 @@ std::string MakeValidJsonPayload(uint64_t client_id_first = 1,
     MetadataPayload payload;
     payload.client_id = {client_id_first, client_id_second};
     payload.size = size;
+    payload.logical_key = "logical-key";
+    payload.canonical_key =
+        "v1|tenant=tenant-a|domain=domain-a|key=logical-key|version=v1|scope="
+        "shared";
+    payload.tenant_id = "tenant-a";
+    payload.domain_id = "domain-a";
+    payload.version = "v1";
+    payload.sharing_scope = "shared";
+    payload.data_type = ObjectDataType::TENSOR;
+    payload.qos_tier = QoSTier::PROTECTED;
+    payload.access_mode = AccessMode::READ_ONLY;
+    payload.type_hints = {{"format", "fp16"}, {"layout", "row-major"}};
+    payload.retention.policy = RetentionPolicy::TTL;
+    payload.retention.ttl_ms = 60000;
+    payload.retention.keep_last_n = 2;
+    payload.retention.delete_recursively = true;
+    payload.pin.mode = PinMode::SOFT;
+    payload.pin.ttl_ms = 30000;
+    payload.pin.refresh_on_read = false;
+    payload.pin.refresh_on_batch_get = false;
+    payload.pin.protect_from_eviction = true;
+    payload.pin.protect_from_offload = false;
+    payload.pin.protect_from_auto_retention_cleanup = true;
+    payload.pin.explicit_delete_requires_force = false;
+    payload.group_path = "/tenant-a/model-a";
+    payload.generation = 7;
+    payload.created_at_ms = 1111;
+    payload.last_accessed_at_ms = 2222;
     payload.replicas = {};
     auto buf = struct_pack::serialize(payload);
     return std::string(buf.data(), buf.size());
@@ -531,6 +559,39 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd_ValidJson) {
     EXPECT_EQ(1u, meta->client_id.first);
     EXPECT_EQ(2u, meta->client_id.second);
     EXPECT_EQ(2048u, meta->size);
+    EXPECT_EQ("logical-key", meta->logical_key);
+    EXPECT_EQ(
+        "v1|tenant=tenant-a|domain=domain-a|key=logical-key|version=v1|scope="
+        "shared",
+        meta->canonical_key);
+    EXPECT_EQ("tenant-a", meta->tenant_id);
+    EXPECT_EQ("domain-a", meta->domain_id);
+    ASSERT_TRUE(meta->version.has_value());
+    EXPECT_EQ("v1", *meta->version);
+    ASSERT_TRUE(meta->sharing_scope.has_value());
+    EXPECT_EQ("shared", *meta->sharing_scope);
+    EXPECT_EQ(ObjectDataType::TENSOR, meta->data_type);
+    EXPECT_EQ(QoSTier::PROTECTED, meta->qos_tier);
+    EXPECT_EQ(AccessMode::READ_ONLY, meta->access_mode);
+    EXPECT_EQ("fp16", meta->type_hints.at("format"));
+    EXPECT_EQ("row-major", meta->type_hints.at("layout"));
+    EXPECT_EQ(RetentionPolicy::TTL, meta->retention.policy);
+    EXPECT_EQ(60000u, meta->retention.ttl_ms);
+    EXPECT_EQ(2u, meta->retention.keep_last_n);
+    EXPECT_TRUE(meta->retention.delete_recursively);
+    EXPECT_EQ(PinMode::SOFT, meta->pin.mode);
+    EXPECT_EQ(30000u, meta->pin.ttl_ms);
+    EXPECT_FALSE(meta->pin.refresh_on_read);
+    EXPECT_FALSE(meta->pin.refresh_on_batch_get);
+    EXPECT_TRUE(meta->pin.protect_from_eviction);
+    EXPECT_FALSE(meta->pin.protect_from_offload);
+    EXPECT_TRUE(meta->pin.protect_from_auto_retention_cleanup);
+    EXPECT_FALSE(meta->pin.explicit_delete_requires_force);
+    EXPECT_EQ("/tenant-a/model-a", meta->group_path);
+    EXPECT_EQ(7u, meta->generation);
+    EXPECT_EQ(1111, meta->created_at_ms);
+    EXPECT_EQ(2222, meta->last_accessed_at_ms);
+    EXPECT_EQ(1u, meta->last_sequence_id);
 }
 
 TEST_F(OpLogApplierTest, TestApplyPutEnd_InvalidJson) {

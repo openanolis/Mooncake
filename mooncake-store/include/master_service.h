@@ -515,6 +515,43 @@ class MasterService {
             MasterMetricManager::instance().observe_value_size(value_length);
         }
 
+        ObjectMetadata(
+            const UUID& client_id_,
+            const std::chrono::system_clock::time_point put_start_time_,
+            size_t value_length, std::vector<Replica>&& reps,
+            bool enable_soft_pin, bool enable_hard_pin,
+            const std::string& logical_key_, const std::string& canonical_key_,
+            const std::string& tenant_id_, const std::string& domain_id_,
+            const std::optional<std::string>& version_,
+            const std::optional<std::string>& sharing_scope_,
+            ObjectDataType data_type_, QoSTier qos_tier_,
+            AccessMode access_mode_,
+            std::unordered_map<std::string, std::string> type_hints_,
+            const RetentionSpec& retention_, const PinSpec& pin_,
+            const std::string& group_path_, uint64_t generation_,
+            const std::chrono::system_clock::time_point created_at_,
+            const std::chrono::system_clock::time_point last_accessed_at_)
+            : ObjectMetadata(client_id_, put_start_time_, value_length,
+                             std::move(reps), enable_soft_pin,
+                             enable_hard_pin) {
+            logical_key = logical_key_;
+            canonical_key = canonical_key_;
+            tenant_id = tenant_id_;
+            domain_id = domain_id_;
+            version = version_;
+            sharing_scope = sharing_scope_;
+            data_type = data_type_;
+            qos_tier = qos_tier_;
+            access_mode = access_mode_;
+            type_hints = std::move(type_hints_);
+            retention = retention_;
+            pin = pin_;
+            group_path = group_path_;
+            generation = generation_;
+            created_at = created_at_;
+            last_accessed_at = last_accessed_at_;
+        }
+
         ObjectMetadata(const ObjectMetadata&) = delete;
         ObjectMetadata& operator=(const ObjectMetadata&) = delete;
         ObjectMetadata(ObjectMetadata&&) = delete;
@@ -523,6 +560,23 @@ class MasterService {
         const UUID client_id;
         const std::chrono::system_clock::time_point put_start_time;
         const size_t size;
+
+        std::string logical_key;
+        std::string canonical_key;
+        std::string tenant_id{"default"};
+        std::string domain_id{"default"};
+        std::optional<std::string> version;
+        std::optional<std::string> sharing_scope;
+        ObjectDataType data_type{ObjectDataType::UNKNOWN};
+        QoSTier qos_tier{QoSTier::SHARED};
+        AccessMode access_mode{AccessMode::NORMAL};
+        std::unordered_map<std::string, std::string> type_hints;
+        RetentionSpec retention{};
+        PinSpec pin{};
+        std::string group_path;
+        uint64_t generation{0};
+        std::chrono::system_clock::time_point created_at{};
+        std::chrono::system_clock::time_point last_accessed_at{};
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
@@ -702,6 +756,23 @@ class MasterService {
         }
 
         bool IsHardPinned() const { return hard_pinned; }
+
+        void UpdateLastAccessed(
+            const std::chrono::system_clock::time_point& access_time) {
+            last_accessed_at = access_time;
+        }
+
+        int64_t CreatedAtMs() const {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       created_at.time_since_epoch())
+                .count();
+        }
+
+        int64_t LastAccessedAtMs() const {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       last_accessed_at.time_since_epoch())
+                .count();
+        }
 
         // Check if the metadata is valid
         // Valid means it has at least one valid replica and size is greater
@@ -927,6 +998,40 @@ class MasterService {
                 std::forward_as_tuple(client_id, now, total_length,
                                       std::move(replicas), enable_soft_pin,
                                       enable_hard_pin));
+            it_ = result.first;
+        }
+
+        void Create(const UUID& client_id, uint64_t total_length,
+                    std::vector<Replica> replicas, bool enable_soft_pin,
+                    bool enable_hard_pin, const std::string& logical_key,
+                    const std::string& canonical_key,
+                    const std::string& tenant_id,
+                    const std::string& domain_id,
+                    const std::optional<std::string>& version,
+                    const std::optional<std::string>& sharing_scope,
+                    ObjectDataType data_type, QoSTier qos_tier,
+                    AccessMode access_mode,
+                    std::unordered_map<std::string, std::string> type_hints,
+                    const RetentionSpec& retention, const PinSpec& pin,
+                    const std::string& group_path, uint64_t generation,
+                    const std::chrono::system_clock::time_point& created_at,
+                    const std::chrono::system_clock::time_point&
+                        last_accessed_at) {
+            if (Exists()) {
+                throw std::logic_error("Already exists");
+            }
+            const auto now = std::chrono::system_clock::now();
+            auto result = shard_guard_->metadata.emplace(
+                std::piecewise_construct, std::forward_as_tuple(key_),
+                std::forward_as_tuple(client_id, now, total_length,
+                                      std::move(replicas), enable_soft_pin,
+                                      enable_hard_pin, logical_key,
+                                      canonical_key, tenant_id, domain_id,
+                                      version, sharing_scope, data_type,
+                                      qos_tier, access_mode,
+                                      std::move(type_hints), retention, pin,
+                                      group_path, generation, created_at,
+                                      last_accessed_at));
             it_ = result.first;
         }
 

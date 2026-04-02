@@ -1169,15 +1169,84 @@ class MooncakeHostMemAllocatorPyWrapper {
 
 PYBIND11_MODULE(store, m) {
     // Define the ReplicateConfig class
+    py::enum_<ObjectDataType>(m, "ObjectDataType")
+        .value("UNKNOWN", ObjectDataType::UNKNOWN)
+        .value("KVCACHE", ObjectDataType::KVCACHE)
+        .value("TENSOR", ObjectDataType::TENSOR)
+        .value("WEIGHT", ObjectDataType::WEIGHT)
+        .value("SAMPLE", ObjectDataType::SAMPLE)
+        .value("ACTIVATION", ObjectDataType::ACTIVATION)
+        .value("GRADIENT", ObjectDataType::GRADIENT)
+        .value("OPTIMIZER_STATE", ObjectDataType::OPTIMIZER_STATE)
+        .value("METADATA", ObjectDataType::METADATA)
+        .export_values();
+
+    py::enum_<QoSTier>(m, "QoSTier")
+        .value("RESERVED", QoSTier::RESERVED)
+        .value("PROTECTED", QoSTier::PROTECTED)
+        .value("SHARED", QoSTier::SHARED)
+        .value("EPHEMERAL", QoSTier::EPHEMERAL)
+        .export_values();
+
+    py::enum_<AccessMode>(m, "AccessMode")
+        .value("NORMAL", AccessMode::NORMAL)
+        .value("READ_ONLY", AccessMode::READ_ONLY)
+        .export_values();
+
+    py::enum_<RetentionPolicy>(m, "RetentionPolicy")
+        .value("EXPLICIT_DELETE", RetentionPolicy::EXPLICIT_DELETE)
+        .value("TTL", RetentionPolicy::TTL)
+        .value("KEEP_LAST_N", RetentionPolicy::KEEP_LAST_N)
+        .export_values();
+
+    py::enum_<PinMode>(m, "PinMode")
+        .value("NONE", PinMode::NONE)
+        .value("SOFT", PinMode::SOFT)
+        .value("HARD", PinMode::HARD)
+        .export_values();
+
+    py::class_<RetentionSpec>(m, "RetentionSpec")
+        .def(py::init<>())
+        .def_readwrite("policy", &RetentionSpec::policy)
+        .def_readwrite("ttl_ms", &RetentionSpec::ttl_ms)
+        .def_readwrite("keep_last_n", &RetentionSpec::keep_last_n)
+        .def_readwrite("delete_recursively", &RetentionSpec::delete_recursively);
+
+    py::class_<PinSpec>(m, "PinSpec")
+        .def(py::init<>())
+        .def_readwrite("mode", &PinSpec::mode)
+        .def_readwrite("ttl_ms", &PinSpec::ttl_ms)
+        .def_readwrite("refresh_on_read", &PinSpec::refresh_on_read)
+        .def_readwrite("refresh_on_batch_get", &PinSpec::refresh_on_batch_get)
+        .def_readwrite("protect_from_eviction", &PinSpec::protect_from_eviction)
+        .def_readwrite("protect_from_offload", &PinSpec::protect_from_offload)
+        .def_readwrite("protect_from_auto_retention_cleanup",
+                       &PinSpec::protect_from_auto_retention_cleanup)
+        .def_readwrite("explicit_delete_requires_force",
+                       &PinSpec::explicit_delete_requires_force);
+
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
         .def_readwrite("replica_num", &ReplicateConfig::replica_num)
         .def_readwrite("with_soft_pin", &ReplicateConfig::with_soft_pin)
+        .def_readwrite("with_hard_pin", &ReplicateConfig::with_hard_pin)
         .def_readwrite("preferred_segments",
                        &ReplicateConfig::preferred_segments)
         .def_readwrite("preferred_segment", &ReplicateConfig::preferred_segment)
         .def_readwrite("prefer_alloc_in_same_node",
                        &ReplicateConfig::prefer_alloc_in_same_node)
+        .def_readwrite("tenant_id", &ReplicateConfig::tenant_id)
+        .def_readwrite("domain_id", &ReplicateConfig::domain_id)
+        .def_readwrite("version", &ReplicateConfig::version)
+        .def_readwrite("sharing_scope", &ReplicateConfig::sharing_scope)
+        .def_readwrite("data_type", &ReplicateConfig::data_type)
+        .def_readwrite("qos_tier", &ReplicateConfig::qos_tier)
+        .def_readwrite("access_mode", &ReplicateConfig::access_mode)
+        .def_readwrite("type_hints", &ReplicateConfig::type_hints)
+        .def_readwrite("retention", &ReplicateConfig::retention)
+        .def_readwrite("pin", &ReplicateConfig::pin)
+        .def_readwrite("group_path", &ReplicateConfig::group_path)
+        .def_readwrite("generation", &ReplicateConfig::generation)
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;

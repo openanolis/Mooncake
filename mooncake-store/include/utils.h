@@ -252,6 +252,12 @@ std::vector<std::string> splitString(const std::string& str,
                                      bool trim_spaces = true,
                                      bool keep_empty = false);
 
+std::string BuildCanonicalObjectKey(
+    const std::string& logical_key, const std::string& tenant_id,
+    const std::string& domain_id,
+    const std::optional<std::string>& version = std::nullopt,
+    const std::optional<std::string>& sharing_scope = std::nullopt);
+
 // Buffer allocator functions
 
 constexpr size_t SZ_2MB = 2 * 1024 * 1024;
