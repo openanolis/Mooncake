@@ -47,6 +47,7 @@ struct SessionHeader {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
     defined(USE_MLU) || defined(USE_MACA)
 static bool isCudaMemory(void* addr) {
+    if (!gpu_runtime_available()) return false;
     cudaPointerAttributes attributes;
     auto status = cudaPointerGetAttributes(&attributes, addr);
     if (status != cudaSuccess) return false;

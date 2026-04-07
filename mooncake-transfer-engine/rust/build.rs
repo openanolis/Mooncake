@@ -71,29 +71,48 @@ fn main() {
     }
 
     // CUDA runtime: libtransfer_engine.a built with USE_CUDA=ON pulls in
-    // cudaMemcpy/cudaStream* symbols.  The Rust demos themselves don't call
-    // CUDA — this is purely a transitive archive dep.  Enable with
-    // MOONCAKE_WITH_CUDA=1 and optional CUDA_HOME override for lib path.
+    // CUDA API symbols via cuda_loader (dlopen-based).  The Rust demos
+    // themselves don't call CUDA — this is purely a transitive archive dep.
+    // Enable with MOONCAKE_WITH_CUDA=1.
     if flag_on("MOONCAKE_WITH_CUDA") {
-        // Accept either a CUDA_HOME (append lib64/lib) or an explicit
-        // CUDART_LIB_DIR that already points at the directory containing
-        // libcudart.so.  This covers both /usr/local/cuda installs and
-        // pip-wheel layouts like .../nvidia/cu13/lib.
-        if let Ok(dir) = env::var("CUDART_LIB_DIR") {
+        // Prefer cuda_loader (dlopen-based wrapper) over direct libcudart link.
+        // Accept CUDA_LOADER_LIB_DIR pointing at the directory containing
+        // libcuda_loader.so, or fall back to the build tree default path.
+        if let Ok(dir) = env::var("CUDA_LOADER_LIB_DIR") {
             println!("cargo:rustc-link-search=native={}", dir);
-        } else if let Ok(cuda_home) = env::var("CUDA_HOME") {
-            let lib64 = PathBuf::from(&cuda_home).join("lib64");
-            let lib = PathBuf::from(&cuda_home).join("lib");
-            if lib64.exists() {
-                println!("cargo:rustc-link-search=native={}", lib64.display());
-            }
-            if lib.exists() {
-                println!("cargo:rustc-link-search=native={}", lib.display());
+            println!("cargo:rustc-link-lib=cuda_loader");
+        } else if let Ok(build_dir) = env::var("MOONCAKE_BUILD_DIR") {
+            let loader_dir = PathBuf::from(&build_dir)
+                .join("mooncake-common")
+                .join("cuda_loader");
+            if loader_dir.exists() {
+                println!(
+                    "cargo:rustc-link-search=native={}",
+                    loader_dir.display()
+                );
+                println!("cargo:rustc-link-lib=cuda_loader");
             }
         } else {
-            println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
+            // Fallback: link real CUDA libs directly (non-cuda_loader builds)
+            if let Ok(dir) = env::var("CUDART_LIB_DIR") {
+                println!("cargo:rustc-link-search=native={}", dir);
+            } else if let Ok(cuda_home) = env::var("CUDA_HOME") {
+                let lib64 = PathBuf::from(&cuda_home).join("lib64");
+                let lib = PathBuf::from(&cuda_home).join("lib");
+                if lib64.exists() {
+                    println!(
+                        "cargo:rustc-link-search=native={}",
+                        lib64.display()
+                    );
+                }
+                if lib.exists() {
+                    println!("cargo:rustc-link-search=native={}", lib.display());
+                }
+            } else {
+                println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
+            }
+            println!("cargo:rustc-link-lib=cudart");
         }
-        println!("cargo:rustc-link-lib=cudart");
     }
 
     let bindings = bindgen::builder()

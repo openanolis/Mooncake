@@ -128,7 +128,7 @@ void validateBackend(const std::string &backend) {
     }
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
     defined(USE_MACA)
-    if (backend == "gpu") {
+    if (backend == "gpu" && gpu_runtime_available()) {
         return;
     }
 #endif

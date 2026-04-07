@@ -7,6 +7,7 @@ if (STORE_USE_K8S_LEASE)
 endif()
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_subdirectory(cuda_loader)
 add_subdirectory(src)
 
 if (BUILD_UNIT_TESTS)

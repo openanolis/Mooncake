@@ -34,7 +34,7 @@
 #endif
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#include "cuda_alike.h"
 #endif
 
 static void* (*allocateMemory)(size_t) = nullptr;
@@ -852,6 +852,9 @@ void TransferEnginePy::batchTransferOnCuda(
     const std::vector<uintptr_t>& peer_buffer_addresses,
     const std::vector<size_t>& lengths, TransferOpcode opcode,
     uintptr_t stream_ptr) {
+    if (!gpu_runtime_available()) {
+        throw std::runtime_error("CUDA runtime not available");
+    }
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {

@@ -16,11 +16,13 @@ namespace gpu_staging {
 // If so, writes the device ID to *out_device_id for subsequent SetDevice.
 inline bool IsDevicePointer(const void* ptr, int* out_device_id) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
-    cudaPointerAttributes attr{};
-    if (cudaPointerGetAttributes(&attr, ptr) == cudaSuccess &&
-        attr.type == cudaMemoryTypeDevice) {
-        if (out_device_id) *out_device_id = attr.device;
-        return true;
+    if (gpu_runtime_available()) {
+        cudaPointerAttributes attr{};
+        if (cudaPointerGetAttributes(&attr, ptr) == cudaSuccess &&
+            attr.type == cudaMemoryTypeDevice) {
+            if (out_device_id) *out_device_id = attr.device;
+            return true;
+        }
     }
 #elif defined(USE_HIP)
     hipPointerAttribute_t attr{};
@@ -46,7 +48,8 @@ inline bool IsDevicePointer(const void* ptr, int* out_device_id) {
 // Copy device memory to host. Caller must have called SetDevice first.
 inline bool CopyDeviceToHost(void* dst, const void* src, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
-    return cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost) == cudaSuccess;
+    if (gpu_runtime_available())
+        return cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost) == cudaSuccess;
 #elif defined(USE_HIP)
     return hipMemcpy(dst, src, size, hipMemcpyDeviceToHost) == hipSuccess;
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
@@ -64,7 +67,7 @@ inline bool CopyDeviceToHost(void* dst, const void* src, size_t size) {
 inline void SetDevice(int device_id) {
     if (device_id < 0) return;
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
-    cudaSetDevice(device_id);
+    if (gpu_runtime_available()) cudaSetDevice(device_id);
 #elif defined(USE_HIP)
     hipSetDevice(device_id);
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)

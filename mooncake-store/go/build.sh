@@ -43,7 +43,10 @@ CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common"
 CGO_LDFLAGS+=" -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio"
 CGO_LDFLAGS+=" -lstdc++ -lnuma -lglog -lgflags -libverbs -ljsoncpp -lzstd -lcurl"
 
-if [ -d "/usr/local/cuda/lib64" ]; then
+# cuda_loader provides CUDA API wrappers via dlopen (no hard dependency on libcudart)
+if [ -f "${BUILD_DIR}/mooncake-common/cuda_loader/libcuda_loader.so" ]; then
+    CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common/cuda_loader -lcuda_loader"
+elif [ -d "/usr/local/cuda/lib64" ]; then
     CGO_LDFLAGS+=" -L/usr/local/cuda/lib64 -lcudart"
 fi
 

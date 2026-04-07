@@ -354,11 +354,14 @@ int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
     int device_ordinal = 0;
 
 #if defined(USE_CUDA)
-    cudaPointerAttributes attributes;
-    cudaError_t cuda_ret = cudaPointerGetAttributes(&attributes, addr);
-    if (cuda_ret == cudaSuccess && attributes.type == cudaMemoryTypeDevice) {
-        iface = FI_HMEM_CUDA;
-        device_ordinal = attributes.device;
+    if (gpu_runtime_available()) {
+        cudaPointerAttributes attributes;
+        cudaError_t cuda_ret = cudaPointerGetAttributes(&attributes, addr);
+        if (cuda_ret == cudaSuccess &&
+            attributes.type == cudaMemoryTypeDevice) {
+            iface = FI_HMEM_CUDA;
+            device_ordinal = attributes.device;
+        }
     }
 #elif defined(USE_HIP)
     hipPointerAttribute_t attributes;
