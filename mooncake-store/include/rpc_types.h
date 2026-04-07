@@ -41,6 +41,13 @@ struct GetReplicaListResponse {
 };
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms);
 
+struct BatchQueryResultItem {
+    int error_code = static_cast<int>(ErrorCode::OK);
+    std::vector<Replica::Descriptor> replicas;
+    uint64_t lease_ttl_ms = 0;
+};
+YLT_REFL(BatchQueryResultItem, error_code, replicas, lease_ttl_ms);
+
 /**
  * @brief Response structure for GetStorageConfig operation
  */

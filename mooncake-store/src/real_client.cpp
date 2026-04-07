@@ -1217,6 +1217,44 @@ int64_t RealClient::getSize(const std::string &key) {
     return to_py_ret(getSize_internal(key));
 }
 
+std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::batch_query(
+    const std::vector<std::string> &keys) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<QueryResult, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    return client_->BatchQuery(keys);
+}
+
+std::vector<BatchQueryResultItem> RealClient::batch_query_dummy_helper(
+    const std::vector<std::string> &keys) {
+    const auto now = std::chrono::steady_clock::now();
+    auto query_results = batch_query(keys);
+    std::vector<BatchQueryResultItem> items;
+    items.reserve(query_results.size());
+
+    for (const auto &result : query_results) {
+        BatchQueryResultItem item;
+        if (result) {
+            const auto &query_result = result.value();
+            item.replicas = query_result.replicas;
+            if (query_result.lease_timeout > now) {
+                item.lease_ttl_ms =
+                    static_cast<uint64_t>(std::chrono::duration_cast<
+                                          std::chrono::milliseconds>(
+                                              query_result.lease_timeout - now)
+                                              .count());
+            }
+        } else {
+            item.error_code = static_cast<int>(result.error());
+        }
+        items.push_back(std::move(item));
+    }
+
+    return items;
+}
+
 tl::expected<void, ErrorCode> RealClient::map_shm_internal(
     int fd, uint64_t dummy_base_addr, size_t shm_size, bool is_local_buffer,
     const UUID &client_id) {
@@ -1854,7 +1892,8 @@ RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
 std::vector<std::shared_ptr<BufferHandle>>
 RealClient::batch_get_buffer_internal(
     const std::vector<std::string> &keys,
-    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator,
+    const std::vector<QueryResult> *query_results) {
     std::vector<std::shared_ptr<BufferHandle>> final_results(keys.size(),
                                                              nullptr);
 
@@ -1867,8 +1906,15 @@ RealClient::batch_get_buffer_internal(
         return final_results;
     }
 
-    // 1. Query metadata for all keys
-    auto query_results = client_->BatchQuery(keys);
+    std::vector<tl::expected<QueryResult, ErrorCode>> queried_results;
+    if (query_results == nullptr) {
+        queried_results = client_->BatchQuery(keys);
+    } else if (query_results->size() != keys.size()) {
+        LOG(ERROR) << "batch_get_buffer_with_query_results expects "
+                   << keys.size() << " query results, got "
+                   << query_results->size();
+        return final_results;
+    }
 
     // 2. Prepare for batch get: filter valid keys and prepare buffers
     struct KeyOp {
@@ -1883,23 +1929,33 @@ RealClient::batch_get_buffer_internal(
 
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto &key = keys[i];
+        std::optional<QueryResult> query_result_value;
 
-        if (!query_results[i]) {
-            if (query_results[i].error() != ErrorCode::OBJECT_NOT_FOUND &&
-                query_results[i].error() != ErrorCode::REPLICA_IS_NOT_READY) {
-                LOG(ERROR) << "Query failed for key '" << key
-                           << "': " << toString(query_results[i].error());
+        if (query_results != nullptr) {
+            if ((*query_results)[i].IsLeaseExpired()) {
+                LOG(WARNING) << "Cached query result expired for key: " << key;
+                continue;
             }
-            continue;
+            query_result_value.emplace((*query_results)[i]);
+        } else {
+            if (!queried_results[i]) {
+                if (queried_results[i].error() != ErrorCode::OBJECT_NOT_FOUND &&
+                    queried_results[i].error() !=
+                        ErrorCode::REPLICA_IS_NOT_READY) {
+                    LOG(ERROR) << "Query failed for key '" << key
+                               << "': " << toString(queried_results[i].error());
+                }
+                continue;
+            }
+            query_result_value.emplace(queried_results[i].value());
         }
 
-        auto query_result_values = query_results[i].value();
-        if (query_result_values.replicas.empty()) {
+        if (query_result_value->replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             continue;
         }
 
-        const auto &replica = query_result_values.replicas[0];
+        const auto &replica = query_result_value->replicas[0];
         uint64_t total_size = calculate_total_size(replica);
         if (total_size == 0) {
             continue;
@@ -1921,7 +1977,7 @@ RealClient::batch_get_buffer_internal(
         valid_ops.emplace_back(
             KeyOp{.original_index = i,
                   .key = key,
-                  .query_result = std::move(query_result_values),
+                  .query_result = std::move(*query_result_value),
                   .buffer_handle = std::move(buffer_handle),
                   .slices = std::move(slices)});
     }
@@ -1965,6 +2021,13 @@ RealClient::batch_get_buffer_internal(
 std::vector<std::shared_ptr<BufferHandle>> RealClient::batch_get_buffer(
     const std::vector<std::string> &keys) {
     return batch_get_buffer_internal(keys);
+}
+
+std::vector<std::shared_ptr<BufferHandle>>
+RealClient::batch_get_buffer_with_query_results(
+    const std::vector<std::string> &keys,
+    const std::vector<QueryResult> &query_results) {
+    return batch_get_buffer_internal(keys, nullptr, &query_results);
 }
 
 tl::expected<void, ErrorCode> RealClient::register_buffer_internal(

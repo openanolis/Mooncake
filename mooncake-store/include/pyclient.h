@@ -195,6 +195,14 @@ class PyClient {
     virtual std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys) = 0;
 
+    virtual std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
+        const std::vector<std::string> &keys) = 0;
+
+    virtual std::vector<std::shared_ptr<BufferHandle>>
+    batch_get_buffer_with_query_results(
+        const std::vector<std::string> &keys,
+        const std::vector<QueryResult> &query_results) = 0;
+
     virtual int put_parts(
         const std::string &key, std::vector<std::span<const char>> values,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;

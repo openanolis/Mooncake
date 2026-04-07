@@ -754,6 +754,48 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
     return results;
 }
 
+std::vector<tl::expected<QueryResult, ErrorCode>> DummyClient::batch_query(
+    const std::vector<std::string>& keys) {
+    auto rpc_result = invoke_rpc<&RealClient::batch_query_dummy_helper,
+                                 std::vector<BatchQueryResultItem>>(keys);
+    if (!rpc_result.has_value()) {
+        return std::vector<tl::expected<QueryResult, ErrorCode>>(
+            keys.size(), tl::unexpected(rpc_result.error()));
+    }
+
+    auto items = rpc_result.value();
+    if (items.size() != keys.size()) {
+        LOG(ERROR) << "batch_query returned " << items.size()
+                   << " results for " << keys.size() << " keys";
+        return std::vector<tl::expected<QueryResult, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<tl::expected<QueryResult, ErrorCode>> results;
+    results.reserve(items.size());
+    for (auto& item : items) {
+        const auto error_code = static_cast<ErrorCode>(item.error_code);
+        if (error_code != ErrorCode::OK) {
+            results.emplace_back(tl::unexpected(error_code));
+            continue;
+        }
+
+        results.emplace_back(QueryResult(
+            std::move(item.replicas),
+            now + std::chrono::milliseconds(item.lease_ttl_ms)));
+    }
+    return results;
+}
+
+std::vector<std::shared_ptr<BufferHandle>>
+DummyClient::batch_get_buffer_with_query_results(
+    const std::vector<std::string>& keys,
+    const std::vector<QueryResult>& query_results) {
+    (void)query_results;
+    return batch_get_buffer(keys);
+}
+
 int64_t DummyClient::get_into(const std::string& key, void* buffer,
                               size_t size) {
     // TODO: implement this function

@@ -257,6 +257,13 @@ class RealClient : public PyClient {
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys);
 
+    std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
+        const std::vector<std::string> &keys);
+
+    std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_with_query_results(
+        const std::vector<std::string> &keys,
+        const std::vector<QueryResult> &query_results);
+
     int remove(const std::string &key, bool force = false);
 
     long removeByRegex(const std::string &str, bool force = false);
@@ -571,6 +578,9 @@ class RealClient : public PyClient {
 
     tl::expected<int64_t, ErrorCode> getSize_internal(const std::string &key);
 
+    std::vector<BatchQueryResultItem> batch_query_dummy_helper(
+        const std::vector<std::string> &keys);
+
     std::shared_ptr<BufferHandle> get_buffer_internal(
         const std::string &key,
         const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
@@ -579,7 +589,8 @@ class RealClient : public PyClient {
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string> &keys,
         const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
-            nullptr);
+            nullptr,
+        const std::vector<QueryResult> *query_results = nullptr);
 
     std::map<std::string, std::vector<Replica::Descriptor>>
     batch_get_replica_desc(const std::vector<std::string> &keys);

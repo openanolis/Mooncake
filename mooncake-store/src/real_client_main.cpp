@@ -35,6 +35,8 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::isExist_internal>(&real_client);
     server.register_handler<&RealClient::batchIsExist_internal>(&real_client);
     server.register_handler<&RealClient::getSize_internal>(&real_client);
+    server.register_handler<&RealClient::batch_query_dummy_helper>(
+        &real_client);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(
         &real_client);
     server.register_handler<
