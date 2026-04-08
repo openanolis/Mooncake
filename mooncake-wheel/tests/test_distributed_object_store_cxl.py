@@ -590,21 +590,48 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         config = ReplicateConfig()
         self.assertEqual(config.replica_num, 1)
         self.assertEqual(config.with_soft_pin, False)
+        self.assertEqual(config.with_hard_pin, False)
         self.assertEqual(config.preferred_segment, "")
+        self.assertEqual(config.tenant_id, "default")
+        self.assertEqual(config.domain_id, "default")
+        self.assertEqual(config.object_set, "default")
+        self.assertEqual(config.sharing_scope, "")
+        self.assertEqual(config.qos_tier, "default")
+        self.assertEqual(config.logical_key, "")
+        self.assertEqual(config.canonical_key, "")
 
         # Test property assignment
         config.replica_num = 3
         config.with_soft_pin = True
+        config.with_hard_pin = True
         config.preferred_segment = "node1:12345"
+        config.tenant_id = "tenant-a"
+        config.domain_id = "domain-a"
+        config.object_set = "set-a"
+        config.sharing_scope = "scope-a"
+        config.qos_tier = "gold"
+        config.logical_key = "logical-a"
+        config.canonical_key = "tenant-a/domain-a/set-a/logical-a"
 
         self.assertEqual(config.replica_num, 3)
         self.assertEqual(config.with_soft_pin, True)
+        self.assertEqual(config.with_hard_pin, True)
         self.assertEqual(config.preferred_segment, "node1:12345")
+        self.assertEqual(config.tenant_id, "tenant-a")
+        self.assertEqual(config.domain_id, "domain-a")
+        self.assertEqual(config.object_set, "set-a")
+        self.assertEqual(config.sharing_scope, "scope-a")
+        self.assertEqual(config.qos_tier, "gold")
+        self.assertEqual(config.logical_key, "logical-a")
+        self.assertEqual(config.canonical_key,
+                         "tenant-a/domain-a/set-a/logical-a")
 
         # Test string representation
         config_str = str(config)
         self.assertIsInstance(config_str, str)
         self.assertIn("3", config_str)  # Should contain replica_num
+        self.assertIn("tenant-a", config_str)
+        self.assertIn("logical-a", config_str)
 
     def test_batch_get_buffer_operations(self):
         """Test batch_get_buffer operations for multiple keys."""

@@ -45,6 +45,14 @@ mooncake::ReplicateConfig to_replicate_config(
 
     config.replica_num = c_config->replica_num;
     config.with_soft_pin = c_config->with_soft_pin != 0;
+    config.with_hard_pin = c_config->with_hard_pin != 0;
+    config.tenant_id = c_str_or(c_config->tenant_id, "default");
+    config.domain_id = c_str_or(c_config->domain_id, "default");
+    config.object_set = c_str_or(c_config->object_set, "default");
+    config.sharing_scope = c_str_or(c_config->sharing_scope, "");
+    config.qos_tier = c_str_or(c_config->qos_tier, "default");
+    config.logical_key = c_str_or(c_config->logical_key, "");
+    config.canonical_key = c_str_or(c_config->canonical_key, "");
     if (c_config->preferred_segments &&
         c_config->preferred_segments_count > 0) {
         for (size_t i = 0; i < c_config->preferred_segments_count; ++i) {

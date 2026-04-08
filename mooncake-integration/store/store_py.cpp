@@ -1397,11 +1397,19 @@ PYBIND11_MODULE(store, m) {
         .def(py::init<>())
         .def_readwrite("replica_num", &ReplicateConfig::replica_num)
         .def_readwrite("with_soft_pin", &ReplicateConfig::with_soft_pin)
+        .def_readwrite("with_hard_pin", &ReplicateConfig::with_hard_pin)
         .def_readwrite("preferred_segments",
                        &ReplicateConfig::preferred_segments)
         .def_readwrite("preferred_segment", &ReplicateConfig::preferred_segment)
         .def_readwrite("prefer_alloc_in_same_node",
                        &ReplicateConfig::prefer_alloc_in_same_node)
+        .def_readwrite("tenant_id", &ReplicateConfig::tenant_id)
+        .def_readwrite("domain_id", &ReplicateConfig::domain_id)
+        .def_readwrite("object_set", &ReplicateConfig::object_set)
+        .def_readwrite("sharing_scope", &ReplicateConfig::sharing_scope)
+        .def_readwrite("qos_tier", &ReplicateConfig::qos_tier)
+        .def_readwrite("logical_key", &ReplicateConfig::logical_key)
+        .def_readwrite("canonical_key", &ReplicateConfig::canonical_key)
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;
