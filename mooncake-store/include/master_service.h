@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <msgpack.hpp>
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
 
@@ -565,10 +566,21 @@ class MasterService {
             const UUID& client_id_,
             const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
-            bool enable_soft_pin, bool enable_hard_pin = false)
+            bool enable_soft_pin, bool enable_hard_pin,
+            std::string tenant_id_, std::string domain_id_,
+            std::string object_set_, std::string sharing_scope_,
+            std::string qos_tier_, std::string logical_key_,
+            std::string canonical_key_)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
+              tenant_id(std::move(tenant_id_)),
+              domain_id(std::move(domain_id_)),
+              object_set(std::move(object_set_)),
+              sharing_scope(std::move(sharing_scope_)),
+              qos_tier(std::move(qos_tier_)),
+              logical_key(std::move(logical_key_)),
+              canonical_key(std::move(canonical_key_)),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
@@ -591,6 +603,13 @@ class MasterService {
         // Updated by UpsertStart (Case B) to reset the discard timeout.
         std::chrono::system_clock::time_point put_start_time;
         const size_t size;
+        std::string tenant_id;
+        std::string domain_id;
+        std::string object_set;
+        std::string sharing_scope;
+        std::string qos_tier;
+        std::string logical_key;
+        std::string canonical_key;
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
@@ -994,7 +1013,14 @@ class MasterService {
 
         void Create(const UUID& client_id, uint64_t total_length,
                     std::vector<Replica> replicas, bool enable_soft_pin,
-                    bool enable_hard_pin = false) {
+                    bool enable_hard_pin = false,
+                    const std::string& tenant_id = "default",
+                    const std::string& domain_id = "default",
+                    const std::string& object_set = "default",
+                    const std::string& sharing_scope = std::string(),
+                    const std::string& qos_tier = "default",
+                    const std::string& logical_key = std::string(),
+                    const std::string& canonical_key = std::string()) {
             if (Exists()) {
                 throw std::logic_error("Already exists");
             }
@@ -1003,7 +1029,9 @@ class MasterService {
                 std::piecewise_construct, std::forward_as_tuple(key_),
                 std::forward_as_tuple(client_id, now, total_length,
                                       std::move(replicas), enable_soft_pin,
-                                      enable_hard_pin));
+                                      enable_hard_pin, tenant_id, domain_id,
+                                      object_set, sharing_scope, qos_tier,
+                                      logical_key, canonical_key));
             it_ = result.first;
         }
 
@@ -1048,7 +1076,8 @@ class MasterService {
 
         // Deserialize a single MetadataShard
         tl::expected<void, SerializationError> DeserializeShard(
-            const msgpack::object& obj, MetadataShard& shard);
+            const msgpack::object& obj, size_t shard_index,
+            uint64_t* max_restored_replica_id);
 
         // Serialize discarded replicas
         tl::expected<void, SerializationError> SerializeDiscardedReplicas(
@@ -1056,7 +1085,7 @@ class MasterService {
 
         // Deserialize discarded replicas
         tl::expected<void, SerializationError> DeserializeDiscardedReplicas(
-            const msgpack::object& obj);
+            const msgpack::object& obj, uint64_t* max_restored_replica_id);
     };
 
     friend class MetadataAccessor;

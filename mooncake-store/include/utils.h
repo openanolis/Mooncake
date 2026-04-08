@@ -425,4 +425,9 @@ std::string GetEnvStringOr(const char* name, const std::string& default_value);
 std::string ResolvePathFromKey(const std::string& key,
                                const std::string& root_dir,
                                const std::string& fsdir);
+
+std::string BuildCanonicalObjectKey(const std::string& tenant_id,
+                                    const std::string& domain_id,
+                                    const std::string& object_set,
+                                    const std::string& logical_key);
 }  // namespace mooncake

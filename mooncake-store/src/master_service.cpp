@@ -12,6 +12,7 @@
 #include <boost/algorithm/string.hpp>
 
 #include "master_metric_manager.h"
+#include "metadata_store.h"
 #include "segment.h"
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
@@ -72,6 +73,84 @@ int64_t CurrentTimeMs() {
 }
 
 }  // namespace
+
+tl::expected<SnapshotMetadataFields, SerializationError>
+ParseSnapshotMetadataFields(const msgpack::object& object) {
+    if (object.type != msgpack::type::ARRAY) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "snapshot metadata entry is not an array"));
+    }
+    if (object.via.array.size < 7) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "snapshot metadata entry is too short"));
+    }
+
+    try {
+        SnapshotMetadataFields fields;
+        msgpack::object* array = object.via.array.ptr;
+        uint32_t index = 0;
+
+        std::string client_id_str = array[index++].as<std::string>();
+        if (!StringToUuid(client_id_str, fields.client_id)) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "snapshot metadata entry has invalid client UUID: " +
+                    client_id_str));
+        }
+
+        fields.put_start_time_ms = array[index++].as<uint64_t>();
+        fields.size = array[index++].as<uint64_t>();
+        fields.lease_timeout_ms = array[index++].as<uint64_t>();
+        fields.has_soft_pin_timeout = array[index++].as<bool>();
+        fields.soft_pin_timeout_ms = array[index++].as<uint64_t>();
+
+        const uint32_t legacy_base_size = 7;
+        const uint32_t extended_base_size = 14;
+        const bool has_extended_metadata =
+            object.via.array.size >= extended_base_size &&
+            array[6].type == msgpack::type::STR;
+        if (has_extended_metadata) {
+            fields.tenant_id = array[index++].as<std::string>();
+            fields.domain_id = array[index++].as<std::string>();
+            fields.object_set = array[index++].as<std::string>();
+            fields.sharing_scope = array[index++].as<std::string>();
+            fields.qos_tier = array[index++].as<std::string>();
+            fields.logical_key = array[index++].as<std::string>();
+            fields.canonical_key = array[index++].as<std::string>();
+        }
+
+        fields.replica_count = array[index++].as<uint32_t>();
+        if (object.via.array.size != legacy_base_size + fields.replica_count &&
+            object.via.array.size != legacy_base_size + fields.replica_count +
+                                        1 &&
+            object.via.array.size != extended_base_size +
+                                         fields.replica_count &&
+            object.via.array.size != extended_base_size +
+                                         fields.replica_count +
+                                         1) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                fmt::format(
+                    "snapshot metadata entry replica count mismatch: "
+                    "replicas={}, total_fields={}",
+                    fields.replica_count, object.via.array.size)));
+        }
+
+        fields.replica_index = index;
+        if (index + fields.replica_count < object.via.array.size) {
+            fields.hard_pinned =
+                array[index + fields.replica_count].as<bool>();
+        }
+        return fields;
+    } catch (const std::exception& e) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "failed to parse snapshot metadata entry: " +
+                std::string(e.what())));
+    }
+}
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
@@ -790,10 +869,21 @@ auto MasterService::AllocateAndInsertMetadata(
         replica_list.emplace_back(replica.get_descriptor());
     }
 
+    std::string logical_key =
+        config.logical_key.empty() ? key : config.logical_key;
+    std::string canonical_key =
+        config.canonical_key.empty()
+            ? BuildCanonicalObjectKey(config.tenant_id, config.domain_id,
+                                      config.object_set, logical_key)
+            : config.canonical_key;
+
     shard->metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
-                              config.with_soft_pin, config.with_hard_pin));
+                              config.with_soft_pin, config.with_hard_pin,
+                              config.tenant_id, config.domain_id,
+                              config.object_set, config.sharing_scope,
+                              config.qos_tier, logical_key, canonical_key));
     shard->processing_keys.insert(key);
 
     return replica_list;
@@ -917,7 +1007,9 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         accessor.Create(
             client_id,
             replica.get_descriptor().get_local_disk_descriptor().object_size,
-            std::vector<Replica>{}, false);
+            std::vector<Replica>{}, false, false, "default", "default",
+            "default", std::string(), "default", key,
+            BuildCanonicalObjectKey("default", "default", "default", key));
     }
     auto& metadata = accessor.Get();
     if (replica.type() != ReplicaType::LOCAL_DISK) {
@@ -3237,9 +3329,10 @@ bool MasterService::TryRestoreStateFromSnapshot(
                 "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
             if (!skip_cleanup) {
                 auto cleanup_now = now;
-                for (auto& shard : metadata_shards_) {
-                    for (auto it = shard.metadata.begin();
-                         it != shard.metadata.end();) {
+                for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+                    MetadataShardAccessorRW shard(this, shard_idx);
+                    for (auto it = shard->metadata.begin();
+                         it != shard->metadata.end();) {
                         if (it->second.HasDiffRepStatus(
                                 ReplicaStatus::COMPLETE) ||
                             (it->second.IsLeaseExpired(cleanup_now) &&
@@ -3262,7 +3355,7 @@ bool MasterService::TryRestoreStateFromSnapshot(
                                                       .time_since_epoch())
                                                   .count())
                                         : "null");
-                            it = shard.metadata.erase(it);
+                            it = shard->metadata.erase(it);
                         } else {
                             ++it;
                         }
@@ -3276,9 +3369,10 @@ bool MasterService::TryRestoreStateFromSnapshot(
                     .reset_segment_allocated_mem_size(segment_name);
             }
 
-            for (auto& shard : metadata_shards_) {
-                for (auto it = shard.metadata.begin();
-                     it != shard.metadata.end();) {
+            for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+                MetadataShardAccessorRW shard(this, shard_idx);
+                for (auto it = shard->metadata.begin();
+                     it != shard->metadata.end(); ++it) {
                     for (auto& replica : it->second.GetAllReplicas()) {
                         if (!replica.get_descriptor().is_memory_replica()) {
                             continue;
@@ -3300,7 +3394,6 @@ bool MasterService::TryRestoreStateFromSnapshot(
                             temp_segment_name,
                             static_cast<int64_t>(buffer_descriptor.size_));
                     }
-                    ++it;
                 }
             }
 
@@ -3749,7 +3842,8 @@ MasterService::MetadataSerializer::Serialize() {
     // First count non-empty shards
     size_t valid_shards = 0;
     for (size_t i = 0; i < kNumShards; ++i) {
-        if (!service_->metadata_shards_[i].metadata.empty()) {
+        MetadataShardAccessorRO shard(service_, i);
+        if (!shard->metadata.empty()) {
             valid_shards++;
         }
     }
@@ -3759,10 +3853,10 @@ MasterService::MetadataSerializer::Serialize() {
 
     // Iterate through all shards, serialize each shard independently
     for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
-        const auto& shard = service_->metadata_shards_[shard_idx];
+        MetadataShardAccessorRO shard(service_, shard_idx);
 
         // Skip if shard is empty
-        if (shard.metadata.empty()) {
+        if (shard->metadata.empty()) {
             continue;
         }
 
@@ -3774,7 +3868,7 @@ MasterService::MetadataSerializer::Serialize() {
         msgpack::packer<msgpack::sbuffer> shard_packer(&shard_buffer);
 
         // Serialize shard using SerializeShard
-        auto result = SerializeShard(shard, shard_packer);
+        auto result = SerializeShard(*shard.operator->(), shard_packer);
         if (!result) {
             return tl::make_unexpected(SerializationError(
                 result.error().code,
@@ -3815,6 +3909,7 @@ MasterService::MetadataSerializer::Serialize() {
 tl::expected<void, SerializationError>
 MasterService::MetadataSerializer::Deserialize(
     const std::vector<uint8_t>& data) {
+    uint64_t max_restored_replica_id = 0;
     // Parse MessagePack data directly
     msgpack::object_handle oh;
     try {
@@ -3899,9 +3994,7 @@ MasterService::MetadataSerializer::Deserialize(
 
         const msgpack::object& shard_obj = shard_oh.get();
 
-        // Get shard reference and deserialize
-        auto& shard = service_->metadata_shards_[shard_idx];
-        auto result = DeserializeShard(shard_obj, shard);
+        auto result = DeserializeShard(shard_obj, shard_idx, &max_restored_replica_id);
         if (!result) {
             return tl::make_unexpected(SerializationError(
                 result.error().code,
@@ -3916,7 +4009,9 @@ MasterService::MetadataSerializer::Deserialize(
             ErrorCode::DESERIALIZE_FAIL,
             "Missing required field 'discarded_replicas' in snapshot data"));
     }
-    auto dr_result = DeserializeDiscardedReplicas(*discarded_replicas_obj);
+    auto dr_result =
+        DeserializeDiscardedReplicas(*discarded_replicas_obj,
+                                     &max_restored_replica_id);
     if (!dr_result) {
         return tl::make_unexpected(
             SerializationError(dr_result.error().code,
@@ -3931,6 +4026,13 @@ MasterService::MetadataSerializer::Deserialize(
             "Missing required field 'replica_next_id' in snapshot data"));
     }
     auto next_id = replica_next_id_obj->as<uint64_t>();
+    const uint64_t min_next_id = max_restored_replica_id + 1;
+    if (next_id < min_next_id) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            fmt::format("replica_next_id {} is smaller than restored minimum {}",
+                        next_id, min_next_id)));
+    }
     Replica::next_id_.store(next_id);
     LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
 
@@ -3938,8 +4040,12 @@ MasterService::MetadataSerializer::Deserialize(
 }
 
 void MasterService::MetadataSerializer::Reset() {
-    for (auto& shard : service_->metadata_shards_) {
-        shard.metadata.clear();
+    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+        MetadataShardAccessorRW shard(service_, shard_idx);
+        shard->metadata.clear();
+        shard->processing_keys.clear();
+        shard->replication_tasks.clear();
+        shard->offloading_tasks.clear();
     }
     {
         std::lock_guard lock(service_->discarded_replicas_mutex_);
@@ -3986,8 +4092,10 @@ MasterService::MetadataSerializer::SerializeShard(const MetadataShard& shard,
 }
 
 tl::expected<void, SerializationError>
-MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
-                                                    MetadataShard& shard) {
+MasterService::MetadataSerializer::DeserializeShard(
+    const msgpack::object& obj, size_t shard_index,
+    uint64_t* max_restored_replica_id) {
+    MetadataShardAccessorRW shard(service_, shard_index);
     if (obj.type != msgpack::type::MAP) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL, "Invalid shard format: expected map"));
@@ -4007,7 +4115,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
     }
 
     // Clear existing data
-    shard.metadata.clear();
+    shard->metadata.clear();
 
     // Deserialize metadata
     if (metadata_array == nullptr ||
@@ -4017,7 +4125,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                                "Missing or invalid 'metadata' field in shard"));
     }
 
-    shard.metadata.reserve(metadata_array->via.array.size);
+    shard->metadata.reserve(metadata_array->via.array.size);
 
     for (uint32_t j = 0; j < metadata_array->via.array.size; ++j) {
         const msgpack::object& item = metadata_array->via.array.ptr[j];
@@ -4033,22 +4141,32 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
 
         auto metadata_result = DeserializeMetadata(value_obj);
         if (!metadata_result) {
-            LOG(ERROR) << "Failed to deserialize metadata for key: " << key
-                       << ": " << metadata_result.error().message;
-            continue;
+            return tl::make_unexpected(SerializationError(
+                metadata_result.error().code,
+                fmt::format("Failed to deserialize metadata for key '{}': {}",
+                            key, metadata_result.error().message)));
         }
 
         auto metadata_ptr = std::move(metadata_result.value());
-        auto [it, inserted] = shard.metadata.emplace(
+        auto [it, inserted] = shard->metadata.emplace(
             std::piecewise_construct, std::forward_as_tuple(std::move(key)),
             std::forward_as_tuple(
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
                 metadata_ptr->size, metadata_ptr->PopReplicas(),
                 metadata_ptr->soft_pin_timeout.has_value(),
-                metadata_ptr->IsHardPinned()));
+                metadata_ptr->IsHardPinned(), metadata_ptr->tenant_id,
+                metadata_ptr->domain_id, metadata_ptr->object_set,
+                metadata_ptr->sharing_scope, metadata_ptr->qos_tier,
+                metadata_ptr->logical_key, metadata_ptr->canonical_key));
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
+        if (max_restored_replica_id != nullptr) {
+            for (const auto& replica : it->second.GetAllReplicas()) {
+                *max_restored_replica_id =
+                    std::max<uint64_t>(*max_restored_replica_id, replica.id());
+            }
+        }
     }
 
     return {};
@@ -4060,12 +4178,11 @@ MasterService::MetadataSerializer::SerializeMetadata(
     MsgpackPacker& packer) const {
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
-    // has_soft_pin_timeout, soft_pin_timeout, replicas_count, replicas...,
-    // hard_pinned]
+    // has_soft_pin_timeout, soft_pin_timeout, tenant_id, domain_id,
+    // object_set, sharing_scope, qos_tier, logical_key, canonical_key,
+    // replicas_count, replicas..., hard_pinned]
 
-    size_t array_size = 8;  // client_id, put_start_time, size, lease_timeout,
-                            // has_soft_pin_timeout, soft_pin_timeout,
-                            // replicas_count + hard_pinned
+    size_t array_size = 15;  // base fields + replicas_count + hard_pinned
     array_size += metadata.CountReplicas();  // One element per replica
     packer.pack_array(array_size);
 
@@ -4102,6 +4219,14 @@ MasterService::MetadataSerializer::SerializeMetadata(
         packer.pack(uint64_t(0));  // Placeholder
     }
 
+    packer.pack(metadata.tenant_id);
+    packer.pack(metadata.domain_id);
+    packer.pack(metadata.object_set);
+    packer.pack(metadata.sharing_scope);
+    packer.pack(metadata.qos_tier);
+    packer.pack(metadata.logical_key);
+    packer.pack(metadata.canonical_key);
+
     // Serialize replicas count
     packer.pack(static_cast<uint32_t>(metadata.CountReplicas()));
 
@@ -4122,62 +4247,18 @@ MasterService::MetadataSerializer::SerializeMetadata(
 tl::expected<std::unique_ptr<MasterService::ObjectMetadata>, SerializationError>
 MasterService::MetadataSerializer::DeserializeMetadata(
     const msgpack::object& obj) const {
-    // Check if input is a valid array
-    if (obj.type != msgpack::type::ARRAY) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "deserialize ObjectMetadata state is not an array"));
+    auto fields_result = ParseSnapshotMetadataFields(obj);
+    if (!fields_result) {
+        return tl::unexpected(fields_result.error());
     }
 
-    // Need at least 7 elements: client_id, put_start_time, size, lease_timeout,
-    // has_soft_pin_timeout, soft_pin_timeout, replicas_count
-    // (8th element = hard_pinned is optional for backward compat)
-    if (obj.via.array.size < 7) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "deserialize ObjectMetadata array size is too small"));
-    }
-
+    const auto& fields = fields_result.value();
     msgpack::object* array = obj.via.array.ptr;
-    uint32_t index = 0;
+    uint32_t index = fields.replica_index;
 
-    // Deserialize client_id string
-    std::string client_id_str = array[index++].as<std::string>();
-    UUID client_id;
-    StringToUuid(client_id_str, client_id);
-
-    // Deserialize put_start_time
-    uint64_t put_start_time_timestamp = array[index++].as<uint64_t>();
-
-    // Deserialize size
-    auto size = static_cast<size_t>(array[index++].as<uint64_t>());
-
-    // Deserialize lease_timeout
-    uint64_t lease_timestamp = array[index++].as<uint64_t>();
-
-    // Deserialize soft_pin_timeout flag
-    bool has_soft_pin_timeout = array[index++].as<bool>();
-
-    // Deserialize soft_pin_timeout value
-    uint64_t soft_pin_timestamp = array[index++].as<uint64_t>();
-
-    // Deserialize replicas count
-    uint32_t replicas_count = array[index++].as<uint32_t>();
-
-    // Array size: 7 + replicas_count (old format) or 8 + replicas_count (new
-    // format with hard_pinned)
-    if (obj.via.array.size != 7 + replicas_count &&
-        obj.via.array.size != 8 + replicas_count) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            "deserialize ObjectMetadata array size mismatch"));
-    }
-
-    // Deserialize replicas
     std::vector<Replica> replicas;
-    replicas.reserve(replicas_count);
-
-    for (uint32_t i = 0; i < replicas_count; i++) {
+    replicas.reserve(fields.replica_count);
+    for (uint32_t i = 0; i < fields.replica_count; i++) {
         auto result = Serializer<Replica>::deserialize(
             array[index++], service_->segment_manager_.getView());
         if (!result) {
@@ -4186,27 +4267,20 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         replicas.emplace_back(std::move(*result.value()));
     }
 
-    // Deserialize hard_pinned (if present, otherwise default to false)
-    bool is_hard_pinned = false;
-    if (index < obj.via.array.size) {
-        is_hard_pinned = array[index++].as<bool>();
-    }
-
-    // Create ObjectMetadata instance
-    bool enable_soft_pin = has_soft_pin_timeout;
     auto metadata = std::make_unique<ObjectMetadata>(
-        client_id,
+        fields.client_id,
         std::chrono::system_clock::time_point(
-            std::chrono::milliseconds(put_start_time_timestamp)),
-        size, std::move(replicas), enable_soft_pin, is_hard_pinned);
+            std::chrono::milliseconds(fields.put_start_time_ms)),
+        static_cast<size_t>(fields.size), std::move(replicas),
+        fields.has_soft_pin_timeout, fields.hard_pinned, fields.tenant_id,
+        fields.domain_id, fields.object_set, fields.sharing_scope,
+        fields.qos_tier, fields.logical_key, fields.canonical_key);
     metadata->lease_timeout = std::chrono::system_clock::time_point(
-        std::chrono::milliseconds(lease_timestamp));
+        std::chrono::milliseconds(fields.lease_timeout_ms));
 
-    // Set soft_pin_timeout (if exists)
-    if (has_soft_pin_timeout) {
-        metadata->soft_pin_timeout.emplace(
-            std::chrono::system_clock::time_point(
-                std::chrono::milliseconds(soft_pin_timestamp)));
+    if (fields.has_soft_pin_timeout) {
+        metadata->soft_pin_timeout.emplace(std::chrono::system_clock::time_point(
+            std::chrono::milliseconds(fields.soft_pin_timeout_ms)));
     }
 
     return metadata;
@@ -4399,7 +4473,7 @@ MasterService::MetadataSerializer::SerializeDiscardedReplicas(
 
 tl::expected<void, SerializationError>
 MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
-    const msgpack::object& obj) {
+    const msgpack::object& obj, uint64_t* max_restored_replica_id) {
     if (obj.type != msgpack::type::ARRAY) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL, "discarded_replicas: expected array"));
@@ -4456,6 +4530,10 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
                                 j, i, replica_result.error().message)));
             }
             replicas.emplace_back(std::move(*replica_result.value()));
+            if (max_restored_replica_id != nullptr) {
+                *max_restored_replica_id = std::max<uint64_t>(
+                    *max_restored_replica_id, replicas.back().id());
+            }
         }
 
         // Create DiscardedReplicas and manually set mem_size_

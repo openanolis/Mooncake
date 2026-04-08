@@ -15,6 +15,7 @@
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#include "metadata_store.h"
 #include "segment.h"
 #include "serialize/serializer.hpp"
 #include "utils/zstd_util.h"
@@ -102,60 +103,34 @@ DeserializeStandbyObjectMetadata(
     const msgpack::object& object, const SegmentView& segment_view,
     uint64_t snapshot_sequence_id,
     const std::chrono::system_clock::time_point& now) {
-    if (object.type != msgpack::type::ARRAY) {
-        LOG(ERROR) << "Snapshot metadata entry is not an array";
-        return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
-    }
-    if (object.via.array.size < 7) {
-        LOG(ERROR) << "Snapshot metadata entry is too short, size="
-                   << object.via.array.size;
-        return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+    auto fields_result = ParseSnapshotMetadataFields(object);
+    if (!fields_result) {
+        LOG(ERROR) << fields_result.error().message;
+        return tl::make_unexpected(fields_result.error().code);
     }
 
     try {
+        const auto& fields = fields_result.value();
         msgpack::object* array = object.via.array.ptr;
-        uint32_t index = 0;
-
-        std::string client_id_string = array[index++].as<std::string>();
-        UUID client_id;
-        if (!StringToUuid(client_id_string, client_id)) {
-            LOG(ERROR) << "Snapshot metadata entry has invalid client UUID: "
-                       << client_id_string;
-            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
-        }
-
-        (void)array[index++].as<uint64_t>();  // put_start_time
-        const auto size = static_cast<size_t>(array[index++].as<uint64_t>());
-        const auto lease_timestamp_ms = array[index++].as<uint64_t>();
-        const bool has_soft_pin_timeout = array[index++].as<bool>();
-        const auto soft_pin_timestamp_ms = array[index++].as<uint64_t>();
-        const auto replica_count = array[index++].as<uint32_t>();
-
-        if (object.via.array.size != 7 + replica_count &&
-            object.via.array.size != 8 + replica_count) {
-            LOG(ERROR) << "Snapshot metadata entry replica count mismatch, "
-                       << "replicas=" << replica_count
-                       << ", total_fields=" << object.via.array.size;
-            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
-        }
+        uint32_t index = fields.replica_index;
 
         const auto lease_timeout = std::chrono::system_clock::time_point(
-            std::chrono::milliseconds(lease_timestamp_ms));
+            std::chrono::milliseconds(fields.lease_timeout_ms));
         std::optional<std::chrono::system_clock::time_point> soft_pin_timeout;
-        if (has_soft_pin_timeout) {
+        if (fields.has_soft_pin_timeout) {
             soft_pin_timeout.emplace(
-                std::chrono::milliseconds(soft_pin_timestamp_ms));
+                std::chrono::milliseconds(fields.soft_pin_timeout_ms));
         }
 
-        if (size == 0 ||
+        if (fields.size == 0 ||
             (lease_timeout <= now && (!soft_pin_timeout.has_value() ||
                                       soft_pin_timeout.value() <= now))) {
             return std::optional<StandbyObjectMetadata>();
         }
 
         std::vector<Replica::Descriptor> replicas;
-        replicas.reserve(replica_count);
-        for (uint32_t i = 0; i < replica_count; ++i) {
+        replicas.reserve(fields.replica_count);
+        for (uint32_t i = 0; i < fields.replica_count; ++i) {
             auto replica_result =
                 Serializer<Replica>::deserialize(array[index++], segment_view);
             if (!replica_result) {
@@ -179,8 +154,15 @@ DeserializeStandbyObjectMetadata(
         }
 
         StandbyObjectMetadata metadata;
-        metadata.client_id = client_id;
-        metadata.size = size;
+        metadata.client_id = fields.client_id;
+        metadata.size = fields.size;
+        metadata.tenant_id = fields.tenant_id;
+        metadata.domain_id = fields.domain_id;
+        metadata.object_set = fields.object_set;
+        metadata.sharing_scope = fields.sharing_scope;
+        metadata.qos_tier = fields.qos_tier;
+        metadata.logical_key = fields.logical_key;
+        metadata.canonical_key = fields.canonical_key;
         metadata.replicas = std::move(replicas);
         metadata.last_sequence_id = snapshot_sequence_id;
         return std::optional<StandbyObjectMetadata>(std::move(metadata));

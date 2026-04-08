@@ -463,10 +463,9 @@ bool OpLogApplier::CheckSequenceOrder(const OpLogEntry& entry) {
 }
 
 void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
-    // Payload contains serialized metadata (replicas, size, etc.) in JSON
-    // format. Deserialize the payload immediately and store structured
-    // metadata. This allows Standby to serve requests immediately after
-    // promotion.
+    // Payload contains struct_pack-serialized MetadataPayload. Deserialize the
+    // payload immediately and store structured metadata so Standby can serve
+    // requests immediately after promotion.
 
     if (entry.payload.empty()) {
         // No payload - create empty metadata (legacy compatibility)

@@ -133,7 +133,9 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     std::string_view disk_file_path = kDefaultTestDiskFilePath,
     uint64_t object_size = kDefaultTestObjectSize,
     uint64_t put_start_time_ms = kDefaultTestPutStartTimeMs,
-    uint64_t lease_timeout_ms = kDefaultTestLeaseTimeoutMs) {
+    uint64_t lease_timeout_ms = kDefaultTestLeaseTimeoutMs,
+    std::optional<std::string> client_id_override = std::nullopt,
+    std::optional<uint64_t> replica_next_id_override = std::nullopt) {
     msgpack::sbuffer shard_buffer;
     MsgpackPacker shard_packer(&shard_buffer);
     shard_packer.pack_map(1);
@@ -142,15 +144,24 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     shard_packer.pack_array(2);
     shard_packer.pack(std::string(object_key));
 
-    shard_packer.pack_array(8);
-    shard_packer.pack(UuidToString(client_id));
+    shard_packer.pack_array(15);
+    shard_packer.pack(client_id_override.value_or(UuidToString(client_id)));
     shard_packer.pack(put_start_time_ms);
     shard_packer.pack(object_size);
     shard_packer.pack(lease_timeout_ms);
     shard_packer.pack(false);
     shard_packer.pack(uint64_t{0});
+    shard_packer.pack(std::string("default"));
+    shard_packer.pack(std::string("default"));
+    shard_packer.pack(std::string("default"));
+    shard_packer.pack(std::string());
+    shard_packer.pack(std::string("default"));
+    shard_packer.pack(std::string(object_key));
+    shard_packer.pack(std::string("default/default/default/") +
+                      std::string(object_key));
     shard_packer.pack(uint32_t{1});
     PackDiskReplica(shard_packer, disk_file_path, object_size);
+    shard_packer.pack(false);
 
     auto compressed_shard =
         zstd_compress(reinterpret_cast<const uint8_t*>(shard_buffer.data()),
@@ -158,7 +169,7 @@ inline std::vector<uint8_t> BuildMetadataPayload(
 
     msgpack::sbuffer root_buffer;
     MsgpackPacker root_packer(&root_buffer);
-    root_packer.pack_map(1);
+    root_packer.pack_map(3);
     root_packer.pack(std::string("shards"));
     root_packer.pack_map(1);
     root_packer.pack(std::string("0"));
@@ -166,6 +177,10 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     root_packer.pack_bin_body(
         reinterpret_cast<const char*>(compressed_shard.data()),
         compressed_shard.size());
+    root_packer.pack(std::string("discarded_replicas"));
+    root_packer.pack_array(0);
+    root_packer.pack(std::string("replica_next_id"));
+    root_packer.pack(replica_next_id_override.value_or(uint64_t{2}));
     return ToByteVector(root_buffer);
 }
 

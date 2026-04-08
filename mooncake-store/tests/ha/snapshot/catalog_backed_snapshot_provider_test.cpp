@@ -107,6 +107,15 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotRoundTrip) {
     EXPECT_EQ(key, kDefaultTestObjectKey);
     EXPECT_EQ(metadata.client_id, (UUID{1, 2}));
     EXPECT_EQ(metadata.size, kDefaultTestObjectSize);
+    EXPECT_EQ(metadata.tenant_id, "default");
+    EXPECT_EQ(metadata.domain_id, "default");
+    EXPECT_EQ(metadata.object_set, "default");
+    EXPECT_EQ(metadata.sharing_scope, "");
+    EXPECT_EQ(metadata.qos_tier, "default");
+    EXPECT_EQ(metadata.logical_key, kDefaultTestObjectKey);
+    EXPECT_EQ(metadata.canonical_key,
+              "default/default/default/" +
+                  std::string(kDefaultTestObjectKey));
     EXPECT_EQ(metadata.last_sequence_id, descriptor_.last_included_seq);
     ASSERT_EQ(metadata.replicas.size(), 1u);
 
@@ -129,6 +138,36 @@ TEST_P(CatalogBackedSnapshotProviderTest, RejectsClusterMismatch) {
         provider.value()->LoadLatestSnapshot(cluster_id_ + "-other");
     ASSERT_FALSE(snapshot.has_value());
     EXPECT_EQ(snapshot.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest, RejectsInvalidMetadataUuid) {
+    auto manifest = object_store_->UploadString(descriptor_.manifest_key,
+                                                "messagepack|1.0.0|standby-test");
+    ASSERT_TRUE(manifest.has_value()) << manifest.error();
+
+    auto segments = object_store_->UploadBuffer(
+        descriptor_.object_prefix + "segments", BuildSegmentsPayload());
+    ASSERT_TRUE(segments.has_value()) << segments.error();
+
+    auto metadata = object_store_->UploadBuffer(
+        descriptor_.object_prefix + "metadata",
+        BuildMetadataPayload(UUID{1, 2}, kDefaultTestObjectKey,
+                             kDefaultTestDiskFilePath, kDefaultTestObjectSize,
+                             kDefaultTestPutStartTimeMs,
+                             kDefaultTestLeaseTimeoutMs,
+                             std::string("not-a-uuid")));
+    ASSERT_TRUE(metadata.has_value()) << metadata.error();
+
+    auto publish_result = catalog_store_->Publish(descriptor_);
+    ASSERT_EQ(publish_result, ErrorCode::OK);
+    snapshot_published_ = true;
+
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value()) << toString(provider.error());
+
+    auto snapshot = provider.value()->LoadLatestSnapshot(cluster_id_);
+    ASSERT_FALSE(snapshot.has_value());
+    EXPECT_EQ(snapshot.error(), ErrorCode::DESERIALIZE_FAIL);
 }
 
 INSTANTIATE_TEST_SUITE_P(

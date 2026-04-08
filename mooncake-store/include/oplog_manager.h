@@ -30,7 +30,7 @@ enum class OpType : uint8_t {
 };
 
 // A single operation log entry.
-// Note: Payload contains JSON serialized MetadataPayload (defined in
+// Note: Payload contains struct_pack-serialized MetadataPayload (defined in
 // metadata_store.h) for PUT_END operations, allowing Standby to restore
 // complete metadata.
 struct OpLogEntry {

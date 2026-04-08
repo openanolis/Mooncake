@@ -5,6 +5,9 @@
 #include <string>
 #include <vector>
 
+#include <msgpack.hpp>
+#include <ylt/util/tl/expected.hpp>
+
 #include "replica.h"
 #include "types.h"
 
@@ -19,6 +22,13 @@ namespace mooncake {
 struct StandbyObjectMetadata {
     UUID client_id{0, 0};
     uint64_t size{0};
+    std::string tenant_id{"default"};
+    std::string domain_id{"default"};
+    std::string object_set{"default"};
+    std::string sharing_scope{};
+    std::string qos_tier{"default"};
+    std::string logical_key{};
+    std::string canonical_key{};
     std::vector<Replica::Descriptor> replicas;
     // NOTE: Lease information is NOT stored because:
     // 1. Standby does not perform eviction, so lease info is not used
@@ -42,16 +52,32 @@ struct StandbyObjectMetadata {
 struct MetadataPayload {
     UUID client_id{0, 0};
     uint64_t size{0};
+    std::string tenant_id{"default"};
+    std::string domain_id{"default"};
+    std::string object_set{"default"};
+    std::string sharing_scope{};
+    std::string qos_tier{"default"};
+    std::string logical_key{};
+    std::string canonical_key{};
     std::vector<Replica::Descriptor> replicas;
     // NOTE: Lease information removed - not needed by Standby
 
-    YLT_REFL(MetadataPayload, client_id, size, replicas);
+    YLT_REFL(MetadataPayload, client_id, size, tenant_id, domain_id,
+             object_set, sharing_scope, qos_tier, logical_key, canonical_key,
+             replicas);
 
     // Convert to StandbyObjectMetadata
     StandbyObjectMetadata ToStandbyMetadata(uint64_t sequence_id) const {
         StandbyObjectMetadata meta;
         meta.client_id = client_id;
         meta.size = size;
+        meta.tenant_id = tenant_id;
+        meta.domain_id = domain_id;
+        meta.object_set = object_set;
+        meta.sharing_scope = sharing_scope;
+        meta.qos_tier = qos_tier;
+        meta.logical_key = logical_key;
+        meta.canonical_key = canonical_key;
         meta.replicas = replicas;
         meta.last_sequence_id = sequence_id;
         return meta;
@@ -116,5 +142,29 @@ class MetadataStore {
      */
     virtual size_t GetKeyCount() const = 0;
 };
+
+// Shared parser for snapshot metadata entries used by both master restore and
+// standby snapshot bootstrap.
+struct SnapshotMetadataFields {
+    UUID client_id{0, 0};
+    uint64_t put_start_time_ms{0};
+    uint64_t size{0};
+    uint64_t lease_timeout_ms{0};
+    bool has_soft_pin_timeout{false};
+    uint64_t soft_pin_timeout_ms{0};
+    std::string tenant_id{"default"};
+    std::string domain_id{"default"};
+    std::string object_set{"default"};
+    std::string sharing_scope{};
+    std::string qos_tier{"default"};
+    std::string logical_key{};
+    std::string canonical_key{};
+    uint32_t replica_count{0};
+    uint32_t replica_index{0};
+    bool hard_pinned{false};
+};
+
+tl::expected<SnapshotMetadataFields, SerializationError>
+ParseSnapshotMetadataFields(const msgpack::object& object);
 
 }  // namespace mooncake

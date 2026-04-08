@@ -90,6 +90,13 @@ struct ReplicateConfig {
     std::string preferred_segment{};  // Deprecated: Single preferred segment
                                       // for backward compatibility
     bool prefer_alloc_in_same_node{false};
+    std::string tenant_id{"default"};
+    std::string domain_id{"default"};
+    std::string object_set{"default"};
+    std::string sharing_scope{};
+    std::string qos_tier{"default"};
+    std::string logical_key{};
+    std::string canonical_key{};
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
@@ -107,7 +114,14 @@ struct ReplicateConfig {
                << config.preferred_segment;
         }
         os << ", prefer_alloc_in_same_node: "
-           << config.prefer_alloc_in_same_node << " }";
+           << config.prefer_alloc_in_same_node
+           << ", tenant_id: " << config.tenant_id
+           << ", domain_id: " << config.domain_id
+           << ", object_set: " << config.object_set
+           << ", sharing_scope: " << config.sharing_scope
+           << ", qos_tier: " << config.qos_tier
+           << ", logical_key: " << config.logical_key
+           << ", canonical_key: " << config.canonical_key << " }";
         return os;
     }
 };

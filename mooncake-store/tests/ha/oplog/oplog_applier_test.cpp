@@ -92,15 +92,20 @@ OpLogEntry MakeEntry(uint64_t seq, OpType type, const std::string& key,
     return e;
 }
 
-// Helper function to create a valid JSON payload for PUT_END
-std::string MakeValidJsonPayload(uint64_t client_id_first = 1,
-                                 uint64_t client_id_second = 2,
-                                 uint64_t size = 1024) {
-    // NOTE: OpLogApplier's current implementation expects PUT_END payload to be
-    // struct_pack-serialized MetadataPayload (msgpack binary), not JSON.
+// Helper function to create a valid struct_pack payload for PUT_END
+std::string MakeValidStructPackPayload(uint64_t client_id_first = 1,
+                                       uint64_t client_id_second = 2,
+                                       uint64_t size = 1024) {
     MetadataPayload payload;
     payload.client_id = {client_id_first, client_id_second};
     payload.size = size;
+    payload.tenant_id = "tenant-a";
+    payload.domain_id = "domain-a";
+    payload.object_set = "set-a";
+    payload.sharing_scope = "shared";
+    payload.qos_tier = "gold";
+    payload.logical_key = "logical-key";
+    payload.canonical_key = "tenant-a/domain-a/set-a/logical-key";
     payload.replicas = {};
     auto buf = struct_pack::serialize(payload);
     return std::string(buf.data(), buf.size());
@@ -127,7 +132,7 @@ class OpLogApplierTest : public ::testing::Test {
 // ========== 4.1.1 Basic apply tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyPutEnd) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
 
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
@@ -139,7 +144,7 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd) {
 
 TEST_F(OpLogApplierTest, TestApplyPutRevoke) {
     // First add a key
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
     EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
@@ -153,7 +158,7 @@ TEST_F(OpLogApplierTest, TestApplyPutRevoke) {
 
 TEST_F(OpLogApplierTest, TestApplyRemove) {
     // First add a key
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
     EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
@@ -167,7 +172,7 @@ TEST_F(OpLogApplierTest, TestApplyRemove) {
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidOpType) {
     OpLogEntry entry =
-        MakeEntry(1, OpType::PUT_END, "key1", MakeValidJsonPayload());
+        MakeEntry(1, OpType::PUT_END, "key1", MakeValidStructPackPayload());
     // Manually set an invalid op_type (assuming OpType is an enum)
     // Since we can't directly set invalid enum, we test with valid types
     // and verify that unsupported types in ProcessPendingEntries are handled
@@ -177,7 +182,7 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidOpType) {
 // ========== 4.1.2 Sequence ordering tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyInOrder) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry2 = MakeEntry(2, OpType::PUT_END, "key2", payload);
     OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
@@ -196,7 +201,7 @@ TEST_F(OpLogApplierTest, TestApplyInOrder) {
 }
 
 TEST_F(OpLogApplierTest, TestApplyOutOfOrder) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
     OpLogEntry entry2 = MakeEntry(2, OpType::PUT_END, "key2", payload);
@@ -228,7 +233,7 @@ TEST_F(OpLogApplierTest, TestApplyOutOfOrder) {
 }
 
 TEST_F(OpLogApplierTest, TestApplyWithGap) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry4 = MakeEntry(4, OpType::PUT_END, "key4", payload);
 
@@ -248,7 +253,7 @@ TEST_F(OpLogApplierTest, TestApplyWithGap) {
 }
 
 TEST_F(OpLogApplierTest, TestApplyDuplicateSequenceId) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry1_dup = MakeEntry(1, OpType::PUT_END, "key1_dup", payload);
 
@@ -309,7 +314,7 @@ TEST_F(OpLogApplierTest, TestGapResolution_Retry) {
 // ========== 4.1.4 Checksum tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_ValidChecksum) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
 
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
@@ -318,7 +323,7 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntry_ValidChecksum) {
 }
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidChecksum) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
 
     // Tamper with the checksum
@@ -330,7 +335,7 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidChecksum) {
 }
 
 TEST_F(OpLogApplierTest, TestChecksumFailureMetric) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
 
     // Tamper with the checksum
@@ -343,7 +348,7 @@ TEST_F(OpLogApplierTest, TestChecksumFailureMetric) {
 // ========== 4.1.5 Size validation tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_ValidSize) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
 
     EXPECT_TRUE(OpLogManager::ValidateEntrySize(entry));
@@ -381,7 +386,7 @@ TEST_F(OpLogApplierTest, TestRecover) {
     EXPECT_EQ(11u, applier_->GetExpectedSequenceId());
 
     // Apply entry with seq=11 should succeed
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry = MakeEntry(11, OpType::PUT_END, "key1", payload);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(12u, applier_->GetExpectedSequenceId());
@@ -393,14 +398,14 @@ TEST_F(OpLogApplierTest, TestRecover_ZeroSequenceId) {
     EXPECT_EQ(1u, applier_->GetExpectedSequenceId());
 
     // Apply entry with seq=1 should succeed
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
 }
 
 TEST_F(OpLogApplierTest, TestRecover_AfterGap) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
 
@@ -424,7 +429,7 @@ TEST_F(OpLogApplierTest, TestRecover_AfterGap) {
 // ========== 4.1.7 Pending entries tests ==========
 
 TEST_F(OpLogApplierTest, TestProcessPendingEntries) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
     OpLogEntry entry2 = MakeEntry(2, OpType::PUT_END, "key2", payload);
@@ -458,7 +463,7 @@ TEST_F(OpLogApplierTest, TestProcessPendingEntries) {
 }
 
 TEST_F(OpLogApplierTest, TestPendingEntriesTimeout) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
 
@@ -487,7 +492,7 @@ TEST_F(OpLogApplierTest, TestPendingEntriesTimeout) {
 }
 
 TEST_F(OpLogApplierTest, TestPendingEntriesSkip) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry4 = MakeEntry(4, OpType::PUT_END, "key4", payload);
 
@@ -516,10 +521,10 @@ TEST_F(OpLogApplierTest, TestPendingEntriesSkip) {
     EXPECT_FALSE(mock_metadata_store_->Exists("key4"));
 }
 
-// ========== 4.1.8 JSON parsing tests ==========
+// ========== 4.1.8 struct_pack payload parsing tests ==========
 
-TEST_F(OpLogApplierTest, TestApplyPutEnd_ValidJson) {
-    std::string payload = MakeValidJsonPayload(1, 2, 2048);
+TEST_F(OpLogApplierTest, TestApplyPutEnd_ValidStructPackPayload) {
+    std::string payload = MakeValidStructPackPayload(1, 2, 2048);
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
 
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
@@ -531,11 +536,18 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd_ValidJson) {
     EXPECT_EQ(1u, meta->client_id.first);
     EXPECT_EQ(2u, meta->client_id.second);
     EXPECT_EQ(2048u, meta->size);
+    EXPECT_EQ("tenant-a", meta->tenant_id);
+    EXPECT_EQ("domain-a", meta->domain_id);
+    EXPECT_EQ("set-a", meta->object_set);
+    EXPECT_EQ("shared", meta->sharing_scope);
+    EXPECT_EQ("gold", meta->qos_tier);
+    EXPECT_EQ("logical-key", meta->logical_key);
+    EXPECT_EQ("tenant-a/domain-a/set-a/logical-key", meta->canonical_key);
 }
 
-TEST_F(OpLogApplierTest, TestApplyPutEnd_InvalidJson) {
-    std::string invalid_json = "{invalid json}";
-    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", invalid_json);
+TEST_F(OpLogApplierTest, TestApplyPutEnd_InvalidStructPackPayload) {
+    std::string invalid_payload = "invalid-struct-pack-payload";
+    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", invalid_payload);
 
     // Should still succeed (fallback to empty metadata)
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
@@ -568,7 +580,7 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd_EmptyPayload) {
 // ========== Additional Edge Case Tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntries_Batch) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     std::vector<OpLogEntry> entries;
     entries.push_back(MakeEntry(1, OpType::PUT_END, "key1", payload));
     entries.push_back(MakeEntry(2, OpType::PUT_END, "key2", payload));
@@ -581,7 +593,7 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntries_Batch) {
 }
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntries_WithGaps) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     std::vector<OpLogEntry> entries;
     entries.push_back(MakeEntry(1, OpType::PUT_END, "key1", payload));
     entries.push_back(
@@ -609,7 +621,7 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntries_WithGaps) {
 TEST_F(OpLogApplierTest, TestGetExpectedSequenceId) {
     EXPECT_EQ(1u, applier_->GetExpectedSequenceId());
 
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidStructPackPayload();
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());

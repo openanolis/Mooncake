@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <regex>
 #include <string>
@@ -23,6 +24,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "ha/snapshot/snapshot_test_utils.h"
 #include "utils/file_util.h"
 
 namespace mooncake::test {
@@ -147,6 +149,32 @@ class SnapshotChildProcessTest : public ::testing::Test {
     tl::expected<void, SerializationError> CallPersistState(
         const ha::SnapshotDescriptor& descriptor) {
         return service_->PersistState(descriptor);
+    }
+
+    void OverwriteSnapshotMetadata(const std::string& snapshot_id,
+                                   const std::vector<uint8_t>& payload) {
+        const fs::path metadata_path = fs::path(tmp_dir()) /
+                                       "mooncake_master_snapshot" /
+                                       snapshot_id / "metadata";
+        std::ofstream stream(metadata_path, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(stream.is_open())
+            << "Failed to open snapshot metadata file: " << metadata_path;
+        stream.write(reinterpret_cast<const char*>(payload.data()),
+                     static_cast<std::streamsize>(payload.size()));
+        ASSERT_TRUE(stream.good())
+            << "Failed to write snapshot metadata file: " << metadata_path;
+    }
+
+    MasterServiceConfig BuildRestoreConfig() const {
+        return MasterServiceConfigBuilder()
+            .set_enable_snapshot(false)
+            .set_enable_snapshot_restore(true)
+            .set_snapshot_backup_dir(tmp_dir() + "/backup")
+            .set_snapshot_interval_seconds(100)
+            .set_snapshot_child_timeout_seconds(60)
+            .set_snapshot_retention_count(3)
+            .set_snapshot_object_store_type("local")
+            .build();
     }
 
     bool GetUseSnapshotBackupDir() {
@@ -603,16 +631,8 @@ TEST_F(SnapshotChildProcessTest,
 
     service_.reset();
 
-    auto restore_config = MasterServiceConfigBuilder()
-                              .set_enable_snapshot(false)
-                              .set_enable_snapshot_restore(true)
-                              .set_snapshot_backup_dir(tmp_dir() + "/backup")
-                              .set_snapshot_interval_seconds(100)
-                              .set_snapshot_child_timeout_seconds(60)
-                              .set_snapshot_retention_count(3)
-                              .set_snapshot_object_store_type("local")
-                              .build();
-    auto restored_service = std::make_unique<MasterService>(restore_config);
+    auto restored_service =
+        std::make_unique<MasterService>(BuildRestoreConfig());
 
     EXPECT_TRUE(restored_service->ExistKey(key1).value_or(false))
         << "Restore should fall back to the previous healthy snapshot";
@@ -620,6 +640,108 @@ TEST_F(SnapshotChildProcessTest,
         << "Corrupted latest snapshot must not be partially restored";
 
     restored_service.reset();
+}
+
+TEST_F(SnapshotChildProcessTest,
+       RestoreFallsBackToPreviousHealthySnapshotWhenLatestHasInvalidUuid) {
+    CreateDefaultService();
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "restore_invalid_uuid_segment";
+    segment.base = 0x300100000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    const std::string key1 = "restore_invalid_uuid_key_1";
+    auto put1 = service_->PutStart(client_id, key1, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put1.has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key1, ReplicaType::MEMORY).has_value());
+    EXPECT_TRUE(service_->ExistKey(key1).value_or(false));
+
+    const std::string snapshot_id1 = "20240702_121000_000";
+    auto persist_result = CallPersistState(snapshot_id1);
+    ASSERT_TRUE(persist_result.has_value()) << persist_result.error().message;
+
+    const std::string key2 = "restore_invalid_uuid_key_2";
+    auto put2 = service_->PutStart(client_id, key2, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put2.has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key2, ReplicaType::MEMORY).has_value());
+    EXPECT_TRUE(service_->ExistKey(key2).value_or(false));
+
+    const std::string snapshot_id2 = "20240702_121500_000";
+    persist_result = CallPersistState(snapshot_id2);
+    ASSERT_TRUE(persist_result.has_value()) << persist_result.error().message;
+
+    OverwriteSnapshotMetadata(snapshot_id2,
+                              BuildMetadataPayload(client_id, key2,
+                                                   kDefaultTestDiskFilePath,
+                                                   kDefaultTestObjectSize,
+                                                   kDefaultTestPutStartTimeMs,
+                                                   kDefaultTestLeaseTimeoutMs,
+                                                   std::string("not-a-uuid")));
+
+    service_.reset();
+
+    auto restored_service =
+        std::make_unique<MasterService>(BuildRestoreConfig());
+
+    EXPECT_TRUE(restored_service->ExistKey(key1).value_or(false));
+    EXPECT_FALSE(restored_service->ExistKey(key2).value_or(false));
+}
+
+TEST_F(
+    SnapshotChildProcessTest,
+    RestoreFallsBackToPreviousHealthySnapshotWhenLatestHasReplicaNextIdRegression) {
+    CreateDefaultService();
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "restore_replica_next_id_segment";
+    segment.base = 0x300200000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    const std::string key1 = "restore_replica_next_id_key_1";
+    auto put1 = service_->PutStart(client_id, key1, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put1.has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key1, ReplicaType::MEMORY).has_value());
+    EXPECT_TRUE(service_->ExistKey(key1).value_or(false));
+
+    const std::string snapshot_id1 = "20240702_122000_000";
+    auto persist_result = CallPersistState(snapshot_id1);
+    ASSERT_TRUE(persist_result.has_value()) << persist_result.error().message;
+
+    const std::string key2 = "restore_replica_next_id_key_2";
+    auto put2 = service_->PutStart(client_id, key2, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put2.has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key2, ReplicaType::MEMORY).has_value());
+    EXPECT_TRUE(service_->ExistKey(key2).value_or(false));
+
+    const std::string snapshot_id2 = "20240702_122500_000";
+    persist_result = CallPersistState(snapshot_id2);
+    ASSERT_TRUE(persist_result.has_value()) << persist_result.error().message;
+
+    OverwriteSnapshotMetadata(snapshot_id2,
+                              BuildMetadataPayload(client_id, key2,
+                                                   kDefaultTestDiskFilePath,
+                                                   kDefaultTestObjectSize,
+                                                   kDefaultTestPutStartTimeMs,
+                                                   kDefaultTestLeaseTimeoutMs,
+                                                   std::nullopt,
+                                                   uint64_t{1}));
+
+    service_.reset();
+
+    auto restored_service =
+        std::make_unique<MasterService>(BuildRestoreConfig());
+
+    EXPECT_TRUE(restored_service->ExistKey(key1).value_or(false));
+    EXPECT_FALSE(restored_service->ExistKey(key2).value_or(false));
 }
 
 // ========== Environment Variable Tests ==========

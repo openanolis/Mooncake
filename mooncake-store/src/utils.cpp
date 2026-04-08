@@ -347,6 +347,14 @@ static std::string SanitizeKey(const std::string &key) {
     return sanitized_key;
 }
 
+std::string BuildCanonicalObjectKey(const std::string &tenant_id,
+                                    const std::string &domain_id,
+                                    const std::string &object_set,
+                                    const std::string &logical_key) {
+    return tenant_id + "/" + domain_id + "/" + object_set + "/" +
+           logical_key;
+}
+
 std::string ResolvePathFromKey(const std::string &key,
                                const std::string &root_dir,
                                const std::string &fsdir) {
