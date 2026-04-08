@@ -40,6 +40,8 @@ from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
 
+from mooncake.serving_adapter import normalize_vllm_serving_metadata
+
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -225,7 +227,11 @@ class MooncakeConnectorScheduler:
               asynchronously (between scheduler steps).
         """
 
-        params = request.kv_transfer_params
+        params = normalize_vllm_serving_metadata(
+            request.kv_transfer_params, request.request_id
+        )
+        if request.kv_transfer_params is not None and params is not request.kv_transfer_params:
+            request.kv_transfer_params = params
         logger.debug(
             "MooncakeConnector get_num_new_matched_tokens: "
             "num_computed_tokens=%s, kv_transfer_params=%s",
@@ -244,7 +250,11 @@ class MooncakeConnectorScheduler:
                                  blocks: "KVCacheBlocks",
                                  num_external_tokens: int):
 
-        params = request.kv_transfer_params
+        params = normalize_vllm_serving_metadata(
+            request.kv_transfer_params, request.request_id
+        )
+        if request.kv_transfer_params is not None and params is not request.kv_transfer_params:
+            request.kv_transfer_params = params
         logger.debug(
             "MooncakeConnector update_state_after_alloc: "
             "num_external_tokens=%s, kv_transfer_params=%s",
@@ -285,6 +295,9 @@ class MooncakeConnectorScheduler:
         if self.kv_role != "kv_producer":
             for req_id, (req, block_ids) in self._reqs_need_recv.items():
                 assert req.kv_transfer_params is not None
+                req.kv_transfer_params = normalize_vllm_serving_metadata(
+                    req.kv_transfer_params, req.request_id
+                )
                 meta.add_new_req(request_id=req_id,
                                  local_block_ids=block_ids,
                                  kv_transfer_params=req.kv_transfer_params)
@@ -310,7 +323,11 @@ class MooncakeConnectorScheduler:
         should be freed now or will be sent asynchronously and freed later.
         """
 
-        params = request.kv_transfer_params
+        params = normalize_vllm_serving_metadata(
+            request.kv_transfer_params, request.request_id
+        )
+        if request.kv_transfer_params is not None and params is not request.kv_transfer_params:
+            request.kv_transfer_params = params
         logger.debug(
             "MooncakeConnector request_finished, request_status=%s, "
             "kv_transfer_params=%s", request.status, params)

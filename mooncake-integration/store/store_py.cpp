@@ -10,6 +10,7 @@
 #include <cstdlib>  // for atexit
 
 #include "integration_utils.h"
+#include "utils.h"
 
 namespace py = pybind11;
 
@@ -1415,6 +1416,10 @@ PYBIND11_MODULE(store, m) {
             oss << config;
             return oss.str();
         });
+
+    m.def("build_canonical_object_key", &BuildCanonicalObjectKey,
+          py::arg("tenant_id"), py::arg("domain_id"), py::arg("object_set"),
+          py::arg("logical_key"));
 
     py::enum_<ReplicaStatus>(m, "ReplicaStatus")
         .value("UNDEFINED", ReplicaStatus::UNDEFINED)

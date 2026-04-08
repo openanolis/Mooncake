@@ -10,6 +10,7 @@ import time
 from aiohttp import web
 from mooncake.store import MooncakeDistributedStore
 from mooncake.mooncake_config import MooncakeConfig
+from mooncake.serving_adapter import MooncakeServingDefaults, MooncakeServingStore
 
 
 def _timed_handler(operation_name, handler):
@@ -21,6 +22,14 @@ def _timed_handler(operation_name, handler):
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             logging.info(f"{operation_name} operation completed in {elapsed_ms:.2f} ms")
     return wrapper
+
+
+def _encode_value(value):
+    if isinstance(value, str):
+        return value.encode()
+    if isinstance(value, bytes):
+        return value
+    raise TypeError("value must be a string or bytes")
 
 
 class MooncakeStoreService:
@@ -50,7 +59,9 @@ class MooncakeStoreService:
 
     def __init__(self, config_path: str = None, cli_config: dict = None):
         self.store = None
+        self.serving_store = None
         self.config = None
+        self.serving_defaults = MooncakeServingDefaults()
         self._setup_logging()
 
         try:
@@ -65,6 +76,7 @@ class MooncakeStoreService:
                     if hasattr(self.config, key):
                         setattr(self.config, key, value)
 
+            self.serving_defaults = MooncakeServingDefaults.from_mapping(cli_config)
             logging.info("Mooncake configuration loaded")
         except Exception as e:
             logging.error("Configuration load failed: %s", e)
@@ -119,6 +131,7 @@ class MooncakeStoreService:
                 if ret != 0:
                     raise RuntimeError("Store initialization failed")
 
+                self.serving_store = MooncakeServingStore(self.store, self.serving_defaults)
                 logging.info(f"Store service started successfully on {self.config.local_hostname}")
                 return True
 
@@ -161,16 +174,40 @@ class MooncakeStoreService:
         try:
             data = await request.json()
             key = data.get('key')
-            value = data.get('value').encode()
+            value = data.get('value')
 
-            if not key or not value:
+            if not key or value is None:
                 return web.Response(
                     status=400,
                     text=json.dumps({'error': 'Missing key or value'}),
                     content_type='application/json'
                 )
 
-            ret = self.store.put(key, value)
+            encoded_value = _encode_value(value)
+            metadata = data.get('metadata') or {}
+            if not isinstance(metadata, dict):
+                return web.Response(
+                    status=400,
+                    text=json.dumps({'error': 'metadata must be an object'}),
+                    content_type='application/json'
+                )
+
+            put_kwargs = {
+                'logical_key': metadata.get('logical_key'),
+                'tenant_id': metadata.get('tenant_id'),
+                'domain_id': metadata.get('domain_id'),
+                'object_set': metadata.get('object_set'),
+                'qos_tier': metadata.get('qos_tier'),
+                'sharing_scope': metadata.get('sharing_scope'),
+                'cache_salt': metadata.get('cache_salt'),
+                'canonical_key': metadata.get('canonical_key'),
+            }
+            has_metadata = any(value is not None for value in put_kwargs.values())
+
+            ret = (
+                self.serving_store.put_with_context(key, encoded_value, **put_kwargs)
+                if has_metadata else self.store.put(key, encoded_value)
+            )
             if ret != 0:
                 return web.Response(
                     status=500,
@@ -181,6 +218,12 @@ class MooncakeStoreService:
             return web.Response(
                 status=200,
                 text=json.dumps({'status': 'success'}),
+                content_type='application/json'
+            )
+        except (TypeError, ValueError) as e:
+            return web.Response(
+                status=400,
+                text=json.dumps({'error': str(e)}),
                 content_type='application/json'
             )
         except Exception as e:
