@@ -420,12 +420,33 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     return {};
 }
 
+void MasterService::AccountLiveBytes(ObjectMetadata& metadata) {
+    if (metadata.AreBytesAccounted()) {
+        return;
+    }
+    MasterMetricManager::instance().inc_labeled_live_bytes(
+        metadata.tenant_id, metadata.domain_id, metadata.object_set,
+        static_cast<int64_t>(metadata.size));
+    metadata.MarkBytesAccounted();
+}
+
+void MasterService::ReleaseLiveBytes(ObjectMetadata& metadata) {
+    if (!metadata.AreBytesAccounted()) {
+        return;
+    }
+    MasterMetricManager::instance().dec_labeled_live_bytes(
+        metadata.tenant_id, metadata.domain_id, metadata.object_set,
+        static_cast<int64_t>(metadata.size));
+    metadata.ClearBytesAccounted();
+}
+
 void MasterService::ClearInvalidHandles() {
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
             if (CleanupStaleHandles(it->second)) {
+                ReleaseLiveBytes(it->second);
                 // If the object is empty, we need to erase the iterator and
                 // also erase the key from processing_keys,
                 // replication_tasks, and offloading_tasks.
@@ -988,6 +1009,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 
     if (replica_type == ReplicaType::MEMORY) {
         MasterMetricManager::instance().inc_mem_cache_nums();
+        AccountLiveBytes(metadata);
     } else if (replica_type == ReplicaType::DISK) {
         MasterMetricManager::instance().inc_file_cache_nums();
     }
@@ -1074,6 +1096,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 
     if (replica_type == ReplicaType::MEMORY) {
         MasterMetricManager::instance().dec_mem_cache_nums();
+        ReleaseLiveBytes(metadata);
     } else if (replica_type == ReplicaType::DISK) {
         MasterMetricManager::instance().dec_file_cache_nums();
     }
@@ -1207,6 +1230,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // If no COMPLETE replicas survive the preemption, this key
             // effectively does not exist — fall through to Case A.
             if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+                ReleaseLiveBytes(metadata);
                 shard->metadata.erase(it);
                 it = shard->metadata.end();
             }
@@ -1293,6 +1317,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         discarded_replicas_.emplace_back(std::move(old_replicas),
                                          now + put_start_release_timeout_sec_);
     }
+    ReleaseLiveBytes(metadata);
     shard->metadata.erase(it);
 
     VLOG(1) << "key=" << key << ", action=upsert_start_case_c_reallocate";
@@ -1840,6 +1865,8 @@ auto MasterService::Remove(const std::string& key, bool force)
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
+    ReleaseLiveBytes(metadata);
+
     // Remove object metadata
     accessor.Erase();
     return {};
@@ -1895,6 +1922,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
+                ReleaseLiveBytes(it->second);
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
@@ -1937,6 +1965,7 @@ long MasterService::RemoveAll(bool force) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
+                ReleaseLiveBytes(it->second);
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
@@ -3364,6 +3393,7 @@ bool MasterService::TryRestoreStateFromSnapshot(
             }
 
             MasterMetricManager::instance().reset_allocated_mem_size();
+            MasterMetricManager::instance().reset_all_labeled_inventory_metrics();
             for (auto& segment_name : segment_names) {
                 MasterMetricManager::instance()
                     .reset_segment_allocated_mem_size(segment_name);
@@ -3393,6 +3423,10 @@ bool MasterService::TryRestoreStateFromSnapshot(
                         MasterMetricManager::instance().inc_allocated_mem_size(
                             temp_segment_name,
                             static_cast<int64_t>(buffer_descriptor.size_));
+                    }
+                    if (it->second.HasReplica(&Replica::fn_is_completed) &&
+                        !it->second.AreBytesAccounted()) {
+                        AccountLiveBytes(it->second);
                     }
                 }
             }
@@ -3468,6 +3502,7 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
 
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
+    MasterMetricManager::instance().reset_all_labeled_inventory_metrics();
 }
 
 ha::SnapshotCatalogStore* MasterService::GetSnapshotCatalogStore() {

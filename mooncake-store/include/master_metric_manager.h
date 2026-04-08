@@ -77,11 +77,40 @@ class MasterMetricManager {
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1);
     void dec_key_count(int64_t val = 1);
+    void inc_labeled_key_count(const std::string& tenant_id,
+                               const std::string& domain_id,
+                               const std::string& object_set,
+                               int64_t val = 1);
+    void dec_labeled_key_count(const std::string& tenant_id,
+                               const std::string& domain_id,
+                               const std::string& object_set,
+                               int64_t val = 1);
     void inc_soft_pin_key_count(int64_t val = 1);
     void dec_soft_pin_key_count(int64_t val = 1);
+    void inc_labeled_live_bytes(const std::string& tenant_id,
+                                const std::string& domain_id,
+                                const std::string& object_set,
+                                int64_t val);
+    void dec_labeled_live_bytes(const std::string& tenant_id,
+                                const std::string& domain_id,
+                                const std::string& object_set,
+                                int64_t val);
+    void reset_labeled_key_count(const std::string& tenant_id,
+                                 const std::string& domain_id,
+                                 const std::string& object_set);
+    void reset_labeled_live_bytes(const std::string& tenant_id,
+                                  const std::string& domain_id,
+                                  const std::string& object_set);
+    void reset_all_labeled_inventory_metrics();
     void observe_value_size(int64_t size);
     int64_t get_key_count();
+    int64_t get_labeled_key_count(const std::string& tenant_id,
+                                  const std::string& domain_id,
+                                  const std::string& object_set);
     int64_t get_soft_pin_key_count();
+    int64_t get_labeled_live_bytes(const std::string& tenant_id,
+                                   const std::string& domain_id,
+                                   const std::string& object_set);
 
     // Cluster Metrics
     void inc_active_clients(int64_t val = 1);
@@ -326,7 +355,9 @@ class MasterMetricManager {
 
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;
+    ylt::metric::dynamic_gauge_3t labeled_key_count_;
     ylt::metric::gauge_t soft_pin_key_count_;
+    ylt::metric::dynamic_gauge_3t labeled_live_bytes_;
     ylt::metric::histogram_t value_size_distribution_;
 
     // Cluster Metrics

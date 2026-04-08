@@ -54,6 +54,10 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
 
     // Key/Value Metrics
     ASSERT_EQ(metrics.get_key_count(), 0);
+    ASSERT_EQ(metrics.get_labeled_key_count("tenant-a", "domain-a", "set-a"),
+              0);
+    ASSERT_EQ(metrics.get_labeled_live_bytes("tenant-a", "domain-a", "set-a"),
+              0);
 
     // Operation Statistics
     ASSERT_EQ(metrics.get_put_start_requests(), 0);
@@ -152,11 +156,18 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     uint64_t value_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
+    config.tenant_id = "tenant-a";
+    config.domain_id = "domain-a";
+    config.object_set = "set-a";
 
     // Test MountSegment request
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
+    ASSERT_EQ(metrics.get_labeled_key_count("tenant-a", "domain-a", "set-a"),
+              0);
+    ASSERT_EQ(metrics.get_labeled_live_bytes("tenant-a", "domain-a", "set-a"),
+              0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), kSegmentSize);
     ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
@@ -171,6 +182,10 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
         service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result1.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
+    ASSERT_EQ(metrics.get_labeled_key_count("tenant-a", "domain-a", "set-a"),
+              1);
+    ASSERT_EQ(metrics.get_labeled_live_bytes("tenant-a", "domain-a", "set-a"),
+              0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
               value_length);
@@ -180,6 +195,10 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
         service_.PutRevoke(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_revoke_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 0);
+    ASSERT_EQ(metrics.get_labeled_key_count("tenant-a", "domain-a", "set-a"),
+              0);
+    ASSERT_EQ(metrics.get_labeled_live_bytes("tenant-a", "domain-a", "set-a"),
+              0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
     ASSERT_EQ(metrics.get_put_revoke_requests(), 1);
@@ -190,6 +209,10 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
         service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result2.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
+    ASSERT_EQ(metrics.get_labeled_key_count("tenant-a", "domain-a", "set-a"),
+              1);
+    ASSERT_EQ(metrics.get_labeled_live_bytes("tenant-a", "domain-a", "set-a"),
+              0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
               value_length);
@@ -198,6 +221,10 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     auto put_end_result = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
+    ASSERT_EQ(metrics.get_labeled_key_count("tenant-a", "domain-a", "set-a"),
+              1);
+    ASSERT_EQ(metrics.get_labeled_live_bytes("tenant-a", "domain-a", "set-a"),
+              value_length);
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
               value_length);
@@ -224,6 +251,10 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_remove_requests(), 1);
     ASSERT_EQ(metrics.get_remove_failures(), 0);
     ASSERT_EQ(metrics.get_key_count(), 0);
+    ASSERT_EQ(metrics.get_labeled_key_count("tenant-a", "domain-a", "set-a"),
+              0);
+    ASSERT_EQ(metrics.get_labeled_live_bytes("tenant-a", "domain-a", "set-a"),
+              0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
 
@@ -234,10 +265,16 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     auto put_end_result2 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result2.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
+    ASSERT_EQ(metrics.get_labeled_live_bytes("tenant-a", "domain-a", "set-a"),
+              value_length);
     ASSERT_EQ(1, service_.RemoveAll());
     ASSERT_EQ(metrics.get_remove_all_requests(), 1);
     ASSERT_EQ(metrics.get_remove_all_failures(), 0);
     ASSERT_EQ(metrics.get_key_count(), 0);
+    ASSERT_EQ(metrics.get_labeled_key_count("tenant-a", "domain-a", "set-a"),
+              0);
+    ASSERT_EQ(metrics.get_labeled_live_bytes("tenant-a", "domain-a", "set-a"),
+              0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
 
@@ -252,6 +289,10 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_unmount_segment_requests(), 1);
     ASSERT_EQ(metrics.get_unmount_segment_failures(), 0);
     ASSERT_EQ(metrics.get_key_count(), 0);
+    ASSERT_EQ(metrics.get_labeled_key_count("tenant-a", "domain-a", "set-a"),
+              0);
+    ASSERT_EQ(metrics.get_labeled_live_bytes("tenant-a", "domain-a", "set-a"),
+              0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
     ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
@@ -262,6 +303,52 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     // check segment mem used ratio for non-existent segment
     ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(""), 0.0);
     ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio("xxxxxx_segment"), 0.0);
+}
+
+TEST_F(MasterMetricsTest, LabeledInventoryUpsertTest) {
+    auto& metrics = MasterMetricManager::instance();
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
+    service_config.enable_metric_reporting = true;
+    WrappedMasterService service_(service_config);
+
+    constexpr size_t kBufferAddress = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment";
+    segment.base = kBufferAddress;
+    segment.size = kSegmentSize;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_.MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.tenant_id = "tenant-b";
+    config.domain_id = "domain-b";
+    config.object_set = "set-b";
+
+    const std::string key = "upsert-key";
+    ASSERT_TRUE(service_.PutStart(client_id, key, 1024, config).has_value());
+    ASSERT_TRUE(service_.PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_EQ(metrics.get_labeled_key_count("tenant-b", "domain-b", "set-b"),
+              1);
+    ASSERT_EQ(metrics.get_labeled_live_bytes("tenant-b", "domain-b", "set-b"),
+              1024);
+
+    ASSERT_TRUE(service_.UpsertStart(client_id, key, 1024, config).has_value());
+    ASSERT_TRUE(service_.UpsertEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_EQ(metrics.get_labeled_key_count("tenant-b", "domain-b", "set-b"),
+              1);
+    ASSERT_EQ(metrics.get_labeled_live_bytes("tenant-b", "domain-b", "set-b"),
+              1024);
+
+    ASSERT_TRUE(service_.UpsertStart(client_id, key, 2048, config).has_value());
+    ASSERT_TRUE(service_.UpsertEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_EQ(metrics.get_labeled_key_count("tenant-b", "domain-b", "set-b"),
+              1);
+    ASSERT_EQ(metrics.get_labeled_live_bytes("tenant-b", "domain-b", "set-b"),
+              2048);
 }
 
 TEST_F(MasterMetricsTest, CalcCacheStatsTest) {

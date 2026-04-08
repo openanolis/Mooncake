@@ -543,6 +543,8 @@ class MasterService {
 
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
+    void AccountLiveBytes(ObjectMetadata& metadata);
+    void ReleaseLiveBytes(ObjectMetadata& metadata);
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -554,9 +556,11 @@ class MasterService {
     struct ObjectMetadata {
         // RAII-style metric management
         ~ObjectMetadata() {
-            MasterMetricManager::instance().dec_key_count(1);
+            auto& metrics = MasterMetricManager::instance();
+            metrics.dec_key_count(1);
+            metrics.dec_labeled_key_count(tenant_id, domain_id, object_set, 1);
             if (soft_pin_timeout) {
-                MasterMetricManager::instance().dec_soft_pin_key_count(1);
+                metrics.dec_soft_pin_key_count(1);
             }
         }
 
@@ -584,13 +588,16 @@ class MasterService {
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
+              bytes_accounted(false),
               replicas_(std::move(reps)) {
-            MasterMetricManager::instance().inc_key_count(1);
+            auto& metrics = MasterMetricManager::instance();
+            metrics.inc_key_count(1);
+            metrics.inc_labeled_key_count(tenant_id, domain_id, object_set, 1);
             if (enable_soft_pin) {
                 soft_pin_timeout.emplace();
-                MasterMetricManager::instance().inc_soft_pin_key_count(1);
+                metrics.inc_soft_pin_key_count(1);
             }
-            MasterMetricManager::instance().observe_value_size(value_length);
+            metrics.observe_value_size(value_length);
         }
 
         ObjectMetadata(const ObjectMetadata&) = delete;
@@ -620,6 +627,7 @@ class MasterService {
             soft_pin_timeout GUARDED_BY(lock);  // optional soft pin, only
                                                 // set for vip objects
         const bool hard_pinned{false};          // immutable, set at creation
+        bool bytes_accounted{false};
 
         void AddReplicas(std::vector<Replica>&& replicas) {
             replicas_.insert(replicas_.end(),
@@ -799,6 +807,10 @@ class MasterService {
                               !replica.has_invalid_mem_handle();
                    });
         }
+
+        void MarkBytesAccounted() { bytes_accounted = true; }
+        void ClearBytesAccounted() { bytes_accounted = false; }
+        bool AreBytesAccounted() const { return bytes_accounted; }
 
         std::vector<std::string> GetReplicaSegmentNames() const {
             std::vector<std::string> segment_names;
