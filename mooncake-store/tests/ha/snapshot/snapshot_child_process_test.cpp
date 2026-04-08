@@ -181,12 +181,46 @@ class SnapshotChildProcessTest : public ::testing::Test {
         return service_->use_snapshot_backup_dir_;
     }
 
+    uint32_t GetShardIndex(MasterService* svc, const std::string& key) {
+        return static_cast<uint32_t>(svc->getShardIndex(key));
+    }
+
     // Check if a key exists in raw metadata (regardless of replica status)
     bool KeyExistsInMetadata(MasterService* svc, const std::string& key) {
         size_t shard_idx = svc->getShardIndex(key);
         auto& shard = svc->metadata_shards_[shard_idx];
         SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
         return shard.metadata.find(key) != shard.metadata.end();
+    }
+
+    struct MetadataFieldsView {
+        std::string tenant_id;
+        std::string domain_id;
+        std::string object_set;
+        std::string sharing_scope;
+        std::string qos_tier;
+        std::string logical_key;
+        std::string canonical_key;
+    };
+
+    std::optional<MetadataFieldsView> GetMetadataDescriptor(
+        MasterService* svc, const std::string& key) {
+        size_t shard_idx = svc->getShardIndex(key);
+        auto& shard = svc->metadata_shards_[shard_idx];
+        SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
+        auto it = shard.metadata.find(key);
+        if (it == shard.metadata.end()) {
+            return std::nullopt;
+        }
+        return MetadataFieldsView{
+            .tenant_id = it->second.tenant_id,
+            .domain_id = it->second.domain_id,
+            .object_set = it->second.object_set,
+            .sharing_scope = it->second.sharing_scope,
+            .qos_tier = it->second.qos_tier,
+            .logical_key = it->second.logical_key,
+            .canonical_key = it->second.canonical_key,
+        };
     }
 
    private:
@@ -742,6 +776,115 @@ TEST_F(
 
     EXPECT_TRUE(restored_service->ExistKey(key1).value_or(false));
     EXPECT_FALSE(restored_service->ExistKey(key2).value_or(false));
+}
+
+TEST_F(SnapshotChildProcessTest, RestoreLoadsLegacyMetadataWithDefaults) {
+    CreateDefaultService();
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "restore_legacy_metadata_segment";
+    segment.base = 0x300300000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    const std::string key = "restore_legacy_metadata_key";
+    auto put = service_->PutStart(client_id, key, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put.has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    EXPECT_TRUE(service_->ExistKey(key).value_or(false));
+
+    const std::string snapshot_id = "20240702_123000_000";
+    auto persist_result = CallPersistState(snapshot_id);
+    ASSERT_TRUE(persist_result.has_value()) << persist_result.error().message;
+
+    SnapshotMetadataPayloadOptions options;
+    options.use_extended_metadata = false;
+    const uint32_t shard_index =
+        GetShardIndex(service_.get(), key);
+    OverwriteSnapshotMetadata(snapshot_id,
+                              BuildMetadataPayload(client_id, key,
+                                                   kDefaultTestDiskFilePath,
+                                                   kDefaultTestObjectSize,
+                                                   kDefaultTestPutStartTimeMs,
+                                                   kDefaultTestLeaseTimeoutMs,
+                                                   std::nullopt,
+                                                   std::nullopt, options,
+                                                   shard_index));
+
+    service_.reset();
+    auto restored_service =
+        std::make_unique<MasterService>(BuildRestoreConfig());
+
+    auto metadata = GetMetadataDescriptor(restored_service.get(), key);
+    ASSERT_TRUE(metadata.has_value());
+    EXPECT_EQ(metadata->tenant_id, "default");
+    EXPECT_EQ(metadata->domain_id, "default");
+    EXPECT_EQ(metadata->object_set, "default");
+    EXPECT_EQ(metadata->sharing_scope, "");
+    EXPECT_EQ(metadata->qos_tier, "default");
+    EXPECT_EQ(metadata->logical_key, "");
+    EXPECT_EQ(metadata->canonical_key, "");
+}
+
+TEST_F(SnapshotChildProcessTest, RestoreLoadsExtendedMetadataFields) {
+    CreateDefaultService();
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "restore_extended_metadata_segment";
+    segment.base = 0x300400000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    const std::string key = "restore_extended_metadata_key";
+    auto put = service_->PutStart(client_id, key, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put.has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    EXPECT_TRUE(service_->ExistKey(key).value_or(false));
+
+    const std::string snapshot_id = "20240702_123500_000";
+    auto persist_result = CallPersistState(snapshot_id);
+    ASSERT_TRUE(persist_result.has_value()) << persist_result.error().message;
+
+    SnapshotMetadataPayloadOptions options;
+    options.tenant_id = "tenant-a";
+    options.domain_id = "domain-a";
+    options.object_set = "set-a";
+    options.sharing_scope = "scope-a";
+    options.qos_tier = "gold";
+    options.logical_key = "logical-a";
+    options.canonical_key = "tenant-a/domain-a/set-a/logical-a";
+    const uint32_t shard_index =
+        GetShardIndex(service_.get(), key);
+    OverwriteSnapshotMetadata(snapshot_id,
+                              BuildMetadataPayload(client_id, key,
+                                                   kDefaultTestDiskFilePath,
+                                                   kDefaultTestObjectSize,
+                                                   kDefaultTestPutStartTimeMs,
+                                                   kDefaultTestLeaseTimeoutMs,
+                                                   std::nullopt,
+                                                   std::nullopt, options,
+                                                   shard_index));
+
+    service_.reset();
+    auto restored_service =
+        std::make_unique<MasterService>(BuildRestoreConfig());
+
+    auto metadata = GetMetadataDescriptor(restored_service.get(), key);
+    ASSERT_TRUE(metadata.has_value());
+    EXPECT_EQ(metadata->tenant_id, "tenant-a");
+    EXPECT_EQ(metadata->domain_id, "domain-a");
+    EXPECT_EQ(metadata->object_set, "set-a");
+    EXPECT_EQ(metadata->sharing_scope, "scope-a");
+    EXPECT_EQ(metadata->qos_tier, "gold");
+    EXPECT_EQ(metadata->logical_key, "logical-a");
+    EXPECT_EQ(metadata->canonical_key,
+              "tenant-a/domain-a/set-a/logical-a");
 }
 
 // ========== Environment Variable Tests ==========

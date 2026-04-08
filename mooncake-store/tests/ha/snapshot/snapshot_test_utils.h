@@ -38,6 +38,18 @@ constexpr uint64_t kDefaultTestSnapshotSeq = 42;
 constexpr uint64_t kDefaultTestProducerViewVersion = 7;
 constexpr int64_t kDefaultTestCreatedAtMs = 1700000000000LL;
 
+struct SnapshotMetadataPayloadOptions {
+    bool use_extended_metadata{true};
+    std::string tenant_id{"default"};
+    std::string domain_id{"default"};
+    std::string object_set{"default"};
+    std::string sharing_scope{};
+    std::string qos_tier{"default"};
+    std::string logical_key{};
+    std::string canonical_key{};
+    bool hard_pinned{false};
+};
+
 struct CatalogBackendParam {
     std::string name;
     std::string catalog_store_type;
@@ -135,7 +147,8 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     uint64_t put_start_time_ms = kDefaultTestPutStartTimeMs,
     uint64_t lease_timeout_ms = kDefaultTestLeaseTimeoutMs,
     std::optional<std::string> client_id_override = std::nullopt,
-    std::optional<uint64_t> replica_next_id_override = std::nullopt) {
+    std::optional<uint64_t> replica_next_id_override = std::nullopt,
+    SnapshotMetadataPayloadOptions options = {}, uint32_t shard_index = 0) {
     msgpack::sbuffer shard_buffer;
     MsgpackPacker shard_packer(&shard_buffer);
     shard_packer.pack_map(1);
@@ -144,24 +157,34 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     shard_packer.pack_array(2);
     shard_packer.pack(std::string(object_key));
 
-    shard_packer.pack_array(15);
+    if (options.logical_key.empty()) {
+        options.logical_key = std::string(object_key);
+    }
+    if (options.canonical_key.empty()) {
+        options.canonical_key = options.tenant_id + "/" + options.domain_id +
+                                "/" + options.object_set + "/" +
+                                options.logical_key;
+    }
+
+    shard_packer.pack_array(options.use_extended_metadata ? 15 : 8);
     shard_packer.pack(client_id_override.value_or(UuidToString(client_id)));
     shard_packer.pack(put_start_time_ms);
     shard_packer.pack(object_size);
     shard_packer.pack(lease_timeout_ms);
     shard_packer.pack(false);
     shard_packer.pack(uint64_t{0});
-    shard_packer.pack(std::string("default"));
-    shard_packer.pack(std::string("default"));
-    shard_packer.pack(std::string("default"));
-    shard_packer.pack(std::string());
-    shard_packer.pack(std::string("default"));
-    shard_packer.pack(std::string(object_key));
-    shard_packer.pack(std::string("default/default/default/") +
-                      std::string(object_key));
+    if (options.use_extended_metadata) {
+        shard_packer.pack(options.tenant_id);
+        shard_packer.pack(options.domain_id);
+        shard_packer.pack(options.object_set);
+        shard_packer.pack(options.sharing_scope);
+        shard_packer.pack(options.qos_tier);
+        shard_packer.pack(options.logical_key);
+        shard_packer.pack(options.canonical_key);
+    }
     shard_packer.pack(uint32_t{1});
     PackDiskReplica(shard_packer, disk_file_path, object_size);
-    shard_packer.pack(false);
+    shard_packer.pack(options.hard_pinned);
 
     auto compressed_shard =
         zstd_compress(reinterpret_cast<const uint8_t*>(shard_buffer.data()),
@@ -172,7 +195,7 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     root_packer.pack_map(3);
     root_packer.pack(std::string("shards"));
     root_packer.pack_map(1);
-    root_packer.pack(std::string("0"));
+    root_packer.pack(shard_index);
     root_packer.pack_bin(compressed_shard.size());
     root_packer.pack_bin_body(
         reinterpret_cast<const char*>(compressed_shard.data()),

@@ -140,6 +140,97 @@ TEST_P(CatalogBackedSnapshotProviderTest, RejectsClusterMismatch) {
     EXPECT_EQ(snapshot.error(), ErrorCode::INVALID_PARAMS);
 }
 
+TEST_P(CatalogBackedSnapshotProviderTest, LoadsLegacyMetadataWithDefaults) {
+    auto manifest = object_store_->UploadString(descriptor_.manifest_key,
+                                                "messagepack|1.0.0|standby-test");
+    ASSERT_TRUE(manifest.has_value()) << manifest.error();
+
+    auto segments = object_store_->UploadBuffer(
+        descriptor_.object_prefix + "segments", BuildSegmentsPayload());
+    ASSERT_TRUE(segments.has_value()) << segments.error();
+
+    SnapshotMetadataPayloadOptions options;
+    options.use_extended_metadata = false;
+    auto metadata = object_store_->UploadBuffer(
+        descriptor_.object_prefix + "metadata",
+        BuildMetadataPayload(UUID{1, 2}, kDefaultTestObjectKey,
+                             kDefaultTestDiskFilePath, kDefaultTestObjectSize,
+                             kDefaultTestPutStartTimeMs,
+                             kDefaultTestLeaseTimeoutMs, std::nullopt,
+                             std::nullopt, options));
+    ASSERT_TRUE(metadata.has_value()) << metadata.error();
+
+    auto publish_result = catalog_store_->Publish(descriptor_);
+    ASSERT_EQ(publish_result, ErrorCode::OK);
+    snapshot_published_ = true;
+
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value()) << toString(provider.error());
+
+    auto snapshot = provider.value()->LoadLatestSnapshot(cluster_id_);
+    ASSERT_TRUE(snapshot.has_value()) << toString(snapshot.error());
+    ASSERT_TRUE(snapshot->has_value());
+    ASSERT_EQ(snapshot->value().metadata.size(), 1u);
+
+    const auto& metadata_entry = snapshot->value().metadata.front().second;
+    EXPECT_EQ(metadata_entry.tenant_id, "default");
+    EXPECT_EQ(metadata_entry.domain_id, "default");
+    EXPECT_EQ(metadata_entry.object_set, "default");
+    EXPECT_EQ(metadata_entry.sharing_scope, "");
+    EXPECT_EQ(metadata_entry.qos_tier, "default");
+    EXPECT_EQ(metadata_entry.logical_key, "");
+    EXPECT_EQ(metadata_entry.canonical_key, "");
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest, LoadsExtendedMetadataFields) {
+    auto manifest = object_store_->UploadString(descriptor_.manifest_key,
+                                                "messagepack|1.0.0|standby-test");
+    ASSERT_TRUE(manifest.has_value()) << manifest.error();
+
+    auto segments = object_store_->UploadBuffer(
+        descriptor_.object_prefix + "segments", BuildSegmentsPayload());
+    ASSERT_TRUE(segments.has_value()) << segments.error();
+
+    SnapshotMetadataPayloadOptions options;
+    options.tenant_id = "tenant-a";
+    options.domain_id = "domain-a";
+    options.object_set = "set-a";
+    options.sharing_scope = "scope-a";
+    options.qos_tier = "gold";
+    options.logical_key = "logical-a";
+    options.canonical_key = "tenant-a/domain-a/set-a/logical-a";
+    auto metadata = object_store_->UploadBuffer(
+        descriptor_.object_prefix + "metadata",
+        BuildMetadataPayload(UUID{1, 2}, kDefaultTestObjectKey,
+                             kDefaultTestDiskFilePath, kDefaultTestObjectSize,
+                             kDefaultTestPutStartTimeMs,
+                             kDefaultTestLeaseTimeoutMs, std::nullopt,
+                             std::nullopt, options));
+    ASSERT_TRUE(metadata.has_value()) << metadata.error();
+
+    auto publish_result = catalog_store_->Publish(descriptor_);
+    ASSERT_EQ(publish_result, ErrorCode::OK);
+    snapshot_published_ = true;
+
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value()) << toString(provider.error());
+
+    auto snapshot = provider.value()->LoadLatestSnapshot(cluster_id_);
+    ASSERT_TRUE(snapshot.has_value()) << toString(snapshot.error());
+    ASSERT_TRUE(snapshot->has_value());
+    ASSERT_EQ(snapshot->value().metadata.size(), 1u);
+
+    const auto& metadata_entry = snapshot->value().metadata.front().second;
+    EXPECT_EQ(metadata_entry.tenant_id, "tenant-a");
+    EXPECT_EQ(metadata_entry.domain_id, "domain-a");
+    EXPECT_EQ(metadata_entry.object_set, "set-a");
+    EXPECT_EQ(metadata_entry.sharing_scope, "scope-a");
+    EXPECT_EQ(metadata_entry.qos_tier, "gold");
+    EXPECT_EQ(metadata_entry.logical_key, "logical-a");
+    EXPECT_EQ(metadata_entry.canonical_key,
+              "tenant-a/domain-a/set-a/logical-a");
+}
+
 TEST_P(CatalogBackedSnapshotProviderTest, RejectsInvalidMetadataUuid) {
     auto manifest = object_store_->UploadString(descriptor_.manifest_key,
                                                 "messagepack|1.0.0|standby-test");
