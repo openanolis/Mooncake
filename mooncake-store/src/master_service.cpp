@@ -874,6 +874,7 @@ AdmissionRequestContext MasterService::BuildAdmissionRequestContext(
     return AdmissionRequestContext{operation,
                                    key,
                                    value_length,
+                                   value_length,
                                    config.replica_num,
                                    config.tenant_id,
                                    config.domain_id,
@@ -884,11 +885,110 @@ AdmissionRequestContext MasterService::BuildAdmissionRequestContext(
                                    std::move(canonical_key)};
 }
 
+uint64_t MasterService::ResolveAdmissionBytes(
+    const AdmissionRequestContext& context,
+    const MetadataShardAccessorRW& current_shard,
+    size_t current_shard_index) const {
+    if (context.sharing_scope != "tenant_shared" ||
+        context.canonical_key.empty()) {
+        return context.slice_length;
+    }
+
+    auto has_shared_object = [&](const auto& shard) {
+        for (const auto& [existing_key, metadata] : shard->metadata) {
+            if (current_shard_index == getShardIndex(existing_key) &&
+                existing_key == context.key) {
+                continue;
+            }
+            if (metadata.tenant_id != context.tenant_id ||
+                metadata.sharing_scope != context.sharing_scope ||
+                metadata.canonical_key != context.canonical_key) {
+                continue;
+            }
+            return true;
+        }
+        return false;
+    };
+
+    if (has_shared_object(current_shard)) {
+        return 0;
+    }
+
+    for (size_t shard_index = 0; shard_index < kNumShards; ++shard_index) {
+        if (shard_index == current_shard_index) {
+            continue;
+        }
+        MetadataShardAccessorRO shard(this, shard_index);
+        if (has_shared_object(shard)) {
+            return 0;
+        }
+    }
+
+    return context.slice_length;
+}
+
+std::vector<std::string> MasterService::ResolvePreferredSegments(
+    const MetadataShardAccessorRW& shard, const ReplicateConfig& config) const {
+    std::vector<std::string> preferred_segments;
+    if (!config.preferred_segment.empty()) {
+        preferred_segments.push_back(config.preferred_segment);
+    } else if (!config.preferred_segments.empty()) {
+        preferred_segments = config.preferred_segments;
+    }
+
+    auto append_if_missing = [&](const std::string& segment_name) {
+        if (!segment_name.empty() &&
+            std::find(preferred_segments.begin(), preferred_segments.end(),
+                      segment_name) == preferred_segments.end()) {
+            preferred_segments.push_back(segment_name);
+        }
+    };
+
+    if (!config.prefer_domain_locality && !config.prefer_object_set_locality) {
+        return preferred_segments;
+    }
+
+    std::unordered_map<std::string, size_t> segment_hits;
+    for (const auto& [_, metadata] : shard->metadata) {
+        if (config.prefer_domain_locality &&
+            metadata.domain_id != config.domain_id) {
+            continue;
+        }
+        if (config.prefer_object_set_locality &&
+            metadata.object_set != config.object_set) {
+            continue;
+        }
+        for (const auto& segment_name : metadata.GetReplicaSegmentNames()) {
+            segment_hits[segment_name]++;
+        }
+    }
+
+    std::vector<std::pair<std::string, size_t>> ranked_segments(
+        segment_hits.begin(), segment_hits.end());
+    std::sort(ranked_segments.begin(), ranked_segments.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  if (lhs.second != rhs.second) {
+                      return lhs.second > rhs.second;
+                  }
+                  return lhs.first < rhs.first;
+              });
+    for (const auto& [segment_name, _] : ranked_segments) {
+        append_if_missing(segment_name);
+    }
+
+    return preferred_segments;
+}
+
 tl::expected<void, ErrorCode> MasterService::AdmitWrite(
     AdmissionRequestContext::Operation operation, const std::string& key,
-    uint64_t value_length, const ReplicateConfig& config) const {
-    return admission_controller_->Admit(
-        BuildAdmissionRequestContext(operation, key, value_length, config));
+    uint64_t value_length, const ReplicateConfig& config,
+    const MetadataShardAccessorRW& current_shard,
+    size_t current_shard_index) const {
+    auto context =
+        BuildAdmissionRequestContext(operation, key, value_length, config);
+    context.effective_requested_bytes =
+        ResolveAdmissionBytes(context, current_shard, current_shard_index);
+    return admission_controller_->Admit(context);
 }
 
 auto MasterService::AllocateAndInsertMetadata(
@@ -903,12 +1003,7 @@ auto MasterService::AllocateAndInsertMetadata(
             segment_manager_.getAllocatorAccess();
         const auto& allocator_manager = allocator_access.getAllocatorManager();
 
-        std::vector<std::string> preferred_segments;
-        if (!config.preferred_segment.empty()) {
-            preferred_segments.push_back(config.preferred_segment);
-        } else if (!config.preferred_segments.empty()) {
-            preferred_segments = config.preferred_segments;
-        }
+        auto preferred_segments = ResolvePreferredSegments(shard, config);
 
         auto allocation_result = allocation_strategy_->Allocate(
             allocator_manager, value_length, config.replica_num,
@@ -1012,7 +1107,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
     auto admission_result =
         AdmitWrite(AdmissionRequestContext::Operation::PUT_START, key,
-                   slice_length, config);
+                   slice_length, config, shard, getShardIndex(key));
     if (!admission_result.has_value()) {
         return tl::make_unexpected(admission_result.error());
     }
@@ -1299,7 +1394,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     if (it == shard->metadata.end()) {
         auto admission_result =
             AdmitWrite(AdmissionRequestContext::Operation::UPSERT_START, key,
-                       slice_length, config);
+                       slice_length, config, shard, getShardIndex(key));
         if (!admission_result.has_value()) {
             return tl::make_unexpected(admission_result.error());
         }
@@ -1376,7 +1471,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
     auto admission_result =
         AdmitWrite(AdmissionRequestContext::Operation::UPSERT_START, key,
-                   slice_length, merged_config);
+                   slice_length, merged_config, shard, getShardIndex(key));
     if (!admission_result.has_value()) {
         return tl::make_unexpected(admission_result.error());
     }
@@ -3591,16 +3686,21 @@ void MasterService::BatchEvict(double evict_ratio_target,
     struct EvictionCandidate {
         std::string key;
         std::string tenant_id;
+        std::string domain_id;
+        std::string object_set;
         std::chrono::system_clock::time_point lease_timeout;
     };
-    using CandidateBuckets =
-        std::map<int, std::unordered_map<std::string, std::vector<EvictionCandidate>>>;
+    using GroupKey = std::pair<std::string, std::string>;
+    using TenantBuckets =
+        std::unordered_map<std::string, std::vector<EvictionCandidate>>;
+    using CandidateBuckets = std::map<int, std::map<GroupKey, TenantBuckets>>;
 
     auto now = std::chrono::system_clock::now();
     long evicted_count = 0;
     long object_count = 0;
     uint64_t total_freed_size = 0;
     std::unordered_map<std::string, uint64_t> tenant_live_bytes;
+    std::map<GroupKey, uint64_t> group_live_bytes;
     CandidateBuckets no_pin_buckets;
     CandidateBuckets soft_pin_buckets;
 
@@ -3629,6 +3729,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         for (const auto& [key, metadata] : shard->metadata) {
             if (metadata.AreBytesAccounted()) {
                 tenant_live_bytes[metadata.tenant_id] += metadata.size;
+                group_live_bytes[{metadata.domain_id, metadata.object_set}] +=
+                    metadata.size;
             }
             if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
                 !can_evict_replicas(metadata)) {
@@ -3636,23 +3738,28 @@ void MasterService::BatchEvict(double evict_ratio_target,
             }
             auto& bucket = metadata.IsSoftPinned(now) ? soft_pin_buckets
                                                       : no_pin_buckets;
-            bucket[EvictionTierRank(metadata.qos_tier)][metadata.tenant_id]
+            bucket[EvictionTierRank(metadata.qos_tier)]
+                  [{metadata.domain_id, metadata.object_set}][metadata.tenant_id]
                 .push_back(EvictionCandidate{key, metadata.tenant_id,
+                                             metadata.domain_id,
+                                             metadata.object_set,
                                              metadata.lease_timeout});
         }
     }
 
     auto sort_bucket_candidates = [](CandidateBuckets& buckets) {
-        for (auto& [_, tenant_buckets] : buckets) {
-            for (auto& [tenant_id, candidates] : tenant_buckets) {
-                std::sort(candidates.begin(), candidates.end(),
-                          [](const EvictionCandidate& lhs,
-                             const EvictionCandidate& rhs) {
-                              if (lhs.lease_timeout != rhs.lease_timeout) {
-                                  return lhs.lease_timeout < rhs.lease_timeout;
-                              }
-                              return lhs.key < rhs.key;
-                          });
+        for (auto& [_, group_buckets] : buckets) {
+            for (auto& [_, tenant_buckets] : group_buckets) {
+                for (auto& [_, candidates] : tenant_buckets) {
+                    std::sort(candidates.begin(), candidates.end(),
+                              [](const EvictionCandidate& lhs,
+                                 const EvictionCandidate& rhs) {
+                                  if (lhs.lease_timeout != rhs.lease_timeout) {
+                                      return lhs.lease_timeout < rhs.lease_timeout;
+                                  }
+                                  return lhs.key < rhs.key;
+                              });
+                }
             }
         }
     };
@@ -3667,45 +3774,62 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         long evicted = 0;
         std::unordered_map<std::string, size_t> next_candidate_index;
-        auto bucket_index_key = [](int tier_rank, const std::string& tenant_id) {
-            return std::to_string(tier_rank) + "\n" + tenant_id;
+        auto bucket_index_key = [](int tier_rank, const GroupKey& group_key,
+                                   const std::string& tenant_id) {
+            return std::to_string(tier_rank) + "\n" + group_key.first + "\n" +
+                   group_key.second + "\n" + tenant_id;
         };
         while (evicted < target_evict_num) {
             int selected_tier = 0;
+            std::optional<GroupKey> selected_group;
             std::optional<std::string> selected_tenant;
-            uint64_t selected_pressure = 0;
+            uint64_t selected_group_pressure = 0;
+            uint64_t selected_tenant_pressure = 0;
             auto selected_timeout =
                 std::chrono::system_clock::time_point::max();
             bool found_candidate = false;
 
-            for (const auto& [tier_rank, tenant_buckets] : buckets) {
-                for (const auto& [tenant_id, candidates] : tenant_buckets) {
-                    const auto next_index_key =
-                        bucket_index_key(tier_rank, tenant_id);
-                    const size_t idx = next_candidate_index[next_index_key];
-                    if (idx >= candidates.size()) {
-                        continue;
-                    }
-                    const uint64_t pressure = tenant_live_bytes[tenant_id];
-                    const auto timeout = candidates[idx].lease_timeout;
-                    const bool prefer_tenant =
-                        !found_candidate ||
-                        (enable_tenant_fair_eviction_
-                             ? (pressure > selected_pressure ||
-                                (pressure == selected_pressure &&
-                                 timeout < selected_timeout) ||
-                                (pressure == selected_pressure &&
-                                 timeout == selected_timeout &&
-                                 tenant_id < *selected_tenant))
-                             : (timeout < selected_timeout ||
-                                (timeout == selected_timeout &&
-                                 tenant_id < *selected_tenant)));
-                    if (prefer_tenant) {
-                        selected_tier = tier_rank;
-                        selected_tenant = tenant_id;
-                        selected_pressure = pressure;
-                        selected_timeout = timeout;
-                        found_candidate = true;
+            for (const auto& [tier_rank, group_buckets] : buckets) {
+                for (const auto& [group_key, tenant_buckets] : group_buckets) {
+                    for (const auto& [tenant_id, candidates] : tenant_buckets) {
+                        const auto next_index_key =
+                            bucket_index_key(tier_rank, group_key, tenant_id);
+                        const size_t idx = next_candidate_index[next_index_key];
+                        if (idx >= candidates.size()) {
+                            continue;
+                        }
+                        const uint64_t tenant_pressure =
+                            tenant_live_bytes[tenant_id];
+                        const uint64_t group_pressure = group_live_bytes[group_key];
+                        const auto timeout = candidates[idx].lease_timeout;
+                        const bool prefer_candidate =
+                            !found_candidate ||
+                            group_pressure > selected_group_pressure ||
+                            (group_pressure == selected_group_pressure &&
+                             enable_tenant_fair_eviction_ &&
+                             (tenant_pressure > selected_tenant_pressure ||
+                              (tenant_pressure == selected_tenant_pressure &&
+                               timeout < selected_timeout) ||
+                              (tenant_pressure == selected_tenant_pressure &&
+                               timeout == selected_timeout &&
+                               tenant_id < *selected_tenant))) ||
+                            (group_pressure == selected_group_pressure &&
+                             (!enable_tenant_fair_eviction_) &&
+                             (timeout < selected_timeout ||
+                              (timeout == selected_timeout &&
+                               (selected_group == std::nullopt ||
+                                group_key < *selected_group ||
+                                (group_key == *selected_group &&
+                                 tenant_id < *selected_tenant)))));
+                        if (prefer_candidate) {
+                            selected_tier = tier_rank;
+                            selected_group = group_key;
+                            selected_tenant = tenant_id;
+                            selected_group_pressure = group_pressure;
+                            selected_tenant_pressure = tenant_pressure;
+                            selected_timeout = timeout;
+                            found_candidate = true;
+                        }
                     }
                 }
                 if (found_candidate) {
@@ -3713,14 +3837,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 }
             }
 
-            if (!selected_tenant) {
+            if (!selected_group || !selected_tenant) {
                 break;
             }
 
             auto& tenant_id = *selected_tenant;
-            auto& candidates = buckets[selected_tier][tenant_id];
-            auto& idx =
-                next_candidate_index[bucket_index_key(selected_tier, tenant_id)];
+            auto& group_key = *selected_group;
+            auto& candidates = buckets[selected_tier][group_key][tenant_id];
+            auto& idx = next_candidate_index[
+                bucket_index_key(selected_tier, group_key, tenant_id)];
             const auto candidate = candidates[idx++];
 
             MetadataAccessorRW accessor(this, candidate.key);
@@ -3748,6 +3873,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 tenant_live_bytes[tenant_id] > object_size
                     ? tenant_live_bytes[tenant_id] - object_size
                     : 0;
+            group_live_bytes[group_key] =
+                group_live_bytes[group_key] > object_size
+                    ? group_live_bytes[group_key] - object_size
+                    : 0;
             if (!metadata.IsValid()) {
                 accessor.Erase();
             }
@@ -3760,9 +3889,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
         static_cast<long>(std::ceil(object_count * evict_ratio_target)),
         [&]() {
             long total = 0;
-            for (const auto& [_, tenant_buckets] : no_pin_buckets) {
-                for (const auto& [_, candidates] : tenant_buckets) {
-                    total += candidates.size();
+            for (const auto& [_, group_buckets] : no_pin_buckets) {
+                for (const auto& [_, tenant_buckets] : group_buckets) {
+                    for (const auto& [_, candidates] : tenant_buckets) {
+                        total += candidates.size();
+                    }
                 }
             }
             return total;

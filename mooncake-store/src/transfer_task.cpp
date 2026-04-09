@@ -626,8 +626,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
 void TransferSubmitter::PopulateRequestQosContext(
     TransferRequest& request, const ReplicateConfig* config) {
+    request.qos_context.tenant_shares = 0;
     if (config == nullptr) {
-        request.qos_context.tenant_shares = 1024;
         return;
     }
 
@@ -638,7 +638,8 @@ void TransferSubmitter::PopulateRequestQosContext(
     request.qos_context.qos_tier = config->qos_tier;
     request.qos_context.logical_key = config->logical_key;
     request.qos_context.canonical_key = config->canonical_key;
-    request.qos_context.tenant_shares = 1024;
+    request.qos_context.tenant_shares =
+        detail::ResolveTenantSharesForQosTier(config->qos_tier).value_or(0);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(

@@ -909,9 +909,20 @@ class MasterService {
         AdmissionRequestContext::Operation operation, const std::string& key,
         uint64_t value_length, const ReplicateConfig& config) const;
 
+    uint64_t ResolveAdmissionBytes(
+        const AdmissionRequestContext& context,
+        const MetadataShardAccessorRW& current_shard,
+        size_t current_shard_index) const;
+
+    std::vector<std::string> ResolvePreferredSegments(
+        const MetadataShardAccessorRW& shard,
+        const ReplicateConfig& config) const;
+
     tl::expected<void, ErrorCode> AdmitWrite(
         AdmissionRequestContext::Operation operation, const std::string& key,
-        uint64_t value_length, const ReplicateConfig& config) const;
+        uint64_t value_length, const ReplicateConfig& config,
+        const MetadataShardAccessorRW& current_shard,
+        size_t current_shard_index) const;
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.

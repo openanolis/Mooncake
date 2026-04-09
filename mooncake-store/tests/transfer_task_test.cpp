@@ -160,6 +160,19 @@ TEST_F(TransferTaskTest, TransferStrategyEnum) {
     EXPECT_EQ(oss.str(), "TRANSFER_ENGINE");
 }
 
+TEST_F(TransferTaskTest, ResolveTenantSharesForQosTierUsesBuiltInPolicy) {
+    EXPECT_EQ(detail::ResolveTenantSharesForQosTier("background"), 512u);
+    EXPECT_EQ(detail::ResolveTenantSharesForQosTier("interactive"), 2048u);
+    EXPECT_EQ(detail::ResolveTenantSharesForQosTier("latency_critical"),
+              4096u);
+}
+
+TEST_F(TransferTaskTest, ResolveTenantSharesForQosTierDefersDefaultAndUnknownTiers) {
+    EXPECT_EQ(detail::ResolveTenantSharesForQosTier("default"), std::nullopt);
+    EXPECT_EQ(detail::ResolveTenantSharesForQosTier(""), std::nullopt);
+    EXPECT_EQ(detail::ResolveTenantSharesForQosTier("custom"), std::nullopt);
+}
+
 }  // namespace mooncake
 
 int main(int argc, char** argv) {

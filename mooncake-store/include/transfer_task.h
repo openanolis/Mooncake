@@ -22,6 +22,24 @@
 
 namespace mooncake {
 
+namespace detail {
+
+inline std::optional<uint32_t> ResolveTenantSharesForQosTier(
+    std::string_view qos_tier) {
+    if (qos_tier == "background") {
+        return 512;
+    }
+    if (qos_tier == "interactive") {
+        return 2048;
+    }
+    if (qos_tier == "latency_critical") {
+        return 4096;
+    }
+    return std::nullopt;
+}
+
+}  // namespace detail
+
 /**
  * @brief Transfer strategy enumeration
  */

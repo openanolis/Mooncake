@@ -89,6 +89,8 @@ struct ReplicateConfig {
         preferred_segments{};         // Preferred segments for allocation
     std::string preferred_segment{};  // Deprecated: Single preferred segment
                                       // for backward compatibility
+    bool prefer_domain_locality{false};
+    bool prefer_object_set_locality{false};
     bool prefer_alloc_in_same_node{false};
     std::string tenant_id{"default"};
     std::string domain_id{"default"};
@@ -115,6 +117,10 @@ struct ReplicateConfig {
         }
         os << ", prefer_alloc_in_same_node: "
            << config.prefer_alloc_in_same_node
+           << ", prefer_domain_locality: "
+           << config.prefer_domain_locality
+           << ", prefer_object_set_locality: "
+           << config.prefer_object_set_locality
            << ", tenant_id: " << config.tenant_id
            << ", domain_id: " << config.domain_id
            << ", object_set: " << config.object_set

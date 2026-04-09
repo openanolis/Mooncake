@@ -4870,6 +4870,73 @@ TEST_F(MasterServiceTest, QuotaAdmissionRejectsDifferentSizeUpsert) {
     EXPECT_EQ(ErrorCode::QUOTA_EXCEEDED, upsert_result.error());
 }
 
+TEST_F(MasterServiceTest, QuotaAdmissionTenantSharedReusesCanonicalBytes) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_admission_strategy_type(
+                                  AdmissionStrategyType::QUOTA)
+                              .set_admission_quota_bytes(1024)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.tenant_id = "tenant-shared";
+    config.domain_id = "domain-shared";
+    config.object_set = "set-shared";
+    config.sharing_scope = "tenant_shared";
+    config.canonical_key = "tenant-shared/domain-shared/set-shared/object-a";
+
+    auto put_first = service_->PutStart(client_id, "tenant_shared_key_1", 1024,
+                                        config);
+    ASSERT_TRUE(put_first.has_value());
+    ASSERT_TRUE(service_
+                    ->PutEnd(client_id, "tenant_shared_key_1",
+                             ReplicaType::MEMORY)
+                    .has_value());
+
+    auto put_second =
+        service_->PutStart(client_id, "tenant_shared_key_2", 1024, config);
+    ASSERT_TRUE(put_second.has_value());
+    ASSERT_TRUE(service_
+                    ->PutEnd(client_id, "tenant_shared_key_2",
+                             ReplicaType::MEMORY)
+                    .has_value());
+}
+
+TEST_F(MasterServiceTest, QuotaAdmissionPrivateScopeStillChargesDuplicateBytes) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_admission_strategy_type(
+                                  AdmissionStrategyType::QUOTA)
+                              .set_admission_quota_bytes(1024)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.tenant_id = "tenant-private";
+    config.domain_id = "domain-private";
+    config.object_set = "set-private";
+    config.sharing_scope = "private";
+    config.canonical_key =
+        "tenant-private/domain-private/set-private/object-a";
+
+    auto put_first =
+        service_->PutStart(client_id, "private_key_1", 1024, config);
+    ASSERT_TRUE(put_first.has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, "private_key_1", ReplicaType::MEMORY)
+            .has_value());
+
+    auto put_second =
+        service_->PutStart(client_id, "private_key_2", 1024, config);
+    ASSERT_FALSE(put_second.has_value());
+    EXPECT_EQ(ErrorCode::QUOTA_EXCEEDED, put_second.error());
+}
+
 TEST_F(MasterServiceTest, UpsertConflictReplicationTask) {
     // Upsert should fail if Copy is in progress
     const uint64_t kv_lease_ttl = 50;
@@ -5134,6 +5201,130 @@ TEST_F(MasterServiceTest, UpsertDifferentSizeThenRevoke) {
 }
 
 // ===================== Hard Pin Tests =====================
+
+TEST_F(MasterServiceTest, ResolvePreferredSegmentsUsesDomainAndObjectSetHints) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context0 =
+        PrepareSimpleSegment(*service_, "segment_0", kDefaultSegmentBase,
+                             kDefaultSegmentSize);
+    [[maybe_unused]] const auto context1 =
+        PrepareSimpleSegment(*service_, "segment_1",
+                             kDefaultSegmentBase + kDefaultSegmentSize,
+                             kDefaultSegmentSize);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig domain_a;
+    domain_a.replica_num = 1;
+    domain_a.preferred_segment = "segment_0";
+    domain_a.tenant_id = "tenant-a";
+    domain_a.domain_id = "domain-a";
+    domain_a.object_set = "set-a";
+    auto put_a = service_->PutStart(client_id, "domain_object_a", 1024, domain_a);
+    ASSERT_TRUE(put_a.has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, "domain_object_a", ReplicaType::MEMORY)
+            .has_value());
+
+    ReplicateConfig domain_b;
+    domain_b.replica_num = 1;
+    domain_b.preferred_segment = "segment_1";
+    domain_b.tenant_id = "tenant-b";
+    domain_b.domain_id = "domain-b";
+    domain_b.object_set = "set-b";
+    auto put_b = service_->PutStart(client_id, "domain_object_b", 1024, domain_b);
+    ASSERT_TRUE(put_b.has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, "domain_object_b", ReplicaType::MEMORY)
+            .has_value());
+
+    ReplicateConfig hinted;
+    hinted.replica_num = 1;
+    hinted.tenant_id = "tenant-c";
+    hinted.domain_id = "domain-b";
+    hinted.object_set = "set-b";
+    hinted.prefer_domain_locality = true;
+    hinted.prefer_object_set_locality = true;
+    auto hinted_put = service_->PutStart(client_id, "domain_object_c", 1024,
+                                         hinted);
+    ASSERT_TRUE(hinted_put.has_value());
+    EXPECT_EQ("segment_1",
+              hinted_put.value()[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_);
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, "domain_object_c", ReplicaType::MEMORY)
+            .has_value());
+}
+
+TEST_F(MasterServiceTest, DomainObjectSetPressureDrivesEvictionWithinTenantTier) {
+    const uint64_t kv_lease_ttl = 200;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_eviction_ratio(0.1)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 8;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "test_segment", buffer, segment_size);
+
+    auto put_object = [&](const std::string& key, const std::string& domain_id,
+                          const std::string& object_set) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-a";
+        config.domain_id = domain_id;
+        config.object_set = object_set;
+        config.qos_tier = "default";
+        ASSERT_TRUE(service_->PutStart(client_id, key, value_size, config)
+                        .has_value());
+        ASSERT_TRUE(
+            service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    };
+
+    put_object("domain_a_0", "domain-a", "set-a");
+    put_object("domain_a_1", "domain-a", "set-a");
+    put_object("domain_a_2", "domain-a", "set-a");
+    put_object("domain_b_0", "domain-b", "set-b");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
+
+    for (int i = 0; i < 6; ++i) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-b";
+        config.domain_id = "domain-z";
+        config.object_set = "set-z";
+        config.qos_tier = "default";
+        if (service_->PutStart(client_id, "evict_trigger_" + std::to_string(i),
+                               value_size, config)
+                .has_value()) {
+            ASSERT_TRUE(service_
+                            ->PutEnd(client_id,
+                                     "evict_trigger_" + std::to_string(i),
+                                     ReplicaType::MEMORY)
+                            .has_value());
+        }
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 500));
+
+    auto domain_a_0 = service_->ExistKey("domain_a_0");
+    auto domain_a_1 = service_->ExistKey("domain_a_1");
+    auto domain_a_2 = service_->ExistKey("domain_a_2");
+    auto domain_b_0 = service_->ExistKey("domain_b_0");
+    ASSERT_TRUE(domain_a_0.has_value());
+    ASSERT_TRUE(domain_a_1.has_value());
+    ASSERT_TRUE(domain_a_2.has_value());
+    ASSERT_TRUE(domain_b_0.has_value());
+    EXPECT_FALSE(domain_a_0.value() && domain_a_1.value() && domain_a_2.value());
+    EXPECT_TRUE(domain_b_0.value());
+
+    service_->RemoveAll(true);
+}
 
 TEST_F(MasterServiceTest, HardPinObjectNotEvicted) {
     // Hard-pinned objects must survive eviction under memory pressure,

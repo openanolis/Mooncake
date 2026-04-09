@@ -19,6 +19,7 @@ struct AdmissionRequestContext {
     Operation operation;
     std::string key;
     uint64_t slice_length;
+    uint64_t effective_requested_bytes;
     size_t replica_num;
     std::string tenant_id;
     std::string domain_id;
