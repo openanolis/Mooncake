@@ -54,9 +54,15 @@ struct TaskInfo {
     bool derived{false};  // merged by other tasks
     int xport_priority{0};
     Request request;
+    Request active_request;
     bool staging{false};
     bool qos_admitted{false};
     bool qos_queued{false};
+    bool pending_bandwidth{false};
+    bool fragment_inflight{false};
+    size_t logical_length{0};
+    size_t submitted_bytes{0};
+    size_t completed_bytes{0};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
     volatile TransferStatusEnum staging_status{TransferStatusEnum::PENDING};
     std::chrono::steady_clock::time_point start_time{};  // For latency tracking
@@ -201,6 +207,25 @@ class TransferEngineImpl {
 
     Status drainPendingRequestsForTenant(const std::string& tenant_key);
 
+    uint64_t rateLimitForRequest(const Request& request) const;
+
+    size_t computeChunkBytesForRate(uint64_t rate_limit_bytes_per_sec) const;
+
+    bool shouldBypassBandwidthShaping(const TaskInfo& task) const;
+
+    bool tryAcquireBandwidthBudget(TaskInfo& task);
+
+    void replenishBandwidthTokensLocked(const std::string& tenant_key,
+                                        std::chrono::steady_clock::time_point now);
+
+    size_t countActiveTenantsWithBacklogLocked(
+        const std::string& include_tenant_key) const;
+
+    void enqueuePendingTaskLocked(const std::string& tenant_key, Batch* batch,
+                                  size_t task_id);
+
+    void buildActiveRequest(TaskInfo& task);
+
     Status classifyAndQueueTask(Batch* batch, size_t task_id, TaskInfo& task,
                                 std::vector<Request> classified_request_list[],
                                 std::vector<size_t> task_id_list[],
@@ -254,8 +279,16 @@ class TransferEngineImpl {
         size_t task_id{0};
     };
 
+    struct BandwidthShapingState {
+        uint64_t tokens{0};
+        uint64_t rate_limit_bytes_per_sec{0};
+        uint64_t burst_bytes{0};
+        std::chrono::steady_clock::time_point last_refill{};
+    };
+
     std::unordered_map<std::string, size_t> tenant_inflight_counts_;
     std::unordered_map<std::string, std::deque<PendingTaskRef>> tenant_pending_task_ids_;
+    std::unordered_map<std::string, BandwidthShapingState> tenant_bandwidth_states_;
     std::mutex qos_mutex_;
 };
 }  // namespace tent

@@ -81,6 +81,14 @@ The design favors predictable behavior and operational simplicity over manual tu
 cpp-api
 :::
 
+## TENT Runtime QoS and Shaping
+
+:::{toctree}
+:maxdepth: 1
+
+bandwidth-shaping
+:::
+
 ## TENT Metrics System
 
 :::{toctree}

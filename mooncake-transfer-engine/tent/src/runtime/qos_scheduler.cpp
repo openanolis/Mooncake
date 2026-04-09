@@ -78,6 +78,42 @@ Status loadTierShares(const Config& config, QosSchedulerConfig& qos_config) {
     return Status::OK();
 }
 
+Status loadTierRateLimits(const Config& config,
+                          QosSchedulerConfig& qos_config) {
+    if (!config.contains("qos/tier_rate_limits")) {
+        return Status::OK();
+    }
+
+    auto tier_rate_limits =
+        config.get<json>("qos/tier_rate_limits", json::object());
+    if (!tier_rate_limits.is_object()) {
+        return Status::InvalidArgument(
+            "qos/tier_rate_limits must be a JSON object" LOC_MARK);
+    }
+
+    qos_config.tier_rate_limits.clear();
+    for (const auto& [tier_name, rate_value] : tier_rate_limits.items()) {
+        if (tier_name.empty()) {
+            return Status::InvalidArgument(
+                "qos/tier_rate_limits keys must not be empty" LOC_MARK);
+        }
+        if (!rate_value.is_number_unsigned() && !rate_value.is_number_integer()) {
+            return Status::InvalidArgument(
+                "qos/tier_rate_limits values must be integers" LOC_MARK);
+        }
+
+        auto rate_limit = rate_value.get<long long>();
+        if (rate_limit <= 0) {
+            return Status::InvalidArgument(
+                "qos/tier_rate_limits values must be greater than 0" LOC_MARK);
+        }
+        qos_config.tier_rate_limits.emplace(
+            tier_name, static_cast<uint64_t>(rate_limit));
+    }
+
+    return Status::OK();
+}
+
 }  // namespace
 
 Status LoadQosSchedulerConfig(const Config& config,
@@ -94,6 +130,19 @@ Status LoadQosSchedulerConfig(const Config& config,
         config.get("qos/scheduler/dispatch_quantum_bytes", 64ull * 1024ull);
     qos_config.max_inflight_per_tenant =
         config.get("qos/scheduler/max_inflight_per_tenant", size_t{64});
+    qos_config.bandwidth_shaping_enabled =
+        config.get("qos/scheduler/bandwidth_shaping_enabled", false);
+    qos_config.default_tenant_rate_limit_bytes_per_sec = config.get(
+        "qos/default_tenant_rate_limit_bytes_per_sec", uint64_t{0});
+    CHECK_STATUS(loadTierRateLimits(config, qos_config));
+    qos_config.bandwidth_burst_bytes = config.get(
+        "qos/scheduler/bandwidth_burst_bytes", 4ull * 1024ull * 1024ull);
+    qos_config.target_interval_us =
+        config.get("qos/scheduler/target_interval_us", 2000ull);
+    qos_config.min_chunk_bytes =
+        config.get("qos/scheduler/min_chunk_bytes", size_t{256ull * 1024ull});
+    qos_config.max_chunk_bytes =
+        config.get("qos/scheduler/max_chunk_bytes", size_t{1024ull * 1024ull});
 
     if (qos_config.default_tenant_id.empty()) {
         return Status::InvalidArgument(
@@ -114,6 +163,37 @@ Status LoadQosSchedulerConfig(const Config& config,
     if (qos_config.max_inflight_per_tenant == 0) {
         return Status::InvalidArgument(
             "qos/scheduler/max_inflight_per_tenant must be greater than 0" LOC_MARK);
+    }
+    if (qos_config.bandwidth_shaping_enabled) {
+        if (qos_config.default_tenant_rate_limit_bytes_per_sec == 0 &&
+            qos_config.tier_rate_limits.empty()) {
+            return Status::InvalidArgument(
+                "bandwidth shaping requires a default rate limit or tier rate limits" LOC_MARK);
+        }
+        if (qos_config.bandwidth_burst_bytes == 0) {
+            return Status::InvalidArgument(
+                "qos/scheduler/bandwidth_burst_bytes must be greater than 0" LOC_MARK);
+        }
+        if (qos_config.target_interval_us == 0) {
+            return Status::InvalidArgument(
+                "qos/scheduler/target_interval_us must be greater than 0" LOC_MARK);
+        }
+        if (qos_config.min_chunk_bytes == 0) {
+            return Status::InvalidArgument(
+                "qos/scheduler/min_chunk_bytes must be greater than 0" LOC_MARK);
+        }
+        if (qos_config.max_chunk_bytes == 0) {
+            return Status::InvalidArgument(
+                "qos/scheduler/max_chunk_bytes must be greater than 0" LOC_MARK);
+        }
+        if (qos_config.min_chunk_bytes > qos_config.max_chunk_bytes) {
+            return Status::InvalidArgument(
+                "qos/scheduler/min_chunk_bytes must be less than or equal to max_chunk_bytes" LOC_MARK);
+        }
+        if (qos_config.bandwidth_burst_bytes < qos_config.min_chunk_bytes) {
+            return Status::InvalidArgument(
+                "qos/scheduler/bandwidth_burst_bytes must be at least min_chunk_bytes" LOC_MARK);
+        }
     }
     return Status::OK();
 }

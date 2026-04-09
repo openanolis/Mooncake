@@ -361,14 +361,23 @@ TEST(TransferEngineConfigOverrideTest,
           "enabled": true,
           "default_tenant_id": "tenant-default",
           "default_tenant_shares": 2048,
+          "default_tenant_rate_limit_bytes_per_sec": 134217728,
           "tier_shares": {
             "gold": 4096,
             "silver": 1024
           },
+          "tier_rate_limits": {
+            "gold": 268435456
+          },
           "scheduler": {
             "type": "weighted_fair",
             "dispatch_quantum_bytes": 32768,
-            "max_inflight_per_tenant": 16
+            "max_inflight_per_tenant": 16,
+            "bandwidth_shaping_enabled": true,
+            "bandwidth_burst_bytes": 4194304,
+            "target_interval_us": 1500,
+            "min_chunk_bytes": 131072,
+            "max_chunk_bytes": 524288
           }
         }
     })");
@@ -382,11 +391,19 @@ TEST(TransferEngineConfigOverrideTest,
     EXPECT_TRUE(config->get("qos/enabled", false));
     EXPECT_EQ(config->get("qos/default_tenant_id", ""), "tenant-default");
     EXPECT_EQ(config->get("qos/default_tenant_shares", 0u), 2048u);
+    EXPECT_EQ(config->get("qos/default_tenant_rate_limit_bytes_per_sec", 0u),
+              134217728u);
     EXPECT_EQ(config->get("qos/tier_shares/gold", 0u), 4096u);
     EXPECT_EQ(config->get("qos/tier_shares/silver", 0u), 1024u);
+    EXPECT_EQ(config->get("qos/tier_rate_limits/gold", 0u), 268435456u);
     EXPECT_EQ(config->get("qos/scheduler/type", ""), "weighted_fair");
     EXPECT_EQ(config->get("qos/scheduler/dispatch_quantum_bytes", 0u), 32768u);
     EXPECT_EQ(config->get("qos/scheduler/max_inflight_per_tenant", 0u), 16u);
+    EXPECT_TRUE(config->get("qos/scheduler/bandwidth_shaping_enabled", false));
+    EXPECT_EQ(config->get("qos/scheduler/bandwidth_burst_bytes", 0u), 4194304u);
+    EXPECT_EQ(config->get("qos/scheduler/target_interval_us", 0u), 1500u);
+    EXPECT_EQ(config->get("qos/scheduler/min_chunk_bytes", 0u), 131072u);
+    EXPECT_EQ(config->get("qos/scheduler/max_chunk_bytes", 0u), 524288u);
 }
 
 TEST(TransferEngineConfigOverrideTest,

@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <vector>
 
 #include "tent/common/types.h"
@@ -52,6 +53,53 @@ TEST(QosRuntimeGatingTest, OrderedRequestsStillPreserveTenantLocalFifoUnderLimit
     EXPECT_EQ(ordered[2].qos_context.tenant_id, "tenant-a");
     EXPECT_EQ(ordered[0].length, 1024u);
     EXPECT_EQ(ordered[2].length, 2048u);
+}
+
+TEST(QosRuntimeGatingTest, ShapingConfigComputesDynamicChunkBounds) {
+    QosSchedulerConfig config{
+        .enabled = true,
+        .bandwidth_shaping_enabled = true,
+        .default_tenant_rate_limit_bytes_per_sec = 128u * 1024u * 1024u,
+        .bandwidth_burst_bytes = 2u * 1024u * 1024u,
+        .target_interval_us = 2000,
+        .min_chunk_bytes = 256u * 1024u,
+        .max_chunk_bytes = 1024u * 1024u,
+    };
+
+    const auto chunk_bytes = std::clamp<size_t>(
+        static_cast<size_t>((config.default_tenant_rate_limit_bytes_per_sec *
+                             config.target_interval_us) /
+                            1000000ull),
+        config.min_chunk_bytes, config.max_chunk_bytes);
+    EXPECT_EQ(chunk_bytes, 268435u);
+
+    config.default_tenant_rate_limit_bytes_per_sec = 1024u * 1024u * 1024u;
+    const auto larger_chunk_bytes = std::clamp<size_t>(
+        static_cast<size_t>((config.default_tenant_rate_limit_bytes_per_sec *
+                             config.target_interval_us) /
+                            1000000ull),
+        config.min_chunk_bytes, config.max_chunk_bytes);
+    EXPECT_EQ(larger_chunk_bytes, 1024u * 1024u);
+}
+
+TEST(QosRuntimeGatingTest, SingleActiveTenantWouldBypassShareShaping) {
+    QosSchedulerConfig config{
+        .enabled = true,
+        .bandwidth_shaping_enabled = true,
+        .default_tenant_rate_limit_bytes_per_sec = 64u * 1024u * 1024u,
+        .bandwidth_burst_bytes = 1024u * 1024u,
+        .target_interval_us = 2000,
+        .min_chunk_bytes = 256u * 1024u,
+        .max_chunk_bytes = 1024u * 1024u,
+    };
+
+    std::vector<Request> requests{makeRequest("tenant-a", 4u * 1024u * 1024u)};
+    QosScheduler scheduler(config);
+    scheduler.NormalizeRequests(requests);
+
+    ASSERT_EQ(requests.size(), 1u);
+    EXPECT_EQ(requests[0].length, 4u * 1024u * 1024u);
+    EXPECT_EQ(requests[0].qos_context.tenant_id, "tenant-a");
 }
 
 }  // namespace

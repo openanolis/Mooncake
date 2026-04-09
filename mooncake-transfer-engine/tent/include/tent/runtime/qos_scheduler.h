@@ -36,6 +36,13 @@ struct QosSchedulerConfig {
     std::string scheduler_type{"weighted_fair"};
     uint64_t dispatch_quantum_bytes{64 * 1024};
     size_t max_inflight_per_tenant{64};
+    bool bandwidth_shaping_enabled{false};
+    uint64_t default_tenant_rate_limit_bytes_per_sec{0};
+    std::unordered_map<std::string, uint64_t> tier_rate_limits{};
+    uint64_t bandwidth_burst_bytes{4ull * 1024ull * 1024ull};
+    uint64_t target_interval_us{2000};
+    size_t min_chunk_bytes{256ull * 1024ull};
+    size_t max_chunk_bytes{1024ull * 1024ull};
 };
 
 Status LoadQosSchedulerConfig(const Config& config,

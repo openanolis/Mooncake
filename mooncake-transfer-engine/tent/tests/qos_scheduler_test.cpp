@@ -45,6 +45,13 @@ TEST(QosSchedulerTest, LoadConfigUsesDefaults) {
     EXPECT_EQ(qos_config.scheduler_type, "weighted_fair");
     EXPECT_EQ(qos_config.dispatch_quantum_bytes, 64u * 1024u);
     EXPECT_EQ(qos_config.max_inflight_per_tenant, 64u);
+    EXPECT_FALSE(qos_config.bandwidth_shaping_enabled);
+    EXPECT_EQ(qos_config.default_tenant_rate_limit_bytes_per_sec, 0u);
+    EXPECT_TRUE(qos_config.tier_rate_limits.empty());
+    EXPECT_EQ(qos_config.bandwidth_burst_bytes, 4u * 1024u * 1024u);
+    EXPECT_EQ(qos_config.target_interval_us, 2000u);
+    EXPECT_EQ(qos_config.min_chunk_bytes, 256u * 1024u);
+    EXPECT_EQ(qos_config.max_chunk_bytes, 1024u * 1024u);
 }
 
 TEST(QosSchedulerTest, LoadConfigRejectsZeroDefaultShares) {
@@ -73,6 +80,45 @@ TEST(QosSchedulerTest, LoadConfigReadsTierShares) {
 TEST(QosSchedulerTest, LoadConfigRejectsInvalidTierShares) {
     Config config;
     config.set("qos/tier_shares/bronze", 0u);
+
+    QosSchedulerConfig qos_config;
+    auto status = LoadQosSchedulerConfig(config, qos_config);
+
+    EXPECT_FALSE(status.ok());
+}
+
+TEST(QosSchedulerTest, LoadConfigReadsBandwidthShapingSettings) {
+    Config config;
+    config.set("qos/scheduler/bandwidth_shaping_enabled", true);
+    config.set("qos/default_tenant_rate_limit_bytes_per_sec", 128u * 1024u * 1024u);
+    config.set("qos/tier_rate_limits/gold", 256u * 1024u * 1024u);
+    config.set("qos/scheduler/bandwidth_burst_bytes", 2u * 1024u * 1024u);
+    config.set("qos/scheduler/target_interval_us", 1500u);
+    config.set("qos/scheduler/min_chunk_bytes", 128u * 1024u);
+    config.set("qos/scheduler/max_chunk_bytes", 512u * 1024u);
+
+    QosSchedulerConfig qos_config;
+    auto status = LoadQosSchedulerConfig(config, qos_config);
+
+    ASSERT_TRUE(status.ok());
+    EXPECT_TRUE(qos_config.bandwidth_shaping_enabled);
+    EXPECT_EQ(qos_config.default_tenant_rate_limit_bytes_per_sec,
+              128u * 1024u * 1024u);
+    ASSERT_EQ(qos_config.tier_rate_limits.size(), 1u);
+    EXPECT_EQ(qos_config.tier_rate_limits.at("gold"), 256u * 1024u * 1024u);
+    EXPECT_EQ(qos_config.bandwidth_burst_bytes, 2u * 1024u * 1024u);
+    EXPECT_EQ(qos_config.target_interval_us, 1500u);
+    EXPECT_EQ(qos_config.min_chunk_bytes, 128u * 1024u);
+    EXPECT_EQ(qos_config.max_chunk_bytes, 512u * 1024u);
+}
+
+TEST(QosSchedulerTest, LoadConfigRejectsInvalidBandwidthShapingSettings) {
+    Config config;
+    config.set("qos/scheduler/bandwidth_shaping_enabled", true);
+    config.set("qos/default_tenant_rate_limit_bytes_per_sec", 0u);
+    config.set("qos/scheduler/bandwidth_burst_bytes", 64u * 1024u);
+    config.set("qos/scheduler/min_chunk_bytes", 128u * 1024u);
+    config.set("qos/scheduler/max_chunk_bytes", 64u * 1024u);
 
     QosSchedulerConfig qos_config;
     auto status = LoadQosSchedulerConfig(config, qos_config);
