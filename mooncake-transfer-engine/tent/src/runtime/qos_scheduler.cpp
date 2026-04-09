@@ -143,6 +143,42 @@ Status LoadQosSchedulerConfig(const Config& config,
         config.get("qos/scheduler/min_chunk_bytes", size_t{256ull * 1024ull});
     qos_config.max_chunk_bytes =
         config.get("qos/scheduler/max_chunk_bytes", size_t{1024ull * 1024ull});
+    qos_config.adaptive_shaping_enabled =
+        config.get("qos/scheduler/adaptive_shaping_enabled", false);
+    qos_config.capacity_estimation_enabled =
+        config.get("qos/scheduler/capacity_estimation_enabled", false);
+    qos_config.initial_estimated_bandwidth_bytes_per_sec = config.get(
+        "qos/scheduler/initial_estimated_bandwidth_bytes_per_sec", uint64_t{0});
+    qos_config.min_estimated_bandwidth_bytes_per_sec = config.get(
+        "qos/scheduler/min_estimated_bandwidth_bytes_per_sec", uint64_t{0});
+    qos_config.max_estimated_bandwidth_bytes_per_sec = config.get(
+        "qos/scheduler/max_estimated_bandwidth_bytes_per_sec", uint64_t{0});
+    qos_config.control_interval_us =
+        config.get("qos/scheduler/control_interval_us", 5000ull);
+    qos_config.throughput_ema_alpha =
+        config.get("qos/scheduler/throughput_ema_alpha", 0.2);
+    qos_config.capacity_increase_ratio =
+        config.get("qos/scheduler/capacity_increase_ratio", 1.1);
+    qos_config.capacity_decrease_ratio =
+        config.get("qos/scheduler/capacity_decrease_ratio", 0.9);
+    qos_config.transport_pacing_enabled =
+        config.get("qos/scheduler/transport_pacing_enabled", false);
+    qos_config.rdma_pacing_quantum_bytes =
+        config.get("qos/scheduler/rdma_pacing_quantum_bytes", size_t{256ull * 1024ull});
+    qos_config.tcp_pacing_quantum_bytes =
+        config.get("qos/scheduler/tcp_pacing_quantum_bytes", size_t{256ull * 1024ull});
+    qos_config.hierarchical_shaping_enabled =
+        config.get("qos/scheduler/hierarchical_shaping_enabled", false);
+    qos_config.domain_hierarchy_weight =
+        config.get("qos/scheduler/domain_hierarchy_weight", 1.0);
+    qos_config.object_set_hierarchy_weight =
+        config.get("qos/scheduler/object_set_hierarchy_weight", 1.0);
+    qos_config.closed_loop_control_enabled =
+        config.get("qos/scheduler/closed_loop_control_enabled", false);
+    qos_config.fairness_error_tolerance =
+        config.get("qos/scheduler/fairness_error_tolerance", 0.1);
+    qos_config.idle_capacity_recovery_ratio =
+        config.get("qos/scheduler/idle_capacity_recovery_ratio", 1.05);
 
     if (qos_config.default_tenant_id.empty()) {
         return Status::InvalidArgument(
@@ -193,6 +229,81 @@ Status LoadQosSchedulerConfig(const Config& config,
         if (qos_config.bandwidth_burst_bytes < qos_config.min_chunk_bytes) {
             return Status::InvalidArgument(
                 "qos/scheduler/bandwidth_burst_bytes must be at least min_chunk_bytes" LOC_MARK);
+        }
+    }
+    if (qos_config.adaptive_shaping_enabled ||
+        qos_config.capacity_estimation_enabled ||
+        qos_config.closed_loop_control_enabled) {
+        if (!qos_config.bandwidth_shaping_enabled) {
+            return Status::InvalidArgument(
+                "adaptive shaping and closed-loop control require bandwidth shaping to be enabled" LOC_MARK);
+        }
+        if (qos_config.control_interval_us == 0) {
+            return Status::InvalidArgument(
+                "qos/scheduler/control_interval_us must be greater than 0" LOC_MARK);
+        }
+        if (qos_config.throughput_ema_alpha <= 0.0 ||
+            qos_config.throughput_ema_alpha > 1.0) {
+            return Status::InvalidArgument(
+                "qos/scheduler/throughput_ema_alpha must be in (0, 1]" LOC_MARK);
+        }
+        if (qos_config.capacity_increase_ratio < 1.0) {
+            return Status::InvalidArgument(
+                "qos/scheduler/capacity_increase_ratio must be at least 1.0" LOC_MARK);
+        }
+        if (qos_config.capacity_decrease_ratio <= 0.0 ||
+            qos_config.capacity_decrease_ratio > 1.0) {
+            return Status::InvalidArgument(
+                "qos/scheduler/capacity_decrease_ratio must be in (0, 1]" LOC_MARK);
+        }
+        if (qos_config.initial_estimated_bandwidth_bytes_per_sec == 0) {
+            qos_config.initial_estimated_bandwidth_bytes_per_sec =
+                qos_config.default_tenant_rate_limit_bytes_per_sec;
+        }
+        if (qos_config.min_estimated_bandwidth_bytes_per_sec == 0) {
+            qos_config.min_estimated_bandwidth_bytes_per_sec =
+                std::max<uint64_t>(1,
+                    qos_config.initial_estimated_bandwidth_bytes_per_sec / 4);
+        }
+        if (qos_config.max_estimated_bandwidth_bytes_per_sec == 0) {
+            qos_config.max_estimated_bandwidth_bytes_per_sec =
+                std::max<uint64_t>(qos_config.initial_estimated_bandwidth_bytes_per_sec,
+                                   qos_config.default_tenant_rate_limit_bytes_per_sec);
+        }
+        if (qos_config.min_estimated_bandwidth_bytes_per_sec >
+            qos_config.initial_estimated_bandwidth_bytes_per_sec) {
+            return Status::InvalidArgument(
+                "min estimated bandwidth must be less than or equal to initial estimate" LOC_MARK);
+        }
+        if (qos_config.initial_estimated_bandwidth_bytes_per_sec >
+            qos_config.max_estimated_bandwidth_bytes_per_sec) {
+            return Status::InvalidArgument(
+                "initial estimated bandwidth must be less than or equal to max estimate" LOC_MARK);
+        }
+    }
+    if (qos_config.transport_pacing_enabled) {
+        if (qos_config.rdma_pacing_quantum_bytes == 0 ||
+            qos_config.tcp_pacing_quantum_bytes == 0) {
+            return Status::InvalidArgument(
+                "transport pacing requires non-zero pacing quanta" LOC_MARK);
+        }
+    }
+    if (qos_config.hierarchical_shaping_enabled) {
+        if (qos_config.domain_hierarchy_weight <= 0.0 ||
+            qos_config.object_set_hierarchy_weight <= 0.0) {
+            return Status::InvalidArgument(
+                "hierarchical weights must be greater than 0" LOC_MARK);
+        }
+    }
+    if (qos_config.closed_loop_control_enabled) {
+        if (qos_config.fairness_error_tolerance < 0.0 ||
+            qos_config.fairness_error_tolerance > 1.0) {
+            return Status::InvalidArgument(
+                "fairness error tolerance must be in [0, 1]" LOC_MARK);
+        }
+        if (qos_config.idle_capacity_recovery_ratio < 1.0) {
+            return Status::InvalidArgument(
+                "idle capacity recovery ratio must be at least 1.0" LOC_MARK);
         }
     }
     return Status::OK();

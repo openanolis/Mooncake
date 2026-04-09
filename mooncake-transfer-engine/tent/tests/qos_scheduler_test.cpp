@@ -96,6 +96,27 @@ TEST(QosSchedulerTest, LoadConfigReadsBandwidthShapingSettings) {
     config.set("qos/scheduler/target_interval_us", 1500u);
     config.set("qos/scheduler/min_chunk_bytes", 128u * 1024u);
     config.set("qos/scheduler/max_chunk_bytes", 512u * 1024u);
+    config.set("qos/scheduler/adaptive_shaping_enabled", true);
+    config.set("qos/scheduler/capacity_estimation_enabled", true);
+    config.set("qos/scheduler/initial_estimated_bandwidth_bytes_per_sec",
+               256u * 1024u * 1024u);
+    config.set("qos/scheduler/min_estimated_bandwidth_bytes_per_sec",
+               64u * 1024u * 1024u);
+    config.set("qos/scheduler/max_estimated_bandwidth_bytes_per_sec",
+               512u * 1024u * 1024u);
+    config.set("qos/scheduler/control_interval_us", 4000u);
+    config.set("qos/scheduler/throughput_ema_alpha", 0.25);
+    config.set("qos/scheduler/capacity_increase_ratio", 1.2);
+    config.set("qos/scheduler/capacity_decrease_ratio", 0.8);
+    config.set("qos/scheduler/transport_pacing_enabled", true);
+    config.set("qos/scheduler/rdma_pacing_quantum_bytes", 128u * 1024u);
+    config.set("qos/scheduler/tcp_pacing_quantum_bytes", 64u * 1024u);
+    config.set("qos/scheduler/hierarchical_shaping_enabled", true);
+    config.set("qos/scheduler/domain_hierarchy_weight", 0.5);
+    config.set("qos/scheduler/object_set_hierarchy_weight", 0.25);
+    config.set("qos/scheduler/closed_loop_control_enabled", true);
+    config.set("qos/scheduler/fairness_error_tolerance", 0.15);
+    config.set("qos/scheduler/idle_capacity_recovery_ratio", 1.1);
 
     QosSchedulerConfig qos_config;
     auto status = LoadQosSchedulerConfig(config, qos_config);
@@ -110,6 +131,27 @@ TEST(QosSchedulerTest, LoadConfigReadsBandwidthShapingSettings) {
     EXPECT_EQ(qos_config.target_interval_us, 1500u);
     EXPECT_EQ(qos_config.min_chunk_bytes, 128u * 1024u);
     EXPECT_EQ(qos_config.max_chunk_bytes, 512u * 1024u);
+    EXPECT_TRUE(qos_config.adaptive_shaping_enabled);
+    EXPECT_TRUE(qos_config.capacity_estimation_enabled);
+    EXPECT_EQ(qos_config.initial_estimated_bandwidth_bytes_per_sec,
+              256u * 1024u * 1024u);
+    EXPECT_EQ(qos_config.min_estimated_bandwidth_bytes_per_sec,
+              64u * 1024u * 1024u);
+    EXPECT_EQ(qos_config.max_estimated_bandwidth_bytes_per_sec,
+              512u * 1024u * 1024u);
+    EXPECT_EQ(qos_config.control_interval_us, 4000u);
+    EXPECT_DOUBLE_EQ(qos_config.throughput_ema_alpha, 0.25);
+    EXPECT_DOUBLE_EQ(qos_config.capacity_increase_ratio, 1.2);
+    EXPECT_DOUBLE_EQ(qos_config.capacity_decrease_ratio, 0.8);
+    EXPECT_TRUE(qos_config.transport_pacing_enabled);
+    EXPECT_EQ(qos_config.rdma_pacing_quantum_bytes, 128u * 1024u);
+    EXPECT_EQ(qos_config.tcp_pacing_quantum_bytes, 64u * 1024u);
+    EXPECT_TRUE(qos_config.hierarchical_shaping_enabled);
+    EXPECT_DOUBLE_EQ(qos_config.domain_hierarchy_weight, 0.5);
+    EXPECT_DOUBLE_EQ(qos_config.object_set_hierarchy_weight, 0.25);
+    EXPECT_TRUE(qos_config.closed_loop_control_enabled);
+    EXPECT_DOUBLE_EQ(qos_config.fairness_error_tolerance, 0.15);
+    EXPECT_DOUBLE_EQ(qos_config.idle_capacity_recovery_ratio, 1.1);
 }
 
 TEST(QosSchedulerTest, LoadConfigRejectsInvalidBandwidthShapingSettings) {
@@ -119,6 +161,24 @@ TEST(QosSchedulerTest, LoadConfigRejectsInvalidBandwidthShapingSettings) {
     config.set("qos/scheduler/bandwidth_burst_bytes", 64u * 1024u);
     config.set("qos/scheduler/min_chunk_bytes", 128u * 1024u);
     config.set("qos/scheduler/max_chunk_bytes", 64u * 1024u);
+
+    QosSchedulerConfig qos_config;
+    auto status = LoadQosSchedulerConfig(config, qos_config);
+
+    EXPECT_FALSE(status.ok());
+}
+
+TEST(QosSchedulerTest, LoadConfigRejectsInvalidAdaptiveAndClosedLoopSettings) {
+    Config config;
+    config.set("qos/scheduler/bandwidth_shaping_enabled", true);
+    config.set("qos/default_tenant_rate_limit_bytes_per_sec", 128u * 1024u * 1024u);
+    config.set("qos/scheduler/adaptive_shaping_enabled", true);
+    config.set("qos/scheduler/throughput_ema_alpha", 1.5);
+    config.set("qos/scheduler/capacity_increase_ratio", 0.9);
+    config.set("qos/scheduler/capacity_decrease_ratio", 1.1);
+    config.set("qos/scheduler/transport_pacing_enabled", true);
+    config.set("qos/scheduler/rdma_pacing_quantum_bytes", 0u);
+    config.set("qos/scheduler/tcp_pacing_quantum_bytes", 0u);
 
     QosSchedulerConfig qos_config;
     auto status = LoadQosSchedulerConfig(config, qos_config);

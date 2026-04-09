@@ -43,6 +43,24 @@ struct QosSchedulerConfig {
     uint64_t target_interval_us{2000};
     size_t min_chunk_bytes{256ull * 1024ull};
     size_t max_chunk_bytes{1024ull * 1024ull};
+    bool adaptive_shaping_enabled{false};
+    bool capacity_estimation_enabled{false};
+    uint64_t initial_estimated_bandwidth_bytes_per_sec{0};
+    uint64_t min_estimated_bandwidth_bytes_per_sec{0};
+    uint64_t max_estimated_bandwidth_bytes_per_sec{0};
+    uint64_t control_interval_us{5000};
+    double throughput_ema_alpha{0.2};
+    double capacity_increase_ratio{1.1};
+    double capacity_decrease_ratio{0.9};
+    bool transport_pacing_enabled{false};
+    size_t rdma_pacing_quantum_bytes{0};
+    size_t tcp_pacing_quantum_bytes{0};
+    bool hierarchical_shaping_enabled{false};
+    double domain_hierarchy_weight{1.0};
+    double object_set_hierarchy_weight{1.0};
+    bool closed_loop_control_enabled{false};
+    double fairness_error_tolerance{0.1};
+    double idle_capacity_recovery_ratio{1.05};
 };
 
 Status LoadQosSchedulerConfig(const Config& config,

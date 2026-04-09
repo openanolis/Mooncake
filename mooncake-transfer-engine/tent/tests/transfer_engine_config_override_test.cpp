@@ -377,7 +377,25 @@ TEST(TransferEngineConfigOverrideTest,
             "bandwidth_burst_bytes": 4194304,
             "target_interval_us": 1500,
             "min_chunk_bytes": 131072,
-            "max_chunk_bytes": 524288
+            "max_chunk_bytes": 524288,
+            "adaptive_shaping_enabled": true,
+            "capacity_estimation_enabled": true,
+            "initial_estimated_bandwidth_bytes_per_sec": 268435456,
+            "min_estimated_bandwidth_bytes_per_sec": 67108864,
+            "max_estimated_bandwidth_bytes_per_sec": 536870912,
+            "control_interval_us": 4000,
+            "throughput_ema_alpha": 0.25,
+            "capacity_increase_ratio": 1.2,
+            "capacity_decrease_ratio": 0.8,
+            "transport_pacing_enabled": true,
+            "rdma_pacing_quantum_bytes": 131072,
+            "tcp_pacing_quantum_bytes": 65536,
+            "hierarchical_shaping_enabled": true,
+            "domain_hierarchy_weight": 0.5,
+            "object_set_hierarchy_weight": 0.25,
+            "closed_loop_control_enabled": true,
+            "fairness_error_tolerance": 0.15,
+            "idle_capacity_recovery_ratio": 1.1
           }
         }
     })");
@@ -404,6 +422,27 @@ TEST(TransferEngineConfigOverrideTest,
     EXPECT_EQ(config->get("qos/scheduler/target_interval_us", 0u), 1500u);
     EXPECT_EQ(config->get("qos/scheduler/min_chunk_bytes", 0u), 131072u);
     EXPECT_EQ(config->get("qos/scheduler/max_chunk_bytes", 0u), 524288u);
+    EXPECT_TRUE(config->get("qos/scheduler/adaptive_shaping_enabled", false));
+    EXPECT_TRUE(config->get("qos/scheduler/capacity_estimation_enabled", false));
+    EXPECT_EQ(config->get("qos/scheduler/initial_estimated_bandwidth_bytes_per_sec", 0u),
+              268435456u);
+    EXPECT_EQ(config->get("qos/scheduler/min_estimated_bandwidth_bytes_per_sec", 0u),
+              67108864u);
+    EXPECT_EQ(config->get("qos/scheduler/max_estimated_bandwidth_bytes_per_sec", 0u),
+              536870912u);
+    EXPECT_EQ(config->get("qos/scheduler/control_interval_us", 0u), 4000u);
+    EXPECT_DOUBLE_EQ(config->get("qos/scheduler/throughput_ema_alpha", 0.0), 0.25);
+    EXPECT_DOUBLE_EQ(config->get("qos/scheduler/capacity_increase_ratio", 0.0), 1.2);
+    EXPECT_DOUBLE_EQ(config->get("qos/scheduler/capacity_decrease_ratio", 0.0), 0.8);
+    EXPECT_TRUE(config->get("qos/scheduler/transport_pacing_enabled", false));
+    EXPECT_EQ(config->get("qos/scheduler/rdma_pacing_quantum_bytes", 0u), 131072u);
+    EXPECT_EQ(config->get("qos/scheduler/tcp_pacing_quantum_bytes", 0u), 65536u);
+    EXPECT_TRUE(config->get("qos/scheduler/hierarchical_shaping_enabled", false));
+    EXPECT_DOUBLE_EQ(config->get("qos/scheduler/domain_hierarchy_weight", 0.0), 0.5);
+    EXPECT_DOUBLE_EQ(config->get("qos/scheduler/object_set_hierarchy_weight", 0.0), 0.25);
+    EXPECT_TRUE(config->get("qos/scheduler/closed_loop_control_enabled", false));
+    EXPECT_DOUBLE_EQ(config->get("qos/scheduler/fairness_error_tolerance", 0.0), 0.15);
+    EXPECT_DOUBLE_EQ(config->get("qos/scheduler/idle_capacity_recovery_ratio", 0.0), 1.1);
 }
 
 TEST(TransferEngineConfigOverrideTest,

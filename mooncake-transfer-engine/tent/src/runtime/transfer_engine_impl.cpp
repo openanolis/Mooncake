@@ -1095,6 +1095,9 @@ Status TransferEngineImpl::submitTransfer(
         task.status = PENDING;
         task.request = merged_request;
         task.active_request = merged_request;
+        task.hierarchy_key = hierarchyKeyForRequest(merged_request);
+        task.effective_shares = hierarchicalSharesForRequest(merged_request);
+        task.pacing_quantum_bytes = 0;
         task.staging = false;
         task.qos_admitted = false;
         task.qos_queued = false;
@@ -1115,8 +1118,7 @@ Status TransferEngineImpl::submitTransfer(
             task.qos_queued = true;
             {
                 std::lock_guard<std::mutex> lock(qos_mutex_);
-                enqueuePendingTaskLocked(tenantKeyForRequest(task.request), batch,
-                                         task_id);
+                enqueuePendingTaskLocked(task.hierarchy_key, batch, task_id);
             }
             continue;
         }
@@ -1124,8 +1126,7 @@ Status TransferEngineImpl::submitTransfer(
         if (qos_scheduler_config_.enabled && !tryAcquireBandwidthBudget(task)) {
             {
                 std::lock_guard<std::mutex> lock(qos_mutex_);
-                enqueuePendingTaskLocked(tenantKeyForRequest(task.request), batch,
-                                         task_id);
+                enqueuePendingTaskLocked(task.hierarchy_key, batch, task_id);
             }
             continue;
         }
@@ -1164,6 +1165,154 @@ uint64_t TransferEngineImpl::rateLimitForRequest(const Request& request) const {
     return qos_scheduler_config_.default_tenant_rate_limit_bytes_per_sec;
 }
 
+uint32_t TransferEngineImpl::effectiveSharesForRequest(const Request& request) const {
+    if (request.qos_context.tenant_shares != 0) {
+        return request.qos_context.tenant_shares;
+    }
+    return qos_scheduler_config_.default_tenant_shares;
+}
+
+uint32_t TransferEngineImpl::hierarchicalSharesForRequest(
+    const Request& request) const {
+    auto shares = static_cast<double>(effectiveSharesForRequest(request));
+    if (qos_scheduler_config_.hierarchical_shaping_enabled) {
+        shares *= qos_scheduler_config_.domain_hierarchy_weight;
+        shares *= qos_scheduler_config_.object_set_hierarchy_weight;
+    }
+    return static_cast<uint32_t>(std::max<double>(1.0, shares));
+}
+
+std::string TransferEngineImpl::hierarchyKeyForRequest(const Request& request) const {
+    auto hierarchy_key = tenantKeyForRequest(request);
+    if (!qos_scheduler_config_.hierarchical_shaping_enabled) {
+        return hierarchy_key;
+    }
+
+    std::string key = hierarchy_key;
+    if (qos_scheduler_config_.domain_hierarchy_weight > 0.0) {
+        key += "/" + request.qos_context.domain_id;
+    }
+    if (qos_scheduler_config_.object_set_hierarchy_weight > 0.0) {
+        key += "/" + request.qos_context.object_set;
+    }
+    return key;
+}
+
+size_t TransferEngineImpl::pacingQuantumForTask(const TaskInfo& task) const {
+    if (!qos_scheduler_config_.transport_pacing_enabled) {
+        return 0;
+    }
+    if (task.type == RDMA) {
+        return qos_scheduler_config_.rdma_pacing_quantum_bytes;
+    }
+    if (task.type == TCP) {
+        return qos_scheduler_config_.tcp_pacing_quantum_bytes;
+    }
+    return 0;
+}
+
+void TransferEngineImpl::refreshAdaptiveControlLocked(
+    std::chrono::steady_clock::time_point now) {
+    if (!qos_scheduler_config_.adaptive_shaping_enabled &&
+        !qos_scheduler_config_.closed_loop_control_enabled) {
+        return;
+    }
+    if (last_global_control_.time_since_epoch().count() != 0) {
+        auto elapsed_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                now - last_global_control_)
+                .count();
+        if (elapsed_us <
+            static_cast<long long>(qos_scheduler_config_.control_interval_us)) {
+            return;
+        }
+    }
+    last_global_control_ = now;
+
+    for (auto& [hierarchy_key, state] : tenant_bandwidth_states_) {
+        if (state.estimated_capacity_bytes_per_sec == 0) {
+            state.estimated_capacity_bytes_per_sec =
+                std::max<uint64_t>(
+                    qos_scheduler_config_.initial_estimated_bandwidth_bytes_per_sec,
+                    state.configured_rate_limit_bytes_per_sec);
+        }
+        auto interval_us = qos_scheduler_config_.control_interval_us;
+        if (interval_us == 0) {
+            interval_us = 1;
+        }
+        uint64_t sample_throughput =
+            (state.completed_bytes_since_control * 1000000ull) / interval_us;
+        if (state.observed_throughput_ema_bytes_per_sec == 0) {
+            state.observed_throughput_ema_bytes_per_sec = sample_throughput;
+        } else {
+            double alpha = qos_scheduler_config_.throughput_ema_alpha;
+            state.observed_throughput_ema_bytes_per_sec = static_cast<uint64_t>(
+                alpha * sample_throughput +
+                (1.0 - alpha) * state.observed_throughput_ema_bytes_per_sec);
+        }
+
+        uint64_t estimate = state.estimated_capacity_bytes_per_sec;
+        if (qos_scheduler_config_.capacity_estimation_enabled) {
+            if (sample_throughput +
+                    computeChunkBytesForRate(
+                        std::max<uint64_t>(1, state.configured_rate_limit_bytes_per_sec)) >=
+                estimate) {
+                estimate = static_cast<uint64_t>(
+                    estimate * qos_scheduler_config_.capacity_increase_ratio);
+            } else if (sample_throughput < estimate *
+                                          (1.0 - qos_scheduler_config_.fairness_error_tolerance)) {
+                estimate = static_cast<uint64_t>(
+                    estimate * qos_scheduler_config_.capacity_decrease_ratio);
+            }
+        }
+
+        if (qos_scheduler_config_.closed_loop_control_enabled &&
+            sample_throughput < state.configured_rate_limit_bytes_per_sec) {
+            estimate = static_cast<uint64_t>(
+                estimate * qos_scheduler_config_.idle_capacity_recovery_ratio);
+        }
+
+        estimate = std::clamp(
+            estimate,
+            qos_scheduler_config_.min_estimated_bandwidth_bytes_per_sec,
+            qos_scheduler_config_.max_estimated_bandwidth_bytes_per_sec);
+        state.estimated_capacity_bytes_per_sec = estimate;
+        state.adaptive_rate_limit_bytes_per_sec =
+            std::min<uint64_t>(estimate, state.configured_rate_limit_bytes_per_sec);
+        if (state.adaptive_rate_limit_bytes_per_sec == 0) {
+            state.adaptive_rate_limit_bytes_per_sec =
+                state.configured_rate_limit_bytes_per_sec;
+        }
+        state.completed_bytes_since_control = 0;
+        state.last_control = now;
+    }
+}
+
+void TransferEngineImpl::recordBandwidthSampleLocked(
+    const std::string& hierarchy_key, size_t bytes_completed,
+    std::chrono::steady_clock::time_point now) {
+    auto& state = tenant_bandwidth_states_[hierarchy_key];
+    state.completed_bytes_since_control += bytes_completed;
+    state.last_sample = now;
+}
+
+uint64_t TransferEngineImpl::effectiveRateLimitForTask(const TaskInfo& task) const {
+    auto configured_rate = rateLimitForRequest(task.request);
+    if (!qos_scheduler_config_.adaptive_shaping_enabled &&
+        !qos_scheduler_config_.closed_loop_control_enabled) {
+        return configured_rate;
+    }
+
+    auto it = tenant_bandwidth_states_.find(task.hierarchy_key);
+    if (it == tenant_bandwidth_states_.end()) {
+        return configured_rate;
+    }
+    if (it->second.adaptive_rate_limit_bytes_per_sec != 0) {
+        return it->second.adaptive_rate_limit_bytes_per_sec;
+    }
+    return configured_rate;
+}
+
 size_t TransferEngineImpl::computeChunkBytesForRate(
     uint64_t rate_limit_bytes_per_sec) const {
     if (rate_limit_bytes_per_sec == 0) {
@@ -1184,15 +1333,16 @@ bool TransferEngineImpl::shouldBypassBandwidthShaping(const TaskInfo& task) cons
     if (!qos_scheduler_config_.bandwidth_shaping_enabled) {
         return true;
     }
-    if (rateLimitForRequest(task.request) == 0) {
+    if (effectiveRateLimitForTask(task) == 0) {
         return true;
     }
     return false;
 }
 
 void TransferEngineImpl::replenishBandwidthTokensLocked(
-    const std::string& tenant_key, std::chrono::steady_clock::time_point now) {
-    auto& state = tenant_bandwidth_states_[tenant_key];
+    const std::string& hierarchy_key, std::chrono::steady_clock::time_point now) {
+    refreshAdaptiveControlLocked(now);
+    auto& state = tenant_bandwidth_states_[hierarchy_key];
     if (state.last_refill.time_since_epoch().count() == 0) {
         state.last_refill = now;
         state.tokens = state.burst_bytes;
@@ -1202,39 +1352,42 @@ void TransferEngineImpl::replenishBandwidthTokensLocked(
     auto elapsed =
         std::chrono::duration_cast<std::chrono::microseconds>(now - state.last_refill)
             .count();
-    if (elapsed <= 0 || state.rate_limit_bytes_per_sec == 0) {
+    auto effective_rate = state.adaptive_rate_limit_bytes_per_sec != 0
+                              ? state.adaptive_rate_limit_bytes_per_sec
+                              : state.configured_rate_limit_bytes_per_sec;
+    if (elapsed <= 0 || effective_rate == 0) {
         state.last_refill = now;
         return;
     }
 
     uint64_t refill =
-        (state.rate_limit_bytes_per_sec * static_cast<uint64_t>(elapsed)) /
+        (effective_rate * static_cast<uint64_t>(elapsed)) /
         1000000ull;
     state.tokens = std::min<uint64_t>(state.burst_bytes, state.tokens + refill);
     state.last_refill = now;
 }
 
 size_t TransferEngineImpl::countActiveTenantsWithBacklogLocked(
-    const std::string& include_tenant_key) const {
+    const std::string& include_hierarchy_key) const {
     std::unordered_set<std::string> active_tenants;
-    for (const auto& [tenant_key, inflight] : tenant_inflight_counts_) {
+    for (const auto& [hierarchy_key, inflight] : tenant_inflight_counts_) {
         if (inflight > 0) {
-            active_tenants.insert(tenant_key);
+            active_tenants.insert(hierarchy_key);
         }
     }
-    for (const auto& [tenant_key, pending] : tenant_pending_task_ids_) {
+    for (const auto& [hierarchy_key, pending] : tenant_pending_task_ids_) {
         if (!pending.empty()) {
-            active_tenants.insert(tenant_key);
+            active_tenants.insert(hierarchy_key);
         }
     }
-    active_tenants.insert(include_tenant_key);
+    active_tenants.insert(include_hierarchy_key);
     return active_tenants.size();
 }
 
-void TransferEngineImpl::enqueuePendingTaskLocked(const std::string& tenant_key,
+void TransferEngineImpl::enqueuePendingTaskLocked(const std::string& hierarchy_key,
                                                   Batch* batch,
                                                   size_t task_id) {
-    auto& pending = tenant_pending_task_ids_[tenant_key];
+    auto& pending = tenant_pending_task_ids_[hierarchy_key];
     auto duplicate = std::find_if(
         pending.begin(), pending.end(), [batch, task_id](const PendingTaskRef& ref) {
             return ref.batch == batch && ref.task_id == task_id;
@@ -1246,23 +1399,37 @@ void TransferEngineImpl::enqueuePendingTaskLocked(const std::string& tenant_key,
 
 void TransferEngineImpl::buildActiveRequest(TaskInfo& task) {
     task.active_request = task.request;
-    if (!qos_scheduler_config_.bandwidth_shaping_enabled) {
-        return;
-    }
-
-    auto rate_limit = rateLimitForRequest(task.request);
+    auto rate_limit = effectiveRateLimitForTask(task);
     auto chunk_bytes = computeChunkBytesForRate(rate_limit);
     if (chunk_bytes == 0 || task.logical_length <= chunk_bytes) {
+        if (qos_scheduler_config_.transport_pacing_enabled &&
+            task.type != UNSPEC) {
+            auto pacing_quantum = pacingQuantumForTask(task);
+            if (pacing_quantum != 0) {
+                task.active_request.length =
+                    std::min(task.active_request.length, pacing_quantum);
+                task.active_request.qos_context.transport_pacing_quantum_bytes =
+                    pacing_quantum;
+            }
+        }
         return;
     }
 
     auto remaining_bytes = task.logical_length - task.submitted_bytes;
     auto fragment_bytes = std::min(chunk_bytes, remaining_bytes);
+    if (task.type != UNSPEC && qos_scheduler_config_.transport_pacing_enabled) {
+        auto pacing_quantum = pacingQuantumForTask(task);
+        if (pacing_quantum != 0) {
+            fragment_bytes = std::min(fragment_bytes, pacing_quantum);
+        }
+    }
     task.active_request.source = static_cast<char*>(task.request.source) +
                                  task.submitted_bytes;
     task.active_request.target_offset =
         task.request.target_offset + task.submitted_bytes;
     task.active_request.length = fragment_bytes;
+    task.active_request.qos_context.transport_pacing_quantum_bytes =
+        task.pacing_quantum_bytes;
 }
 
 bool TransferEngineImpl::tryAcquireBandwidthBudget(TaskInfo& task) {
@@ -1272,23 +1439,37 @@ bool TransferEngineImpl::tryAcquireBandwidthBudget(TaskInfo& task) {
         return true;
     }
 
-    auto tenant_key = tenantKeyForRequest(task.request);
-    auto rate_limit = rateLimitForRequest(task.request);
+    auto hierarchy_key = task.hierarchy_key;
+    auto rate_limit = effectiveRateLimitForTask(task);
     auto chunk_bytes = computeChunkBytesForRate(rate_limit);
     auto remaining_bytes = task.logical_length - task.submitted_bytes;
     auto desired_bytes = std::min(chunk_bytes, remaining_bytes);
+    if (qos_scheduler_config_.transport_pacing_enabled) {
+        auto pacing_quantum = task.pacing_quantum_bytes;
+        if (pacing_quantum != 0) {
+            desired_bytes = std::min(desired_bytes, pacing_quantum);
+        }
+    }
 
     std::lock_guard<std::mutex> lock(qos_mutex_);
-    if (countActiveTenantsWithBacklogLocked(tenant_key) <= 1) {
+    if (countActiveTenantsWithBacklogLocked(hierarchy_key) <= 1) {
         buildActiveRequest(task);
         return true;
     }
 
-    auto& state = tenant_bandwidth_states_[tenant_key];
-    state.rate_limit_bytes_per_sec = rate_limit;
+    auto& state = tenant_bandwidth_states_[hierarchy_key];
+    state.configured_rate_limit_bytes_per_sec = rateLimitForRequest(task.request);
+    if (state.adaptive_rate_limit_bytes_per_sec == 0) {
+        state.adaptive_rate_limit_bytes_per_sec = state.configured_rate_limit_bytes_per_sec;
+    }
+    if (state.estimated_capacity_bytes_per_sec == 0) {
+        state.estimated_capacity_bytes_per_sec =
+            std::max<uint64_t>(qos_scheduler_config_.initial_estimated_bandwidth_bytes_per_sec,
+                               state.configured_rate_limit_bytes_per_sec);
+    }
     state.burst_bytes = std::max<uint64_t>(qos_scheduler_config_.bandwidth_burst_bytes,
                                            chunk_bytes);
-    replenishBandwidthTokensLocked(tenant_key, std::chrono::steady_clock::now());
+    replenishBandwidthTokensLocked(hierarchy_key, std::chrono::steady_clock::now());
     if (state.tokens < desired_bytes) {
         task.pending_bandwidth = true;
         task.qos_queued = true;
@@ -1303,13 +1484,14 @@ bool TransferEngineImpl::tryAcquireBandwidthBudget(TaskInfo& task) {
     task.active_request.target_offset =
         task.request.target_offset + task.submitted_bytes;
     task.active_request.length = desired_bytes;
+    task.active_request.qos_context.transport_pacing_quantum_bytes =
+        task.pacing_quantum_bytes;
     return true;
 }
 
 bool TransferEngineImpl::tryAcquireQosSlot(TaskInfo& task) {
     std::lock_guard<std::mutex> lock(qos_mutex_);
-    auto tenant_key = tenantKeyForRequest(task.request);
-    auto& inflight = tenant_inflight_counts_[tenant_key];
+    auto& inflight = tenant_inflight_counts_[task.hierarchy_key];
     if (inflight >= qos_scheduler_config_.max_inflight_per_tenant) {
         return false;
     }
@@ -1326,8 +1508,7 @@ void TransferEngineImpl::releaseQosSlotIfNeeded(TaskInfo& task,
     }
 
     std::lock_guard<std::mutex> lock(qos_mutex_);
-    auto tenant_key = tenantKeyForRequest(task.request);
-    auto it = tenant_inflight_counts_.find(tenant_key);
+    auto it = tenant_inflight_counts_.find(task.hierarchy_key);
     if (it != tenant_inflight_counts_.end() && it->second > 0) {
         --it->second;
     }
@@ -1339,15 +1520,17 @@ Status TransferEngineImpl::classifyAndQueueTask(
     std::vector<Request> classified_request_list[],
     std::vector<size_t> task_id_list[],
     std::unordered_map<TransportType, size_t>& next_sub_task_id) {
-    buildActiveRequest(task);
-    auto& request = task.active_request;
-    task.type = resolveTransport(request, 0);
+    auto candidate_request = task.active_request;
+    task.type = resolveTransport(candidate_request, 0);
     if (task.type == UNSPEC) {
         LOG(WARNING) << "Unable to find registered buffer for request: "
-                     << printRequest(request);
+                     << printRequest(candidate_request);
         return Status::OK();
     }
 
+    task.pacing_quantum_bytes = pacingQuantumForTask(task);
+    buildActiveRequest(task);
+    auto& request = task.active_request;
     if (task.type == TCP) {
         std::vector<std::string> staging_params;
         findStagingPolicy(request, staging_params);
@@ -1425,7 +1608,7 @@ void TransferEngineImpl::removePendingTasksForBatch(Batch* batch) {
 }
 
 Status TransferEngineImpl::drainPendingRequestsForTenant(
-    const std::string& tenant_key) {
+    const std::string& hierarchy_key) {
     if (!qos_scheduler_config_.enabled) {
         return Status::OK();
     }
@@ -1434,7 +1617,7 @@ Status TransferEngineImpl::drainPendingRequestsForTenant(
         PendingTaskRef pending;
         {
             std::lock_guard<std::mutex> lock(qos_mutex_);
-            auto pending_it = tenant_pending_task_ids_.find(tenant_key);
+            auto pending_it = tenant_pending_task_ids_.find(hierarchy_key);
             if (pending_it == tenant_pending_task_ids_.end() ||
                 pending_it->second.empty()) {
                 return Status::OK();
@@ -1461,14 +1644,14 @@ Status TransferEngineImpl::drainPendingRequestsForTenant(
         if (!task.qos_admitted) {
             if (!tryAcquireQosSlot(task)) {
                 std::lock_guard<std::mutex> lock(qos_mutex_);
-                enqueuePendingTaskLocked(tenant_key, batch, task_id);
+                enqueuePendingTaskLocked(hierarchy_key, batch, task_id);
                 return Status::OK();
             }
         }
 
         if (!tryAcquireBandwidthBudget(task)) {
             std::lock_guard<std::mutex> lock(qos_mutex_);
-            enqueuePendingTaskLocked(tenant_key, batch, task_id);
+            enqueuePendingTaskLocked(hierarchy_key, batch, task_id);
             return Status::OK();
         }
 
@@ -1553,6 +1736,9 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& sub_batch = batch->sub_batch[type];
     task.sub_task_id = sub_batch->size();
     task.type = type;
+    task.pacing_quantum_bytes = pacingQuantumForTask(task);
+    task.active_request.qos_context.transport_pacing_quantum_bytes =
+        task.pacing_quantum_bytes;
     task.fragment_inflight = true;
     return transport->submitTransferTasks(sub_batch, {task.active_request});
 }
@@ -1632,8 +1818,13 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
                 task.active_request = task.request;
                 task.active_request.length = task.logical_length;
                 releaseQosSlotIfNeeded(task, task.status);
-                CHECK_STATUS(drainPendingRequestsForTenant(
-                    tenantKeyForRequest(task.request)));
+                {
+                    std::lock_guard<std::mutex> lock(qos_mutex_);
+                    recordBandwidthSampleLocked(task.hierarchy_key,
+                                                task.active_request.length,
+                                                std::chrono::steady_clock::now());
+                }
+                CHECK_STATUS(drainPendingRequestsForTenant(task.hierarchy_key));
             } else {
                 task.status = PENDING;
                 task.type = UNSPEC;
@@ -1642,18 +1833,18 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
                 task.pending_bandwidth = true;
                 {
                     std::lock_guard<std::mutex> lock(qos_mutex_);
-                    enqueuePendingTaskLocked(tenantKeyForRequest(task.request), batch,
-                                             task_id);
+                    recordBandwidthSampleLocked(task.hierarchy_key,
+                                                task.active_request.length,
+                                                std::chrono::steady_clock::now());
+                    enqueuePendingTaskLocked(task.hierarchy_key, batch, task_id);
                 }
-                CHECK_STATUS(drainPendingRequestsForTenant(
-                    tenantKeyForRequest(task.request)));
+                CHECK_STATUS(drainPendingRequestsForTenant(task.hierarchy_key));
             }
         } else if (isTerminalStatus(fragment_status.s)) {
             task.fragment_inflight = false;
             task.status = fragment_status.s;
             releaseQosSlotIfNeeded(task, task.status);
-            CHECK_STATUS(drainPendingRequestsForTenant(
-                tenantKeyForRequest(task.request)));
+            CHECK_STATUS(drainPendingRequestsForTenant(task.hierarchy_key));
         } else {
             task.status = PENDING;
         }

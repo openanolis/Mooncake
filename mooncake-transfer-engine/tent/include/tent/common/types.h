@@ -49,6 +49,7 @@ struct Request {
         std::string logical_key{};
         std::string canonical_key{};
         uint32_t tenant_shares{1024};
+        size_t transport_pacing_quantum_bytes{0};
     };
 
     OpCode opcode;

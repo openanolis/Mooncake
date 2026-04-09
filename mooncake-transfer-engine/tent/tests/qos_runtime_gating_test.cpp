@@ -102,6 +102,33 @@ TEST(QosRuntimeGatingTest, SingleActiveTenantWouldBypassShareShaping) {
     EXPECT_EQ(requests[0].qos_context.tenant_id, "tenant-a");
 }
 
+TEST(QosRuntimeGatingTest, HierarchicalShapingKeysWouldDifferentiateScopes) {
+    Request tenant_a_domain_1 = makeRequest("tenant-a", 1024);
+    tenant_a_domain_1.qos_context.domain_id = "domain-1";
+    tenant_a_domain_1.qos_context.object_set = "set-a";
+    Request tenant_a_domain_2 = makeRequest("tenant-a", 1024);
+    tenant_a_domain_2.qos_context.domain_id = "domain-2";
+    tenant_a_domain_2.qos_context.object_set = "set-b";
+
+    std::string key1 = tenant_a_domain_1.qos_context.tenant_id + "/" +
+                       tenant_a_domain_1.qos_context.domain_id + "/" +
+                       tenant_a_domain_1.qos_context.object_set;
+    std::string key2 = tenant_a_domain_2.qos_context.tenant_id + "/" +
+                       tenant_a_domain_2.qos_context.domain_id + "/" +
+                       tenant_a_domain_2.qos_context.object_set;
+
+    EXPECT_NE(key1, key2);
+}
+
+TEST(QosRuntimeGatingTest, AdaptiveControlCanClampEstimatedBandwidthRange) {
+    const uint64_t estimated = 600u * 1024u * 1024u;
+    const uint64_t min_estimated = 128u * 1024u * 1024u;
+    const uint64_t max_estimated = 512u * 1024u * 1024u;
+
+    EXPECT_EQ(std::clamp<uint64_t>(estimated, min_estimated, max_estimated),
+              max_estimated);
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

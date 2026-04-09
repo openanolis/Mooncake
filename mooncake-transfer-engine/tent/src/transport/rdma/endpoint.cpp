@@ -526,6 +526,25 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
         std::min(cq->maxCqe() - cq->getQuota(),
                  std::min(params_->max_qp_wr - wr_depth_list_[qp_index].value,
                           (int)slice_list.size()));
+    auto pacing_quantum_bytes =
+        slice_list.empty() ? size_t{0}
+                           : slice_list.front()
+                                 ->task->request.qos_context
+                                 .transport_pacing_quantum_bytes;
+    if (pacing_quantum_bytes != 0) {
+        size_t bytes_to_post = 0;
+        int paced_wr_count = 0;
+        while (paced_wr_count < wr_count) {
+            auto current = slice_list[paced_wr_count];
+            if (paced_wr_count > 0 &&
+                bytes_to_post + current->length > pacing_quantum_bytes) {
+                break;
+            }
+            bytes_to_post += current->length;
+            ++paced_wr_count;
+        }
+        wr_count = paced_wr_count;
+    }
     int sge_count = wr_count * kSgeEntries;
 
     if (wr_count <= 0 || !reserveQuota(qp_index, wr_count)) return 0;

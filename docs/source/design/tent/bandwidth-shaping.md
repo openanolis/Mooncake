@@ -1,10 +1,14 @@
 # TENT Runtime Bandwidth Shaping Design
 
+## Status
+
+This design is now implemented in TENT runtime as the phase-1/1.5 baseline and extended with transport-aware pacing hints, hierarchical shaping keys, and adaptive closed-loop controls in the runtime shaper.
+
 ## Background
 
 TENT already supports QoS normalization, weighted-fair request ordering, and per-tenant inflight gating. Those mechanisms decide **who runs first** and **who must wait**, but they do not yet decide **how many bytes per unit time** each tenant is allowed to put onto the datapath.
 
-The next step is to add real runtime bandwidth shaping without turning fairness into a throughput tax.
+The runtime shaper now adds that byte-rate control without turning fairness into a throughput tax.
 
 This design targets four requirements:
 
@@ -431,48 +435,63 @@ Use existing throughput surfaces such as `tebench` and runtime metrics to confir
 - fairness under contention does not leave obvious capacity idle
 - capped or lower-share tenants are suppressed relative to higher-share tenants only when contention exists
 
-## Future work
+## Implemented extensions beyond phase 1
 
-### 1. Black-box bandwidth estimation
+### Adaptive runtime shaping
 
-Add a runtime estimator for total effective path bandwidth:
+The runtime shaper now keeps per-hierarchy bandwidth state:
 
-- infer `B_est` from observed throughput, queue depth, latency, retries, and congestion signals
-- use `B_est` as the base quantity divided across active tenants
+- configured rate limit
+- adaptive rate limit
+- estimated capacity
+- throughput EMA
+- completed bytes per control interval
+- burst/tokens/refill timestamps
 
-This would improve portability and reduce dependency on configured rate assumptions.
+At each control interval the runtime updates the estimate from observed completions, clamps it into the configured min/max range, and derives an adaptive rate that still respects explicit tenant or tier caps.
 
-### 2. RDMA posting-level shaping
+### Transport-aware pacing
 
-If finer-grained RDMA control is needed later:
+Runtime shaping remains transport-agnostic at admission time, but request fragments now also carry a transport pacing quantum hint. Today this is enforced in two layers:
 
-- propagate tenant identity deeper into slice / worker scheduling
-- add pacing closer to `submitSlices()` / `ibv_post_send()`
+- runtime fragment sizing clamps each fragment by the transport pacing quantum
+- RDMA posting further limits each `submitSlices()` batch so one post wave does not exceed the pacing quantum carried by the fragment request
 
-This should remain a second-phase refinement.
+This keeps transport pacing compatible with the runtime-owned shaper without requiring a separate per-transport scheduler.
 
-### 3. Hierarchical shaping
+### Hierarchical shaping
 
-Future work may add multi-level shaping such as:
+Hierarchical shaping is implemented by deriving shaping state from `tenant/domain/object_set` scope instead of tenant alone when enabled. This means:
 
-- tenant
-- domain
-- object_set
+- inflight accounting is isolated per hierarchy key
+- pending queues drain per hierarchy key
+- bandwidth tokens and adaptive estimates are maintained per hierarchy key
+- weighted ordering still uses normalized request metadata, while runtime admission enforces the hierarchical scope boundary
 
-Phase 1 intentionally stays at tenant granularity.
+### Closed-loop QoS
+
+Closed-loop control builds on adaptive shaping by:
+
+- shrinking estimates when observed throughput materially falls below the current estimate
+- recovering estimates when useful work is available but capacity appears idle
+- preserving work-conserving behavior so idle tenants do not reserve bandwidth
+
+## Remaining future work
+
+The main remaining refinement is deeper transport-native pacing if runtime fragment pacing proves too coarse for a specific backend. In particular, RDMA could still be extended to pace at finer WQE or lane-scheduling granularity, but that is now an optimization pass on top of the existing runtime + endpoint pacing path rather than a prerequisite for correctness.
 
 ## Summary
 
-The phase-1 design adds Linux-inspired bandwidth shaping to TENT runtime without depending on Linux kernel traffic control or transport-specific schedulers.
+The implemented design adds Linux-inspired bandwidth shaping to TENT runtime without depending on Linux kernel traffic control.
 
-The selected design is:
+The current system is:
 
 - runtime-owned
 - chunk-based
-- transport-agnostic
 - work-conserving
-- contention-aware
-- robust to unknown physical bandwidth
+- adaptive
+- hierarchy-aware
+- transport-aware via pacing hints and RDMA endpoint post limiting
 
 Most importantly, it preserves two invariants:
 

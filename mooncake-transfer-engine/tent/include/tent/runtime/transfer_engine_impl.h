@@ -55,6 +55,9 @@ struct TaskInfo {
     int xport_priority{0};
     Request request;
     Request active_request;
+    std::string hierarchy_key;
+    uint32_t effective_shares{1024};
+    size_t pacing_quantum_bytes{0};
     bool staging{false};
     bool qos_admitted{false};
     bool qos_queued{false};
@@ -205,9 +208,25 @@ class TransferEngineImpl {
 
     void releaseQosSlotIfNeeded(TaskInfo& task, TransferStatusEnum new_status);
 
-    Status drainPendingRequestsForTenant(const std::string& tenant_key);
+    Status drainPendingRequestsForTenant(const std::string& hierarchy_key);
 
     uint64_t rateLimitForRequest(const Request& request) const;
+
+    uint64_t effectiveRateLimitForTask(const TaskInfo& task) const;
+
+    uint32_t effectiveSharesForRequest(const Request& request) const;
+
+    uint32_t hierarchicalSharesForRequest(const Request& request) const;
+
+    std::string hierarchyKeyForRequest(const Request& request) const;
+
+    size_t pacingQuantumForTask(const TaskInfo& task) const;
+
+    void refreshAdaptiveControlLocked(std::chrono::steady_clock::time_point now);
+
+    void recordBandwidthSampleLocked(const std::string& hierarchy_key,
+                                     size_t bytes_completed,
+                                     std::chrono::steady_clock::time_point now);
 
     size_t computeChunkBytesForRate(uint64_t rate_limit_bytes_per_sec) const;
 
@@ -215,13 +234,13 @@ class TransferEngineImpl {
 
     bool tryAcquireBandwidthBudget(TaskInfo& task);
 
-    void replenishBandwidthTokensLocked(const std::string& tenant_key,
+    void replenishBandwidthTokensLocked(const std::string& hierarchy_key,
                                         std::chrono::steady_clock::time_point now);
 
     size_t countActiveTenantsWithBacklogLocked(
-        const std::string& include_tenant_key) const;
+        const std::string& include_hierarchy_key) const;
 
-    void enqueuePendingTaskLocked(const std::string& tenant_key, Batch* batch,
+    void enqueuePendingTaskLocked(const std::string& hierarchy_key, Batch* batch,
                                   size_t task_id);
 
     void buildActiveRequest(TaskInfo& task);
@@ -281,14 +300,21 @@ class TransferEngineImpl {
 
     struct BandwidthShapingState {
         uint64_t tokens{0};
-        uint64_t rate_limit_bytes_per_sec{0};
+        uint64_t configured_rate_limit_bytes_per_sec{0};
+        uint64_t adaptive_rate_limit_bytes_per_sec{0};
+        uint64_t observed_throughput_ema_bytes_per_sec{0};
+        uint64_t estimated_capacity_bytes_per_sec{0};
+        uint64_t completed_bytes_since_control{0};
         uint64_t burst_bytes{0};
         std::chrono::steady_clock::time_point last_refill{};
+        std::chrono::steady_clock::time_point last_control{};
+        std::chrono::steady_clock::time_point last_sample{};
     };
 
     std::unordered_map<std::string, size_t> tenant_inflight_counts_;
     std::unordered_map<std::string, std::deque<PendingTaskRef>> tenant_pending_task_ids_;
     std::unordered_map<std::string, BandwidthShapingState> tenant_bandwidth_states_;
+    std::chrono::steady_clock::time_point last_global_control_{};
     std::mutex qos_mutex_;
 };
 }  // namespace tent
