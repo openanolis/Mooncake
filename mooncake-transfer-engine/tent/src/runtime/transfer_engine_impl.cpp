@@ -720,6 +720,7 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
 Status TransferEngineImpl::freeBatch(BatchID batch_id) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
+    removePendingTasksForBatch(batch);
     batch_set_.get().freelist.push_back(batch);
     lazyFreeBatch();
     return Status::OK();
@@ -1070,7 +1071,6 @@ Status TransferEngineImpl::submitTransfer(
     batch->task_list.insert(batch->task_list.end(), normalized_requests.size(),
                             TaskInfo{});
 
-    // Record start time for metrics tracking
     auto submit_time = std::chrono::steady_clock::now();
 
     auto merge_boundaries =
@@ -1088,7 +1088,6 @@ Status TransferEngineImpl::submitTransfer(
         if (merged_task_id_map.count(merged_task_id)) {
             task = merged_task_id_map[merged_task_id];
             task.derived = true;
-            if (task.type != UNSPEC) task_id_list[task.type].push_back(task_id);
             continue;
         }
 
@@ -1096,50 +1095,127 @@ Status TransferEngineImpl::submitTransfer(
         task.status = PENDING;
         task.request = merged_request;
         task.staging = false;
-        task.start_time =
-            submit_time;  // Record start time for latency tracking
-        task.type = resolveTransport(merged_request, 0);
-        if (task.type == UNSPEC) {
-            LOG(WARNING) << "Unable to find registered buffer for request: "
-                         << printRequest(merged_request);
-            merged_task_id_map[merged_task_id] = task;
+        task.qos_admitted = false;
+        task.qos_queued = false;
+        task.start_time = submit_time;
+        task.type = UNSPEC;
+        merged_task_id_map[merged_task_id] = task;
+
+        if (qos_scheduler_config_.enabled && task.derived) {
             continue;
         }
 
-        if (task.type == TCP) {
-            std::vector<std::string> staging_params;
-            findStagingPolicy(merged_request, staging_params);
-            if (!staging_params.empty() && staging_proxy_) {
-                task.staging = true;
-                staging_proxy_->submit(&task, staging_params);
-                continue;
+        if (qos_scheduler_config_.enabled && !tryAcquireQosSlot(task)) {
+            task.qos_queued = true;
+            {
+                std::lock_guard<std::mutex> lock(qos_mutex_);
+                tenant_pending_task_ids_[tenantKeyForRequest(task.request)]
+                    .push_back({batch, task_id});
             }
+            continue;
         }
 
-        if (!batch->sub_batch[task.type]) {
-            auto& transport = transport_list_[task.type];
-            auto status = transport->allocateSubBatch(
-                batch->sub_batch[task.type], batch->max_size);
-            if (!status.ok()) {
-                LOG(WARNING) << "Failed to allocate SubBatch " << task.type
-                             << ":" << status.ToString();
-                merged_task_id_map[merged_task_id] = task;
-                continue;
-            }
-        }
-
-        if (!next_sub_task_id.count(task.type))
-            next_sub_task_id[task.type] = batch->sub_batch[task.type]->size();
-        size_t sub_task_id = next_sub_task_id[task.type];
-        next_sub_task_id[task.type]++;
-
-        classified_request_list[task.type].push_back(merged_request);
-        task.sub_task_id = sub_task_id;
-        task.derived = false;
-        task_id_list[task.type].push_back(task_id);
+        CHECK_STATUS(classifyAndQueueTask(batch, task_id, task,
+                                          classified_request_list,
+                                          task_id_list, next_sub_task_id));
         merged_task_id_map[merged_task_id] = task;
     }
 
+    CHECK_STATUS(flushQueuedTasks(batch, classified_request_list, task_id_list));
+
+    return Status::OK();
+}
+
+std::string TransferEngineImpl::tenantKeyForRequest(const Request& request) const {
+    if (!request.qos_context.tenant_id.empty()) {
+        return request.qos_context.tenant_id;
+    }
+    return qos_scheduler_config_.default_tenant_id;
+}
+
+bool TransferEngineImpl::isTerminalStatus(TransferStatusEnum status) const {
+    return status == COMPLETED || status == FAILED || status == CANCELED ||
+           status == INVALID || status == TIMEOUT;
+}
+
+bool TransferEngineImpl::tryAcquireQosSlot(TaskInfo& task) {
+    std::lock_guard<std::mutex> lock(qos_mutex_);
+    auto tenant_key = tenantKeyForRequest(task.request);
+    auto& inflight = tenant_inflight_counts_[tenant_key];
+    if (inflight >= qos_scheduler_config_.max_inflight_per_tenant) {
+        return false;
+    }
+    ++inflight;
+    task.qos_admitted = true;
+    return true;
+}
+
+void TransferEngineImpl::releaseQosSlotIfNeeded(TaskInfo& task,
+                                                TransferStatusEnum new_status) {
+    if (!qos_scheduler_config_.enabled || !task.qos_admitted ||
+        !isTerminalStatus(new_status)) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(qos_mutex_);
+    auto tenant_key = tenantKeyForRequest(task.request);
+    auto it = tenant_inflight_counts_.find(tenant_key);
+    if (it != tenant_inflight_counts_.end() && it->second > 0) {
+        --it->second;
+    }
+    task.qos_admitted = false;
+}
+
+Status TransferEngineImpl::classifyAndQueueTask(
+    Batch* batch, size_t task_id, TaskInfo& task,
+    std::vector<Request> classified_request_list[],
+    std::vector<size_t> task_id_list[],
+    std::unordered_map<TransportType, size_t>& next_sub_task_id) {
+    auto& merged_request = task.request;
+    task.type = resolveTransport(merged_request, 0);
+    if (task.type == UNSPEC) {
+        LOG(WARNING) << "Unable to find registered buffer for request: "
+                     << printRequest(merged_request);
+        return Status::OK();
+    }
+
+    if (task.type == TCP) {
+        std::vector<std::string> staging_params;
+        findStagingPolicy(merged_request, staging_params);
+        if (!staging_params.empty() && staging_proxy_) {
+            task.staging = true;
+            staging_proxy_->submit(&task, staging_params);
+            return Status::OK();
+        }
+    }
+
+    if (!batch->sub_batch[task.type]) {
+        auto& transport = transport_list_[task.type];
+        auto status = transport->allocateSubBatch(batch->sub_batch[task.type],
+                                                  batch->max_size);
+        if (!status.ok()) {
+            LOG(WARNING) << "Failed to allocate SubBatch " << task.type << ":"
+                         << status.ToString();
+            return Status::OK();
+        }
+    }
+
+    if (!next_sub_task_id.count(task.type)) {
+        next_sub_task_id[task.type] = batch->sub_batch[task.type]->size();
+    }
+    size_t sub_task_id = next_sub_task_id[task.type];
+    next_sub_task_id[task.type]++;
+
+    classified_request_list[task.type].push_back(merged_request);
+    task.sub_task_id = sub_task_id;
+    task.derived = false;
+    task_id_list[task.type].push_back(task_id);
+    return Status::OK();
+}
+
+Status TransferEngineImpl::flushQueuedTasks(
+    Batch* batch, std::vector<Request> classified_request_list[],
+    std::vector<size_t> task_id_list[]) {
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
         if (classified_request_list[type].empty()) continue;
         auto& transport = transport_list_[type];
@@ -1147,14 +1223,78 @@ Status TransferEngineImpl::submitTransfer(
         auto status = transport->submitTransferTasks(
             sub_batch, classified_request_list[type]);
         if (!status.ok()) {
-            // LOG(WARNING) << "Failed to submit SubBatch " << type << ":"
-            //              << status.ToString();
-            for (auto& task_id : task_id_list[type])
-                batch->task_list[task_id].type = UNSPEC;
+            for (auto& task_id : task_id_list[type]) {
+                auto& task = batch->task_list[task_id];
+                task.type = UNSPEC;
+                releaseQosSlotIfNeeded(task, FAILED);
+            }
         }
     }
-
     return Status::OK();
+}
+
+void TransferEngineImpl::removePendingTasksForBatch(Batch* batch) {
+    std::lock_guard<std::mutex> lock(qos_mutex_);
+    for (auto it = tenant_pending_task_ids_.begin();
+         it != tenant_pending_task_ids_.end();) {
+        auto& queue = it->second;
+        queue.erase(std::remove_if(queue.begin(), queue.end(),
+                                   [batch](const PendingTaskRef& pending) {
+                                       return pending.batch == batch;
+                                   }),
+                    queue.end());
+        if (queue.empty()) {
+            it = tenant_pending_task_ids_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+Status TransferEngineImpl::drainPendingRequestsForTenant(
+    const std::string& tenant_key) {
+    if (!qos_scheduler_config_.enabled) {
+        return Status::OK();
+    }
+
+    while (true) {
+        PendingTaskRef pending;
+        {
+            std::lock_guard<std::mutex> lock(qos_mutex_);
+            auto pending_it = tenant_pending_task_ids_.find(tenant_key);
+            if (pending_it == tenant_pending_task_ids_.end() ||
+                pending_it->second.empty()) {
+                return Status::OK();
+            }
+
+            auto& inflight = tenant_inflight_counts_[tenant_key];
+            if (inflight >= qos_scheduler_config_.max_inflight_per_tenant) {
+                return Status::OK();
+            }
+
+            pending = pending_it->second.front();
+            pending_it->second.pop_front();
+            ++inflight;
+            if (pending_it->second.empty()) {
+                tenant_pending_task_ids_.erase(pending_it);
+            }
+        }
+
+        auto* batch = pending.batch;
+        auto task_id = pending.task_id;
+        auto& task = batch->task_list[task_id];
+        task.qos_admitted = true;
+        task.qos_queued = false;
+
+        std::vector<Request> classified_request_list[kSupportedTransportTypes];
+        std::vector<size_t> task_id_list[kSupportedTransportTypes];
+        std::unordered_map<TransportType, size_t> next_sub_task_id;
+        CHECK_STATUS(classifyAndQueueTask(batch, task_id, task,
+                                          classified_request_list,
+                                          task_id_list, next_sub_task_id));
+        CHECK_STATUS(flushQueuedTasks(batch, classified_request_list,
+                                      task_id_list));
+    }
 }
 
 Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
@@ -1270,6 +1410,11 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
     } else {
         if (task.type == UNSPEC) {
+            if (task.qos_queued) {
+                task_status.s = PENDING;
+                task_status.transferred_bytes = 0;
+                return Status::OK();
+            }
             task_status.s = FAILED;
             task_status.transferred_bytes = 0;
             batch->task_list[task_id].status = task_status.s;
@@ -1284,6 +1429,12 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
                                                   task_status));
     }
     batch->task_list[task_id].status = task_status.s;
+
+    if (prev_status == PENDING && isTerminalStatus(task_status.s)) {
+        releaseQosSlotIfNeeded(batch->task_list[task_id], task_status.s);
+        CHECK_STATUS(drainPendingRequestsForTenant(
+            tenantKeyForRequest(batch->task_list[task_id].request)));
+    }
 
     // Record metrics when task transitions to terminal state
     recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
@@ -1333,6 +1484,10 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
         } else {
             if (task.type == UNSPEC) {
+                if (task.qos_queued) {
+                    overall_status.s = PENDING;
+                    continue;
+                }
                 task.status = FAILED;
                 overall_status.s = FAILED;
                 continue;
@@ -1354,6 +1509,12 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
         }
         // memorize task result
         task.status = task_status.s;
+
+        if (prev_status == PENDING && isTerminalStatus(task_status.s)) {
+            releaseQosSlotIfNeeded(task, task_status.s);
+            CHECK_STATUS(drainPendingRequestsForTenant(
+                tenantKeyForRequest(task.request)));
+        }
 
         // Record metrics when task transitions to terminal state
         recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,

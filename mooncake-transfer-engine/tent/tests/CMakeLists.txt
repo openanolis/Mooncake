@@ -49,3 +49,9 @@ link_tent_test(qos_scheduler_test)
 target_include_directories(qos_scheduler_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME qos_scheduler_test COMMAND qos_scheduler_test)
+
+add_executable(qos_runtime_gating_test qos_runtime_gating_test.cpp)
+link_tent_test(qos_runtime_gating_test)
+target_include_directories(qos_runtime_gating_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME qos_runtime_gating_test COMMAND qos_runtime_gating_test)

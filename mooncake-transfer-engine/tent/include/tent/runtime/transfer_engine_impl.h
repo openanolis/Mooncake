@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -54,6 +55,8 @@ struct TaskInfo {
     int xport_priority{0};
     Request request;
     bool staging{false};
+    bool qos_admitted{false};
+    bool qos_queued{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
     volatile TransferStatusEnum staging_status{TransferStatusEnum::PENDING};
     std::chrono::steady_clock::time_point start_time{};  // For latency tracking
@@ -188,6 +191,27 @@ class TransferEngineImpl {
                                      TransferStatusEnum prev_status,
                                      TransferStatusEnum new_status);
 
+    std::string tenantKeyForRequest(const Request& request) const;
+
+    bool isTerminalStatus(TransferStatusEnum status) const;
+
+    bool tryAcquireQosSlot(TaskInfo& task);
+
+    void releaseQosSlotIfNeeded(TaskInfo& task, TransferStatusEnum new_status);
+
+    Status drainPendingRequestsForTenant(const std::string& tenant_key);
+
+    Status classifyAndQueueTask(Batch* batch, size_t task_id, TaskInfo& task,
+                                std::vector<Request> classified_request_list[],
+                                std::vector<size_t> task_id_list[],
+                                std::unordered_map<TransportType, size_t>& next_sub_task_id);
+
+    Status flushQueuedTasks(Batch* batch,
+                            std::vector<Request> classified_request_list[],
+                            std::vector<size_t> task_id_list[]);
+
+    void removePendingTasksForBatch(Batch* batch);
+
    private:
     struct AllocatedMemory {
         void* addr;
@@ -225,6 +249,14 @@ class TransferEngineImpl {
     bool merge_requests_;
     QosSchedulerConfig qos_scheduler_config_{};
     std::unique_ptr<QosScheduler> qos_scheduler_;
+    struct PendingTaskRef {
+        Batch* batch{nullptr};
+        size_t task_id{0};
+    };
+
+    std::unordered_map<std::string, size_t> tenant_inflight_counts_;
+    std::unordered_map<std::string, std::deque<PendingTaskRef>> tenant_pending_task_ids_;
+    std::mutex qos_mutex_;
 };
 }  // namespace tent
 }  // namespace mooncake
