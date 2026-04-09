@@ -2860,6 +2860,85 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
     service_->RemoveAll();
 }
 
+TEST_F(MasterServiceTest, TenantFairEvictionPrefersLargerTenant) {
+    const uint64_t kv_lease_ttl = 200;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_eviction_ratio(0.25)
+                              .set_enable_tenant_fair_eviction(true)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 16;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "test_segment", buffer, segment_size);
+
+    auto put_object = [&](const std::string& key, const std::string& tenant_id) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = tenant_id;
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        ASSERT_TRUE(
+            service_->PutStart(client_id, key, value_size, config).has_value());
+        ASSERT_TRUE(
+            service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    };
+
+    std::vector<std::string> tenant_a_keys;
+    std::vector<std::string> tenant_b_keys;
+    for (int i = 0; i < 8; ++i) {
+        tenant_a_keys.push_back("tenant_a_" + std::to_string(i));
+        put_object(tenant_a_keys.back(), "tenant-a");
+    }
+    for (int i = 0; i < 2; ++i) {
+        tenant_b_keys.push_back("tenant_b_" + std::to_string(i));
+        put_object(tenant_b_keys.back(), "tenant-b");
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
+
+    int failed_puts = 0;
+    for (int i = 0; i < 16; ++i) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-c";
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        const std::string key = "tenant_c_" + std::to_string(i);
+        if (service_->PutStart(client_id, key, value_size, config).has_value()) {
+            ASSERT_TRUE(
+                service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+        } else {
+            failed_puts++;
+        }
+    }
+    ASSERT_GT(failed_puts, 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 1000));
+
+    int tenant_a_survivors = 0;
+    for (const auto& key : tenant_a_keys) {
+        if (service_->GetReplicaList(key).has_value()) {
+            tenant_a_survivors++;
+        }
+    }
+    int tenant_b_survivors = 0;
+    for (const auto& key : tenant_b_keys) {
+        if (service_->GetReplicaList(key).has_value()) {
+            tenant_b_survivors++;
+        }
+    }
+
+    EXPECT_LT(tenant_a_survivors, static_cast<int>(tenant_a_keys.size()));
+    EXPECT_EQ(tenant_b_survivors, static_cast<int>(tenant_b_keys.size()));
+
+    service_->RemoveAll();
+}
+
 TEST_F(MasterServiceTest, ReplicaSegmentsAreUnique) {
     std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();

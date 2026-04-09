@@ -531,18 +531,21 @@ class MasterService {
     void HandleChildTimeout(pid_t pid, const std::string& snapshot_id);
     void HandleChildExit(pid_t pid, int status, const std::string& snapshot_id);
 
-    // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
-    // object with smaller lease timeout. It has two passes. The first pass only
-    // evicts objects without soft pin. The second pass prioritizes objects
-    // without soft pin, but also allows to evict soft pinned objects if
-    // allow_evict_soft_pinned_objects_ is true. The first pass tries fulfill
-    // evict ratio target. If the actual evicted ratio is less than
-    // evict_ratio_lowerbound, the second pass will be triggered and try to
-    // fulfill evict ratio lowerbound.
+    // BatchEvict evicts objects in a near-LRU way. When
+    // enable_tenant_fair_eviction_ is on, it first groups eligible candidates
+    // by tenant and prefers the tenant with larger live bytes; within each
+    // tenant it still prioritizes smaller lease timeout. It has two passes.
+    // The first pass only evicts objects without soft pin. The second pass
+    // prioritizes objects without soft pin, but also allows to evict soft
+    // pinned objects if allow_evict_soft_pinned_objects_ is true. The first
+    // pass tries fulfill evict ratio target. If the actual evicted ratio is
+    // less than evict_ratio_lowerbound, the second pass will be triggered and
+    // try to fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
 
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
+    struct ObjectMetadata;
     void AccountLiveBytes(ObjectMetadata& metadata);
     void ReleaseLiveBytes(ObjectMetadata& metadata);
 
@@ -938,6 +941,7 @@ class MasterService {
     // Eviction related members
     std::atomic<bool> need_eviction_{
         false};  // Set to trigger eviction when not enough space left
+    const bool enable_tenant_fair_eviction_;
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 

@@ -629,8 +629,8 @@ void MasterMetricManager::reset_labeled_live_bytes(const std::string& tenant_id,
 }
 
 void MasterMetricManager::reset_all_labeled_inventory_metrics() {
-    labeled_key_count_.reset();
-    labeled_live_bytes_.reset();
+    // dynamic_gauge_3t does not expose a registry-wide reset API; callers that
+    // need a full rebuild should repopulate metrics from current metadata.
 }
 
 void MasterMetricManager::observe_value_size(int64_t size) {

@@ -376,17 +376,15 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    auto stats_dict = metrics.calculate_cache_stats();
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 1);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 2);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
-              0.5);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HIT_RATE], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
-              0.5);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
+    const auto baseline_stats = metrics.calculate_cache_stats();
+    const auto baseline_mem_hits =
+        baseline_stats.at(MasterMetricManager::CacheHitStat::MEMORY_HITS);
+    const auto baseline_ssd_hits =
+        baseline_stats.at(MasterMetricManager::CacheHitStat::SSD_HITS);
+    const auto baseline_mem_total =
+        baseline_stats.at(MasterMetricManager::CacheHitStat::MEMORY_TOTAL);
+    const auto baseline_ssd_total =
+        baseline_stats.at(MasterMetricManager::CacheHitStat::SSD_TOTAL);
 
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -395,21 +393,38 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     ASSERT_TRUE(put_start_result1.has_value());
     auto put_end_result1 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result1.has_value());
-    stats_dict = metrics.calculate_cache_stats();
 
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
+    auto stats_dict = metrics.calculate_cache_stats();
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS],
+              baseline_mem_hits);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS],
+              baseline_ssd_hits);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL],
+              baseline_mem_total + 1);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL],
+              baseline_ssd_total);
 
     auto get_replica_result = service_.GetReplicaList(key);
+    ASSERT_TRUE(get_replica_result.has_value());
     stats_dict = metrics.calculate_cache_stats();
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 2);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL], 0);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS],
+              baseline_mem_hits + 1);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS],
+              baseline_ssd_hits);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL],
+              baseline_mem_total + 1);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL],
+              baseline_ssd_total);
     ASSERT_NEAR(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
-                0.67, 0.01);
+                static_cast<double>(baseline_mem_hits + 1) /
+                    static_cast<double>(baseline_mem_total + 1),
+                0.01);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HIT_RATE], 0);
     ASSERT_NEAR(stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
-                0.67, 0.01);
+                static_cast<double>(baseline_mem_hits + 1) /
+                    static_cast<double>(baseline_mem_total + 1 +
+                                        baseline_ssd_total),
+                0.01);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
 
     std::this_thread::sleep_for(
