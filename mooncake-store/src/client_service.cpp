@@ -634,18 +634,20 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     return client;
 }
 
-tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
-                                          std::vector<Slice>& slices) {
+tl::expected<void, ErrorCode> Client::Get(
+    const std::string& object_key, std::vector<Slice>& slices,
+    const std::optional<ReplicateConfig>& config) {
     auto query_result = Query(object_key);
     if (!query_result) {
         return tl::unexpected(query_result.error());
     }
-    return Get(object_key, query_result.value(), slices);
+    return Get(object_key, query_result.value(), slices, config);
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
-    std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    std::unordered_map<std::string, std::vector<Slice>>& slices,
+    const std::optional<ReplicateConfig>& config) {
     auto batched_query_results = BatchQuery(object_keys);
 
     // If any queries failed, return error results immediately for failed
@@ -680,7 +682,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
 
         auto valid_results =
-            BatchGet(valid_keys, valid_query_results, valid_slices);
+            BatchGet(valid_keys, valid_query_results, valid_slices, false,
+                     config);
 
         // Merge results back
         for (size_t i = 0; i < valid_indices.size(); ++i) {
@@ -760,9 +763,10 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
     return result;
 }
 
-tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
-                                          const QueryResult& query_result,
-                                          std::vector<Slice>& slices) {
+tl::expected<void, ErrorCode> Client::Get(
+    const std::string& object_key, const QueryResult& query_result,
+    std::vector<Slice>& slices,
+    const std::optional<ReplicateConfig>& config) {
     // Find the first complete replica
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
@@ -780,7 +784,13 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     auto t0_get = std::chrono::steady_clock::now();
-    err = TransferRead(replica, slices);
+    const ReplicateConfig* transfer_config = nullptr;
+    if (config.has_value()) {
+        transfer_config = &config.value();
+    } else if (query_result.transfer_config.has_value()) {
+        transfer_config = &query_result.transfer_config.value();
+    }
+    err = TransferRead(replica, slices, transfer_config);
 
     // Release the cache block after transfer completes (memcpy is done)
     if (hot_cache_ && cache_used) {
@@ -831,7 +841,8 @@ struct BatchGetOperation {
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
-    std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    std::unordered_map<std::string, std::vector<Slice>>& slices,
+    const std::optional<ReplicateConfig>& config) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.resize(object_keys.size());
 
@@ -880,8 +891,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
     }
     for (auto& seg_to_op : seg_to_op_map) {
         auto& op = seg_to_op.second;
+        const ReplicateConfig* transfer_config = nullptr;
+        if (config.has_value()) {
+            transfer_config = &config.value();
+        } else if (!op.key_indexes.empty()) {
+            const auto& query_result = query_results[op.key_indexes[0]];
+            if (query_result.transfer_config.has_value()) {
+                transfer_config = &query_result.transfer_config.value();
+            }
+        }
         auto future = transfer_submitter_->submit_batch(
-            op.replicas, op.batched_slices, TransferRequest::READ);
+            op.replicas, op.batched_slices, TransferRequest::READ,
+            transfer_config);
         if (!future) {
             for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
                 auto index = op.key_indexes[idx];
@@ -950,7 +971,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
-    bool prefer_alloc_in_same_node) {
+    bool prefer_alloc_in_same_node,
+    const std::optional<ReplicateConfig>& config) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -974,7 +996,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         return results;
     }
     if (prefer_alloc_in_same_node) {
-        return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
+        return BatchGetWhenPreferSameNode(object_keys, query_results, slices,
+                                          config);
     }
 
     // Collect all transfer operations for parallel execution
@@ -1022,8 +1045,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
 
         // Submit transfer operation asynchronously
+        const ReplicateConfig* transfer_config = nullptr;
+        if (config.has_value()) {
+            transfer_config = &config.value();
+        } else if (query_result.transfer_config.has_value()) {
+            transfer_config = &query_result.transfer_config.value();
+        }
         auto future = transfer_submitter_->submit(replica, slices_it->second,
-                                                  TransferRequest::READ);
+                                                  TransferRequest::READ,
+                                                  transfer_config);
         if (!future) {
             // Release cache block if submit failed
             if (hot_cache_ && cache_used) {
@@ -1178,7 +1208,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     for (const auto& replica : start_result.value()) {
         if (replica.is_memory_replica()) {
             // Transfer data using allocated handles from all replicas
-            ErrorCode transfer_err = TransferWrite(replica, slices);
+            ErrorCode transfer_err = TransferWrite(replica, slices, &client_cfg);
             if (transfer_err != ErrorCode::OK) {
                 // Revoke put operation
                 auto revoke_result =
@@ -1258,7 +1288,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     // Transfer to memory replicas
     for (const auto& replica : start_result.value()) {
         if (replica.is_memory_replica()) {
-            ErrorCode transfer_err = TransferWrite(replica, slices);
+            ErrorCode transfer_err = TransferWrite(replica, slices, &client_cfg);
             if (transfer_err != ErrorCode::OK) {
                 auto revoke_result =
                     master_client_.UpsertRevoke(key, ReplicaType::MEMORY);
@@ -1307,7 +1337,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     StartBatchUpsert(ops, client_cfg);
 
     auto t0 = std::chrono::steady_clock::now();
-    SubmitTransfers(ops);
+    SubmitTransfers(ops, client_cfg);
     WaitForTransfers(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
@@ -1488,7 +1518,8 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
     }
 }
 
-void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
+void Client::SubmitTransfers(std::vector<PutOperation>& ops,
+                             const ReplicateConfig& client_cfg) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         for (auto& op : ops) {
@@ -1533,7 +1564,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
             const auto& replica = op.replicas[replica_idx];
             if (replica.is_memory_replica()) {
                 auto submit_result = transfer_submitter_->submit(
-                    replica, op.slices, TransferRequest::WRITE);
+                    replica, op.slices, TransferRequest::WRITE, &client_cfg);
 
                 if (!submit_result) {
                     failure_context = "Failed to submit transfer for replica " +
@@ -1854,7 +1885,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
-    std::vector<PutOperation>& ops) {
+    std::vector<PutOperation>& ops, const ReplicateConfig& client_cfg) {
     auto t0 = std::chrono::steady_clock::now();
     std::unordered_map<std::string, PutOperation> seg_to_ops{};
     for (auto& op : ops) {
@@ -1895,7 +1926,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
         auto& merged_op = merged_ops.back();
         merged_op.replicas = op.replicas;
         auto submit_result = transfer_submitter_->submit_batch(
-            op.replicas, op.batched_slices, TransferRequest::WRITE);
+            op.replicas, op.batched_slices, TransferRequest::WRITE,
+            &client_cfg);
         if (!submit_result) {
             failure_context = "Failed to submit batch transfer";
             all_transfers_submitted = false;
@@ -1960,12 +1992,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
                 keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
         StartBatchPut(ops, client_cfg);
-        return BatchPutWhenPreferSameNode(ops);
+        return BatchPutWhenPreferSameNode(ops, client_cfg);
     }
     StartBatchPut(ops, client_cfg);
 
     auto t0 = std::chrono::steady_clock::now();
-    SubmitTransfers(ops);
+    SubmitTransfers(ops, client_cfg);
     WaitForTransfers(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
@@ -2306,7 +2338,7 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 
     // Transfer to each target
     for (const auto& target : targets) {
-        if (TransferWrite(target, slices) != ErrorCode::OK) {
+        if (TransferWrite(target, slices, nullptr) != ErrorCode::OK) {
             revoke_lambda();
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
@@ -2510,14 +2542,15 @@ void Client::PutToLocalFile(const std::string& key,
 
 ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices,
-                               TransferRequest::OpCode op_code) {
+                               TransferRequest::OpCode op_code,
+                               const ReplicateConfig* config) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return ErrorCode::INVALID_PARAMS;
     }
 
-    auto future =
-        transfer_submitter_->submit(replica_descriptor, slices, op_code);
+    auto future = transfer_submitter_->submit(replica_descriptor, slices,
+                                               op_code, config);
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
         return ErrorCode::TRANSFER_FAIL;
@@ -2529,12 +2562,15 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
 }
 
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
-                                std::vector<Slice>& slices) {
-    return TransferData(replica_descriptor, slices, TransferRequest::WRITE);
+                                std::vector<Slice>& slices,
+                                const ReplicateConfig* config) {
+    return TransferData(replica_descriptor, slices, TransferRequest::WRITE,
+                        config);
 }
 
 ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
-                               std::vector<Slice>& slices) {
+                               std::vector<Slice>& slices,
+                               const ReplicateConfig* config) {
     size_t total_size = 0;
     if (replica_descriptor.is_memory_replica()) {
         auto& mem_desc = replica_descriptor.get_memory_descriptor();
@@ -2551,7 +2587,8 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    return TransferData(replica_descriptor, slices, TransferRequest::READ);
+    return TransferData(replica_descriptor, slices, TransferRequest::READ,
+                        config);
 }
 
 void Client::PollAndDispatchTasks() {

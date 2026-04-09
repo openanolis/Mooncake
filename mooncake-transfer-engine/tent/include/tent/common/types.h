@@ -39,11 +39,24 @@ struct Notification {
 
 struct Request {
     enum OpCode { READ, WRITE };
+
+    struct QosContext {
+        std::string tenant_id{"default"};
+        std::string domain_id{"default"};
+        std::string object_set{"default"};
+        std::string sharing_scope{};
+        std::string qos_tier{"default"};
+        std::string logical_key{};
+        std::string canonical_key{};
+        uint32_t tenant_shares{1024};
+    };
+
     OpCode opcode;
     void* source;
     SegmentID target_id;
     uint64_t target_offset;
     size_t length;
+    QosContext qos_context{};
 };
 
 enum TransferStatusEnum {

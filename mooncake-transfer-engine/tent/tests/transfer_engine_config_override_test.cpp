@@ -351,6 +351,45 @@ TEST(TransferEngineConfigOverrideTest,
 }
 
 TEST(TransferEngineConfigOverrideTest,
+     QosConfigOverridesFromMcTentConfRemainAvailableDuringConstruction) {
+    TempConfigFile conf_file(R"({
+        "metadata_type": "p2p",
+        "metadata_servers": "127.0.0.1:2379",
+        "rpc_server_hostname": "127.0.0.1",
+        "rpc_server_port": 15013,
+        "qos": {
+          "enabled": true,
+          "default_tenant_id": "tenant-default",
+          "default_tenant_shares": 2048,
+          "tier_shares": {
+            "gold": 4096,
+            "silver": 1024
+          },
+          "scheduler": {
+            "type": "weighted_fair",
+            "dispatch_quantum_bytes": 32768,
+            "max_inflight_per_tenant": 16
+          }
+        }
+    })");
+    EnvVarGuard guard("MC_TENT_CONF", conf_file.path());
+
+    auto config = std::make_shared<Config>();
+    config->set("local_segment_name", "store-segment-qos");
+
+    TransferEngineImpl engine(config);
+
+    EXPECT_TRUE(config->get("qos/enabled", false));
+    EXPECT_EQ(config->get("qos/default_tenant_id", ""), "tenant-default");
+    EXPECT_EQ(config->get("qos/default_tenant_shares", 0u), 2048u);
+    EXPECT_EQ(config->get("qos/tier_shares/gold", 0u), 4096u);
+    EXPECT_EQ(config->get("qos/tier_shares/silver", 0u), 1024u);
+    EXPECT_EQ(config->get("qos/scheduler/type", ""), "weighted_fair");
+    EXPECT_EQ(config->get("qos/scheduler/dispatch_quantum_bytes", 0u), 32768u);
+    EXPECT_EQ(config->get("qos/scheduler/max_inflight_per_tenant", 0u), 16u);
+}
+
+TEST(TransferEngineConfigOverrideTest,
      InvalidExplicitStringPortFailsInsteadOfSilentlyOverridingMcTentConfValue) {
     TempConfigFile conf_file(R"({
         "metadata_type": "p2p",

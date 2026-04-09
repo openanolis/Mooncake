@@ -53,6 +53,14 @@ pub struct TransferRequest {
     pub target_id: i32,
     pub target_offset: u64,
     pub length: u64,
+    pub tenant_id: Option<String>,
+    pub domain_id: Option<String>,
+    pub object_set: Option<String>,
+    pub sharing_scope: Option<String>,
+    pub qos_tier: Option<String>,
+    pub logical_key: Option<String>,
+    pub canonical_key: Option<String>,
+    pub tenant_shares: u32,
 }
 
 pub struct BufferEntry {
@@ -180,14 +188,85 @@ impl TransferEngine {
         batch_id: BatchID,
         requests: &mut [TransferRequest],
     ) -> Result<()> {
+        let mut tenant_ids = Vec::with_capacity(requests.len());
+        let mut domain_ids = Vec::with_capacity(requests.len());
+        let mut object_sets = Vec::with_capacity(requests.len());
+        let mut sharing_scopes = Vec::with_capacity(requests.len());
+        let mut qos_tiers = Vec::with_capacity(requests.len());
+        let mut logical_keys = Vec::with_capacity(requests.len());
+        let mut canonical_keys = Vec::with_capacity(requests.len());
         let mut requests_c: Vec<bindings::transfer_request_t> = vec![];
         for i in 0..requests.len() {
+            tenant_ids.push(
+                requests[i]
+                    .tenant_id
+                    .as_ref()
+                    .map(|value| CString::new(value.as_str()))
+                    .transpose()
+                    .map_err(|_| anyhow!("CString::new failed"))?,
+            );
+            domain_ids.push(
+                requests[i]
+                    .domain_id
+                    .as_ref()
+                    .map(|value| CString::new(value.as_str()))
+                    .transpose()
+                    .map_err(|_| anyhow!("CString::new failed"))?,
+            );
+            object_sets.push(
+                requests[i]
+                    .object_set
+                    .as_ref()
+                    .map(|value| CString::new(value.as_str()))
+                    .transpose()
+                    .map_err(|_| anyhow!("CString::new failed"))?,
+            );
+            sharing_scopes.push(
+                requests[i]
+                    .sharing_scope
+                    .as_ref()
+                    .map(|value| CString::new(value.as_str()))
+                    .transpose()
+                    .map_err(|_| anyhow!("CString::new failed"))?,
+            );
+            qos_tiers.push(
+                requests[i]
+                    .qos_tier
+                    .as_ref()
+                    .map(|value| CString::new(value.as_str()))
+                    .transpose()
+                    .map_err(|_| anyhow!("CString::new failed"))?,
+            );
+            logical_keys.push(
+                requests[i]
+                    .logical_key
+                    .as_ref()
+                    .map(|value| CString::new(value.as_str()))
+                    .transpose()
+                    .map_err(|_| anyhow!("CString::new failed"))?,
+            );
+            canonical_keys.push(
+                requests[i]
+                    .canonical_key
+                    .as_ref()
+                    .map(|value| CString::new(value.as_str()))
+                    .transpose()
+                    .map_err(|_| anyhow!("CString::new failed"))?,
+            );
             requests_c.push(bindings::transfer_request_t {
                 opcode: requests[i].opcode as i32,
                 source: requests[i].source,
                 target_id: requests[i].target_id,
                 target_offset: requests[i].target_offset,
                 length: requests[i].length,
+                tenant_id: tenant_ids[i].as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+                domain_id: domain_ids[i].as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+                object_set: object_sets[i].as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+                sharing_scope: sharing_scopes[i].as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+                qos_tier: qos_tiers[i].as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+                logical_key: logical_keys[i].as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+                canonical_key: canonical_keys[i].as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+                tenant_shares: if requests[i].tenant_shares == 0 { 1024 } else { requests[i].tenant_shares },
             })
         }
         let ret = unsafe {

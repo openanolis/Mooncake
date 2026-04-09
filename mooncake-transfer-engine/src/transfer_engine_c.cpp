@@ -134,6 +134,29 @@ int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
         native_entries[index].target_id = entries[index].target_id;
         native_entries[index].target_offset = entries[index].target_offset;
         native_entries[index].length = entries[index].length;
+        if (entries[index].tenant_id) {
+            native_entries[index].qos_context.tenant_id = entries[index].tenant_id;
+        }
+        if (entries[index].domain_id) {
+            native_entries[index].qos_context.domain_id = entries[index].domain_id;
+        }
+        if (entries[index].object_set) {
+            native_entries[index].qos_context.object_set = entries[index].object_set;
+        }
+        if (entries[index].sharing_scope) {
+            native_entries[index].qos_context.sharing_scope = entries[index].sharing_scope;
+        }
+        if (entries[index].qos_tier) {
+            native_entries[index].qos_context.qos_tier = entries[index].qos_tier;
+        }
+        if (entries[index].logical_key) {
+            native_entries[index].qos_context.logical_key = entries[index].logical_key;
+        }
+        if (entries[index].canonical_key) {
+            native_entries[index].qos_context.canonical_key = entries[index].canonical_key;
+        }
+        native_entries[index].qos_context.tenant_shares =
+            entries[index].tenant_shares == 0 ? 1024 : entries[index].tenant_shares;
     }
     Status s =
         native->submitTransfer((Transport::BatchID)batch_id, native_entries);
@@ -153,6 +176,29 @@ int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
         native_entries[index].target_id = entries[index].target_id;
         native_entries[index].target_offset = entries[index].target_offset;
         native_entries[index].length = entries[index].length;
+        if (entries[index].tenant_id) {
+            native_entries[index].qos_context.tenant_id = entries[index].tenant_id;
+        }
+        if (entries[index].domain_id) {
+            native_entries[index].qos_context.domain_id = entries[index].domain_id;
+        }
+        if (entries[index].object_set) {
+            native_entries[index].qos_context.object_set = entries[index].object_set;
+        }
+        if (entries[index].sharing_scope) {
+            native_entries[index].qos_context.sharing_scope = entries[index].sharing_scope;
+        }
+        if (entries[index].qos_tier) {
+            native_entries[index].qos_context.qos_tier = entries[index].qos_tier;
+        }
+        if (entries[index].logical_key) {
+            native_entries[index].qos_context.logical_key = entries[index].logical_key;
+        }
+        if (entries[index].canonical_key) {
+            native_entries[index].qos_context.canonical_key = entries[index].canonical_key;
+        }
+        native_entries[index].qos_context.tenant_shares =
+            entries[index].tenant_shares == 0 ? 1024 : entries[index].tenant_shares;
     }
     TransferMetadata::NotifyDesc native_notify_msg;
     native_notify_msg.name = notify_msg.name;

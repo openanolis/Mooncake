@@ -14,20 +14,38 @@ target_link_libraries(metrics_config_loader_test PRIVATE tent_metrics tent_commo
 target_include_directories(metrics_config_loader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME metrics_config_loader_test COMMAND metrics_config_loader_test)
 
+function(link_tent_test target_name)
+    target_link_libraries(${target_name}
+                          PRIVATE tent
+                                  tent_runtime
+                                  tent_platform_all
+                                  tent_transport_all
+                                  tent_metrics
+                                  tent_common
+                                  tent_rpc
+                                  tent_interface
+                                  gtest
+                                  gtest_main)
+    if (TARGET asio_shared)
+        target_link_libraries(${target_name} PRIVATE asio_shared)
+    endif()
+endfunction()
+
 add_executable(request_merge_test request_merge_test.cpp)
-target_link_libraries(request_merge_test PRIVATE tent gtest gtest_main)
+link_tent_test(request_merge_test)
 target_include_directories(request_merge_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME request_merge_test COMMAND request_merge_test)
 
 add_executable(transfer_engine_config_override_test
                transfer_engine_config_override_test.cpp)
-target_link_libraries(transfer_engine_config_override_test
-                      PRIVATE tent gtest gtest_main)
-if (TARGET asio_shared)
-    target_link_libraries(transfer_engine_config_override_test
-                          PRIVATE asio_shared)
-endif()
+link_tent_test(transfer_engine_config_override_test)
 target_include_directories(transfer_engine_config_override_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME transfer_engine_config_override_test
          COMMAND transfer_engine_config_override_test)
+
+add_executable(qos_scheduler_test qos_scheduler_test.cpp)
+link_tent_test(qos_scheduler_test)
+target_include_directories(qos_scheduler_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME qos_scheduler_test COMMAND qos_scheduler_test)

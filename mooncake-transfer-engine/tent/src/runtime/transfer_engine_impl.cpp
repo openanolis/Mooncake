@@ -291,6 +291,9 @@ Status TransferEngineImpl::construct() {
     local_segment_name_ = conf_->get("local_segment_name", "");
     CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
     merge_requests_ = conf_->get("merge_requests", true);
+    CHECK_STATUS(LoadQosSchedulerConfig(*conf_, qos_scheduler_config_));
+    qos_scheduler_ =
+        std::make_unique<QosScheduler>(qos_scheduler_config_);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else
@@ -1053,12 +1056,18 @@ Status TransferEngineImpl::submitTransfer(
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
 
+    std::vector<Request> normalized_requests = request_list;
+    if (qos_scheduler_) {
+        qos_scheduler_->NormalizeRequests(normalized_requests);
+        normalized_requests = qos_scheduler_->OrderRequests(normalized_requests);
+    }
+
     std::vector<Request> classified_request_list[kSupportedTransportTypes];
     std::vector<size_t> task_id_list[kSupportedTransportTypes];
     std::unordered_map<size_t, TaskInfo> merged_task_id_map;
 
     size_t start_task_id = batch->task_list.size();
-    batch->task_list.insert(batch->task_list.end(), request_list.size(),
+    batch->task_list.insert(batch->task_list.end(), normalized_requests.size(),
                             TaskInfo{});
 
     // Record start time for metrics tracking
@@ -1066,10 +1075,10 @@ Status TransferEngineImpl::submitTransfer(
 
     auto merge_boundaries =
         merge_requests_
-            ? resolveRequestBoundaries(metadata_.get(), request_list)
+            ? resolveRequestBoundaries(metadata_.get(), normalized_requests)
             : std::vector<RequestBoundaryInfo>{};
     auto merged =
-        mergeRequests(request_list, merge_boundaries, merge_requests_);
+        mergeRequests(normalized_requests, merge_boundaries, merge_requests_);
     std::unordered_map<TransportType, size_t> next_sub_task_id;
     for (auto& kv : merged.task_lookup) {
         size_t task_id = start_task_id + kv.first;

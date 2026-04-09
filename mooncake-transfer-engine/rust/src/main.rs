@@ -129,6 +129,14 @@ fn initiator_worker(
                 target_id: segment_id,
                 target_offset: args.target_base + source_offset as u64,
                 length: args.block_size as u64,
+                tenant_id: None,
+                domain_id: None,
+                object_set: None,
+                sharing_scope: None,
+                qos_tier: None,
+                logical_key: None,
+                canonical_key: None,
+                tenant_shares: 1024,
             });
         }
 

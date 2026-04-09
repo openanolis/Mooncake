@@ -2,8 +2,10 @@
 
 #include <cassert>
 #include <cstdint>
+#include <map>
 #include <shared_mutex>
 #include <regex>
+#include <string_view>
 #include <unordered_set>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -70,6 +72,22 @@ int64_t CurrentTimeMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+int EvictionTierRank(std::string_view qos_tier) {
+    if (qos_tier.empty() || qos_tier == "default") {
+        return 1;
+    }
+    if (qos_tier == "background") {
+        return 0;
+    }
+    if (qos_tier == "interactive") {
+        return 2;
+    }
+    if (qos_tier == "latency_critical") {
+        return 3;
+    }
+    return 1;
 }
 
 }  // namespace
@@ -3572,10 +3590,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     struct EvictionCandidate {
         std::string key;
+        std::string tenant_id;
         std::chrono::system_clock::time_point lease_timeout;
     };
     using CandidateBuckets =
-        std::unordered_map<std::string, std::vector<EvictionCandidate>>;
+        std::map<int, std::unordered_map<std::string, std::vector<EvictionCandidate>>>;
 
     auto now = std::chrono::system_clock::now();
     long evicted_count = 0;
@@ -3617,25 +3636,28 @@ void MasterService::BatchEvict(double evict_ratio_target,
             }
             auto& bucket = metadata.IsSoftPinned(now) ? soft_pin_buckets
                                                       : no_pin_buckets;
-            bucket[metadata.tenant_id].push_back(
-                EvictionCandidate{key, metadata.lease_timeout});
+            bucket[EvictionTierRank(metadata.qos_tier)][metadata.tenant_id]
+                .push_back(EvictionCandidate{key, metadata.tenant_id,
+                                             metadata.lease_timeout});
         }
     }
 
-    for (auto& [_, candidates] : no_pin_buckets) {
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const EvictionCandidate& lhs,
-                     const EvictionCandidate& rhs) {
-                      return lhs.lease_timeout < rhs.lease_timeout;
-                  });
-    }
-    for (auto& [_, candidates] : soft_pin_buckets) {
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const EvictionCandidate& lhs,
-                     const EvictionCandidate& rhs) {
-                      return lhs.lease_timeout < rhs.lease_timeout;
-                  });
-    }
+    auto sort_bucket_candidates = [](CandidateBuckets& buckets) {
+        for (auto& [_, tenant_buckets] : buckets) {
+            for (auto& [tenant_id, candidates] : tenant_buckets) {
+                std::sort(candidates.begin(), candidates.end(),
+                          [](const EvictionCandidate& lhs,
+                             const EvictionCandidate& rhs) {
+                              if (lhs.lease_timeout != rhs.lease_timeout) {
+                                  return lhs.lease_timeout < rhs.lease_timeout;
+                              }
+                              return lhs.key < rhs.key;
+                          });
+            }
+        }
+    };
+    sort_bucket_candidates(no_pin_buckets);
+    sort_bucket_candidates(soft_pin_buckets);
 
     auto evict_from_buckets = [&](CandidateBuckets& buckets, long target_evict_num,
                                   bool require_no_soft_pin) {
@@ -3645,34 +3667,49 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         long evicted = 0;
         std::unordered_map<std::string, size_t> next_candidate_index;
+        auto bucket_index_key = [](int tier_rank, const std::string& tenant_id) {
+            return std::to_string(tier_rank) + "\n" + tenant_id;
+        };
         while (evicted < target_evict_num) {
+            int selected_tier = 0;
             std::optional<std::string> selected_tenant;
             uint64_t selected_pressure = 0;
             auto selected_timeout =
                 std::chrono::system_clock::time_point::max();
+            bool found_candidate = false;
 
-            for (const auto& [tenant_id, candidates] : buckets) {
-                const size_t idx = next_candidate_index[tenant_id];
-                if (idx >= candidates.size()) {
-                    continue;
+            for (const auto& [tier_rank, tenant_buckets] : buckets) {
+                for (const auto& [tenant_id, candidates] : tenant_buckets) {
+                    const auto next_index_key =
+                        bucket_index_key(tier_rank, tenant_id);
+                    const size_t idx = next_candidate_index[next_index_key];
+                    if (idx >= candidates.size()) {
+                        continue;
+                    }
+                    const uint64_t pressure = tenant_live_bytes[tenant_id];
+                    const auto timeout = candidates[idx].lease_timeout;
+                    const bool prefer_tenant =
+                        !found_candidate ||
+                        (enable_tenant_fair_eviction_
+                             ? (pressure > selected_pressure ||
+                                (pressure == selected_pressure &&
+                                 timeout < selected_timeout) ||
+                                (pressure == selected_pressure &&
+                                 timeout == selected_timeout &&
+                                 tenant_id < *selected_tenant))
+                             : (timeout < selected_timeout ||
+                                (timeout == selected_timeout &&
+                                 tenant_id < *selected_tenant)));
+                    if (prefer_tenant) {
+                        selected_tier = tier_rank;
+                        selected_tenant = tenant_id;
+                        selected_pressure = pressure;
+                        selected_timeout = timeout;
+                        found_candidate = true;
+                    }
                 }
-                const uint64_t pressure = tenant_live_bytes[tenant_id];
-                const auto timeout = candidates[idx].lease_timeout;
-                const bool prefer_tenant =
-                    enable_tenant_fair_eviction_
-                        ? (!selected_tenant || pressure > selected_pressure ||
-                           (pressure == selected_pressure &&
-                            timeout < selected_timeout) ||
-                           (pressure == selected_pressure &&
-                            timeout == selected_timeout &&
-                            tenant_id < *selected_tenant))
-                        : (!selected_tenant || timeout < selected_timeout ||
-                           (timeout == selected_timeout &&
-                            tenant_id < *selected_tenant));
-                if (prefer_tenant) {
-                    selected_tenant = tenant_id;
-                    selected_pressure = pressure;
-                    selected_timeout = timeout;
+                if (found_candidate) {
+                    break;
                 }
             }
 
@@ -3681,8 +3718,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
             }
 
             auto& tenant_id = *selected_tenant;
-            auto& candidates = buckets[tenant_id];
-            auto& idx = next_candidate_index[tenant_id];
+            auto& candidates = buckets[selected_tier][tenant_id];
+            auto& idx =
+                next_candidate_index[bucket_index_key(selected_tier, tenant_id)];
             const auto candidate = candidates[idx++];
 
             MetadataAccessorRW accessor(this, candidate.key);
@@ -3693,7 +3731,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto& metadata = accessor.Get();
             if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
                 !can_evict_replicas(metadata) ||
-                (require_no_soft_pin && metadata.IsSoftPinned(now))) {
+                (require_no_soft_pin && metadata.IsSoftPinned(now)) ||
+                EvictionTierRank(metadata.qos_tier) != selected_tier) {
                 continue;
             }
 
@@ -3721,8 +3760,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
         static_cast<long>(std::ceil(object_count * evict_ratio_target)),
         [&]() {
             long total = 0;
-            for (const auto& [_, candidates] : no_pin_buckets) {
-                total += candidates.size();
+            for (const auto& [_, tenant_buckets] : no_pin_buckets) {
+                for (const auto& [_, candidates] : tenant_buckets) {
+                    total += candidates.size();
+                }
             }
             return total;
         }());

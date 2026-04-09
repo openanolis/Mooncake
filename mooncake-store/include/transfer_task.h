@@ -16,6 +16,7 @@
 #include "transfer_engine.h"
 #include "types.h"
 #include "replica.h"
+#include "replica.h"
 #include "storage_backend.h"
 #include "client_metric.h"
 
@@ -381,14 +382,16 @@ class TransferSubmitter {
      * @return TransferFuture representing the async operation, or nullopt on
      * failure
      */
-    std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
-                                         std::vector<Slice>& slices,
-                                         TransferRequest::OpCode op_code);
+    std::optional<TransferFuture> submit(
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        TransferRequest::OpCode op_code,
+        const ReplicateConfig* config = nullptr);
 
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
-        TransferRequest::OpCode op_code);
+        TransferRequest::OpCode op_code,
+        const ReplicateConfig* config = nullptr);
 
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,
@@ -434,7 +437,8 @@ class TransferSubmitter {
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code);
+        const TransferRequest::OpCode op_code,
+        const ReplicateConfig* config = nullptr);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
@@ -448,6 +452,9 @@ class TransferSubmitter {
 
     std::optional<TransferFuture> submitTransfer(
         std::vector<TransferRequest>& requests);
+
+    static void PopulateRequestQosContext(TransferRequest& request,
+                                          const ReplicateConfig* config);
 };
 
 }  // namespace mooncake

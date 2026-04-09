@@ -37,6 +37,14 @@ struct transfer_request {
     segment_id_t target_id;
     uint64_t target_offset;
     uint64_t length;
+    const char *tenant_id;
+    const char *domain_id;
+    const char *object_set;
+    const char *sharing_scope;
+    const char *qos_tier;
+    const char *logical_key;
+    const char *canonical_key;
+    uint32_t tenant_shares;
 };
 
 typedef struct transfer_request transfer_request_t;

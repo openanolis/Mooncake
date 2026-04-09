@@ -31,6 +31,7 @@
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/common/concurrent/thread_local_storage.h"
+#include "tent/runtime/qos_scheduler.h"
 
 namespace mooncake {
 namespace tent {
@@ -222,6 +223,8 @@ class TransferEngineImpl {
 
     std::unique_ptr<ProxyManager> staging_proxy_;
     bool merge_requests_;
+    QosSchedulerConfig qos_scheduler_config_{};
+    std::unique_ptr<QosScheduler> qos_scheduler_;
 };
 }  // namespace tent
 }  // namespace mooncake

@@ -437,7 +437,7 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code, const ReplicateConfig* config) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -455,7 +455,8 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                 future = submitMemcpyOperation(handle, slices, op_code);
                 break;
             case TransferStrategy::TRANSFER_ENGINE:
-                future = submitTransferEngineOperation(handle, slices, op_code);
+                future = submitTransferEngineOperation(handle, slices, op_code,
+                                                       config);
                 break;
             default:
                 LOG(ERROR) << "Unknown transfer strategy: " << strategy;
@@ -476,7 +477,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
-    TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code, const ReplicateConfig* config) {
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
     for (size_t i = 0; i < replicas.size(); ++i) {
@@ -501,6 +502,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             request.target_id = seg;
             request.target_offset = handle.buffer_address_ + offset;
             request.length = slice.size;
+            PopulateRequestQosContext(request, config);
             requests.emplace_back(request);
             offset += slice.size;
         }
@@ -622,9 +624,26 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     return TransferFuture(state);
 }
 
+void TransferSubmitter::PopulateRequestQosContext(
+    TransferRequest& request, const ReplicateConfig* config) {
+    if (config == nullptr) {
+        request.qos_context.tenant_shares = 1024;
+        return;
+    }
+
+    request.qos_context.tenant_id = config->tenant_id;
+    request.qos_context.domain_id = config->domain_id;
+    request.qos_context.object_set = config->object_set;
+    request.qos_context.sharing_scope = config->sharing_scope;
+    request.qos_context.qos_tier = config->qos_tier;
+    request.qos_context.logical_key = config->logical_key;
+    request.qos_context.canonical_key = config->canonical_key;
+    request.qos_context.tenant_shares = 1024;
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code) {
+    const TransferRequest::OpCode op_code, const ReplicateConfig* config) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
@@ -654,6 +673,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         request.target_id = seg;
         request.target_offset = base_address + offset;
         request.length = slice.size;
+        PopulateRequestQosContext(request, config);
 
         offset += slice.size;
         requests.emplace_back(request);

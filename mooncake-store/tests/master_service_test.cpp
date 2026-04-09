@@ -3019,6 +3019,224 @@ TEST_F(MasterServiceTest, TenantFairEvictionPrefersLargerTenant) {
     service_->RemoveAll();
 }
 
+TEST_F(MasterServiceTest, QosTierEvictionPrefersLowerTierWithinUnpinnedObjects) {
+    const uint64_t kv_lease_ttl = 200;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_eviction_ratio(0.1)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 8;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "test_segment", buffer, segment_size);
+
+    auto put_object = [&](const std::string& key, const std::string& qos_tier,
+                          bool with_soft_pin = false) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-a";
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        config.qos_tier = qos_tier;
+        config.with_soft_pin = with_soft_pin;
+        ASSERT_TRUE(service_->PutStart(client_id, key, value_size, config)
+                        .has_value());
+        ASSERT_TRUE(service_->PutEnd(client_id, key, ReplicaType::MEMORY)
+                        .has_value());
+    };
+
+    put_object("background_old", "background");
+    put_object("latency_old", "latency_critical");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
+
+    for (int i = 0; i < 6; ++i) {
+        put_object("filler_" + std::to_string(i), "default");
+    }
+
+    int failed_puts = 0;
+    for (int i = 0; i < 4; ++i) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-b";
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        config.qos_tier = "default";
+        if (service_->PutStart(client_id, "trigger_" + std::to_string(i),
+                               value_size, config)
+                .has_value()) {
+            ASSERT_TRUE(service_->PutEnd(client_id,
+                                         "trigger_" + std::to_string(i),
+                                         ReplicaType::MEMORY)
+                            .has_value());
+        } else {
+            failed_puts++;
+        }
+    }
+    ASSERT_GT(failed_puts, 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 500));
+
+    auto background_exists = service_->ExistKey("background_old");
+    auto latency_exists = service_->ExistKey("latency_old");
+    ASSERT_TRUE(background_exists.has_value());
+    ASSERT_TRUE(latency_exists.has_value());
+    EXPECT_FALSE(background_exists.value());
+    EXPECT_TRUE(latency_exists.value());
+
+    service_->RemoveAll(true);
+}
+
+TEST_F(MasterServiceTest, UnknownQosTierFallsBackToDefaultRank) {
+    const uint64_t kv_lease_ttl = 200;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_eviction_ratio(0.1)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 8;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "test_segment", buffer, segment_size);
+
+    auto put_object = [&](const std::string& key, const std::string& qos_tier) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-a";
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        config.qos_tier = qos_tier;
+        ASSERT_TRUE(service_->PutStart(client_id, key, value_size, config)
+                        .has_value());
+        ASSERT_TRUE(service_->PutEnd(client_id, key, ReplicaType::MEMORY)
+                        .has_value());
+    };
+
+    put_object("default_old", "default");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    put_object("unknown_old", "mystery-tier");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
+
+    for (int i = 0; i < 6; ++i) {
+        put_object("filler_" + std::to_string(i), "default");
+    }
+
+    int failed_puts = 0;
+    for (int i = 0; i < 4; ++i) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-b";
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        config.qos_tier = "default";
+        if (service_->PutStart(client_id, "trigger_" + std::to_string(i),
+                               value_size, config)
+                .has_value()) {
+            ASSERT_TRUE(service_->PutEnd(client_id,
+                                         "trigger_" + std::to_string(i),
+                                         ReplicaType::MEMORY)
+                            .has_value());
+        } else {
+            failed_puts++;
+        }
+    }
+    ASSERT_GT(failed_puts, 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 500));
+
+    auto default_exists = service_->ExistKey("default_old");
+    auto unknown_exists = service_->ExistKey("unknown_old");
+    ASSERT_TRUE(default_exists.has_value());
+    ASSERT_TRUE(unknown_exists.has_value());
+    EXPECT_FALSE(default_exists.value());
+    EXPECT_TRUE(unknown_exists.value());
+
+    service_->RemoveAll(true);
+}
+
+TEST_F(MasterServiceTest, QosTierDoesNotBypassSoftPinProtectionBoundary) {
+    const uint64_t kv_lease_ttl = 200;
+    const uint64_t kv_soft_pin_ttl = 10000;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
+                              .set_allow_evict_soft_pinned_objects(true)
+                              .set_eviction_ratio(0.1)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 8;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "test_segment", buffer, segment_size);
+
+    auto put_object = [&](const std::string& key, const std::string& qos_tier,
+                          bool with_soft_pin = false) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-a";
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        config.qos_tier = qos_tier;
+        config.with_soft_pin = with_soft_pin;
+        ASSERT_TRUE(service_->PutStart(client_id, key, value_size, config)
+                        .has_value());
+        ASSERT_TRUE(service_->PutEnd(client_id, key, ReplicaType::MEMORY)
+                        .has_value());
+    };
+
+    put_object("soft_background_old", "background", true);
+    put_object("default_old", "default");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
+
+    for (int i = 0; i < 6; ++i) {
+        put_object("filler_" + std::to_string(i), "default");
+    }
+
+    int failed_puts = 0;
+    for (int i = 0; i < 4; ++i) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-b";
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        config.qos_tier = "default";
+        if (service_->PutStart(client_id, "trigger_" + std::to_string(i),
+                               value_size, config)
+                .has_value()) {
+            ASSERT_TRUE(service_->PutEnd(client_id,
+                                         "trigger_" + std::to_string(i),
+                                         ReplicaType::MEMORY)
+                            .has_value());
+        } else {
+            failed_puts++;
+        }
+    }
+    ASSERT_GT(failed_puts, 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 500));
+
+    auto soft_exists = service_->ExistKey("soft_background_old");
+    auto default_exists = service_->ExistKey("default_old");
+    ASSERT_TRUE(soft_exists.has_value());
+    ASSERT_TRUE(default_exists.has_value());
+    EXPECT_TRUE(soft_exists.value());
+    EXPECT_FALSE(default_exists.value());
+
+    service_->RemoveAll(true);
+}
+
 TEST_F(MasterServiceTest, ReplicaSegmentsAreUnique) {
     std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();

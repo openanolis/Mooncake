@@ -419,6 +419,14 @@ Status TransferEngine::submitTransfer(
             req.source = item.source;
             req.target_id = item.target_id;
             req.target_offset = item.target_offset;
+            req.qos_context.tenant_id = item.qos_context.tenant_id;
+            req.qos_context.domain_id = item.qos_context.domain_id;
+            req.qos_context.object_set = item.qos_context.object_set;
+            req.qos_context.sharing_scope = item.qos_context.sharing_scope;
+            req.qos_context.qos_tier = item.qos_context.qos_tier;
+            req.qos_context.logical_key = item.qos_context.logical_key;
+            req.qos_context.canonical_key = item.qos_context.canonical_key;
+            req.qos_context.tenant_shares = item.qos_context.tenant_shares;
             requests.push_back(req);
         }
         auto status = impl_tent_->submitTransfer(batch_id, requests);
@@ -443,6 +451,14 @@ Status TransferEngine::submitTransferWithNotify(
             req.source = item.source;
             req.target_id = item.target_id;
             req.target_offset = item.target_offset;
+            req.qos_context.tenant_id = item.qos_context.tenant_id;
+            req.qos_context.domain_id = item.qos_context.domain_id;
+            req.qos_context.object_set = item.qos_context.object_set;
+            req.qos_context.sharing_scope = item.qos_context.sharing_scope;
+            req.qos_context.qos_tier = item.qos_context.qos_tier;
+            req.qos_context.logical_key = item.qos_context.logical_key;
+            req.qos_context.canonical_key = item.qos_context.canonical_key;
+            req.qos_context.tenant_shares = item.qos_context.tenant_shares;
             requests.push_back(req);
         }
         mooncake::tent::Notification notifi;

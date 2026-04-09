@@ -39,11 +39,15 @@ class QueryResult {
     const std::vector<Replica::Descriptor> replicas;
     /** @brief Time point when the lease for this key expires */
     const std::chrono::steady_clock::time_point lease_timeout;
+    /** @brief Optional transfer QoS context for subsequent reads */
+    const std::optional<ReplicateConfig> transfer_config;
 
     QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
-                std::chrono::steady_clock::time_point lease_timeout_param)
+                std::chrono::steady_clock::time_point lease_timeout_param,
+                std::optional<ReplicateConfig> transfer_config_param = std::nullopt)
         : replicas(std::move(replicas_param)),
-          lease_timeout(lease_timeout_param) {}
+          lease_timeout(lease_timeout_param),
+          transfer_config(std::move(transfer_config_param)) {}
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
@@ -89,8 +93,9 @@ class Client {
      * @param slices Vector of slices to store the retrieved data
      * @return ErrorCode indicating success/failure
      */
-    tl::expected<void, ErrorCode> Get(const std::string& object_key,
-                                      std::vector<Slice>& slices);
+    tl::expected<void, ErrorCode> Get(
+        const std::string& object_key, std::vector<Slice>& slices,
+        const std::optional<ReplicateConfig>& config = std::nullopt);
 
     /**
      * @brief Batch retrieve data for multiple keys
@@ -99,7 +104,8 @@ class Client {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
-        std::unordered_map<std::string, std::vector<Slice>>& slices);
+        std::unordered_map<std::string, std::vector<Slice>>& slices,
+        const std::optional<ReplicateConfig>& config = std::nullopt);
 
     /**
      * @brief Batch query IP addresses for multiple client IDs.
@@ -162,9 +168,10 @@ class Client {
      * @param slices Vector of slices to store the data
      * @return ErrorCode indicating success/failure
      */
-    tl::expected<void, ErrorCode> Get(const std::string& object_key,
-                                      const QueryResult& query_result,
-                                      std::vector<Slice>& slices);
+    tl::expected<void, ErrorCode> Get(
+        const std::string& object_key, const QueryResult& query_result,
+        std::vector<Slice>& slices,
+        const std::optional<ReplicateConfig>& config = std::nullopt);
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
@@ -176,7 +183,8 @@ class Client {
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node = false);
+        bool prefer_same_node = false,
+        const std::optional<ReplicateConfig>& config = std::nullopt);
 
     /**
      * @brief Stores data with replication
@@ -530,11 +538,14 @@ class Client {
     void InitTransferSubmitter();
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
-                           TransferRequest::OpCode op_code);
+                           TransferRequest::OpCode op_code,
+                           const ReplicateConfig* config = nullptr);
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
-                            std::vector<Slice>& slices);
+                            std::vector<Slice>& slices,
+                            const ReplicateConfig* config = nullptr);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices);
+                           std::vector<Slice>& slices,
+                           const ReplicateConfig* config = nullptr);
 
     /**
      * @brief Prepare and use the storage backend for persisting data
@@ -609,7 +620,8 @@ class Client {
         const std::vector<std::vector<Slice>>& batched_slices);
     void StartBatchPut(std::vector<PutOperation>& ops,
                        const ReplicateConfig& config);
-    void SubmitTransfers(std::vector<PutOperation>& ops);
+    void SubmitTransfers(std::vector<PutOperation>& ops,
+                         const ReplicateConfig& config);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
@@ -619,11 +631,12 @@ class Client {
         const std::vector<PutOperation>& ops);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
-        std::vector<PutOperation>& ops);
+        std::vector<PutOperation>& ops, const ReplicateConfig& config);
     std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
-        std::unordered_map<std::string, std::vector<Slice>>& slices);
+        std::unordered_map<std::string, std::vector<Slice>>& slices,
+        const std::optional<ReplicateConfig>& config = std::nullopt);
 
     // Client identification
     const UUID client_id_;
