@@ -324,6 +324,86 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result2.error());
 }
 
+TEST_F(MasterServiceTest, QuotaAdmissionStillRejectsInvalidParamsFirst) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_admission_strategy_type(
+                                  AdmissionStrategyType::QUOTA)
+                              .set_admission_quota_bytes(1024)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 0;
+    auto put_result = service_->PutStart(client_id, "invalid_put", 1024, config);
+    ASSERT_FALSE(put_result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result.error());
+
+    config.replica_num = 1;
+    auto upsert_result = service_->UpsertStart(client_id, "invalid_upsert", 0,
+                                               config);
+    ASSERT_FALSE(upsert_result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, upsert_result.error());
+}
+
+TEST_F(MasterServiceTest, QuotaAdmissionRejectsPutAndIsolatesLabels) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_admission_strategy_type(
+                                  AdmissionStrategyType::QUOTA)
+                              .set_admission_quota_bytes(1024)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig tenant_a_config;
+    tenant_a_config.replica_num = 1;
+    tenant_a_config.tenant_id = "tenant-a";
+    tenant_a_config.domain_id = "domain-a";
+    tenant_a_config.object_set = "set-a";
+
+    auto put_a1 = service_->PutStart(client_id, "tenant_a_key_1", 1024,
+                                     tenant_a_config);
+    ASSERT_TRUE(put_a1.has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, "tenant_a_key_1", ReplicaType::MEMORY)
+            .has_value());
+
+    auto put_a2 = service_->PutStart(client_id, "tenant_a_key_2", 1,
+                                     tenant_a_config);
+    ASSERT_FALSE(put_a2.has_value());
+    EXPECT_EQ(ErrorCode::QUOTA_EXCEEDED, put_a2.error());
+
+    ReplicateConfig tenant_b_config = tenant_a_config;
+    tenant_b_config.tenant_id = "tenant-b";
+    auto put_b = service_->PutStart(client_id, "tenant_b_key_1", 1024,
+                                    tenant_b_config);
+    ASSERT_TRUE(put_b.has_value());
+}
+
+TEST_F(MasterServiceTest, QuotaAdmissionDoesNotMaskAllocatorExhaustion) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_admission_strategy_type(
+                                  AdmissionStrategyType::QUOTA)
+                              .set_admission_quota_bytes(64 * 1024 * 1024)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.tenant_id = "tenant-a";
+    config.domain_id = "domain-a";
+    config.object_set = "set-a";
+
+    auto put_result = service_->PutStart(client_id, "allocator_exhaustion",
+                                         32 * 1024 * 1024, config);
+    ASSERT_FALSE(put_result.has_value());
+    EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, put_result.error());
+}
+
 TEST_F(MasterServiceTest, PutStartEndFlow) {
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
@@ -4510,6 +4590,66 @@ TEST_F(MasterServiceTest, UpsertDifferentSize) {
     auto final_result = service_->GetReplicaList(key);
     ASSERT_TRUE(final_result.has_value());
     EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
+}
+
+TEST_F(MasterServiceTest, QuotaAdmissionBypassesSameSizeUpsert) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_admission_strategy_type(
+                                  AdmissionStrategyType::QUOTA)
+                              .set_admission_quota_bytes(2048)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.tenant_id = "tenant-upsert-same-size";
+    config.domain_id = "domain-upsert-same-size";
+    config.object_set = "set-upsert-same-size";
+
+    auto put_result = service_->PutStart(client_id, "same_size_upsert", 1024,
+                                         config);
+    ASSERT_TRUE(put_result.has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, "same_size_upsert", ReplicaType::MEMORY)
+            .has_value());
+
+    auto upsert_result =
+        service_->UpsertStart(client_id, "same_size_upsert", 1024, config);
+    ASSERT_TRUE(upsert_result.has_value());
+    ASSERT_TRUE(
+        service_->UpsertEnd(client_id, "same_size_upsert", ReplicaType::MEMORY)
+            .has_value());
+}
+
+TEST_F(MasterServiceTest, QuotaAdmissionRejectsDifferentSizeUpsert) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_admission_strategy_type(
+                                  AdmissionStrategyType::QUOTA)
+                              .set_admission_quota_bytes(2048)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.tenant_id = "tenant-upsert-diff-size";
+    config.domain_id = "domain-upsert-diff-size";
+    config.object_set = "set-upsert-diff-size";
+
+    auto put_result = service_->PutStart(client_id, "diff_size_upsert", 1024,
+                                         config);
+    ASSERT_TRUE(put_result.has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, "diff_size_upsert", ReplicaType::MEMORY)
+            .has_value());
+
+    auto upsert_result =
+        service_->UpsertStart(client_id, "diff_size_upsert", 2048, config);
+    ASSERT_FALSE(upsert_result.has_value());
+    EXPECT_EQ(ErrorCode::QUOTA_EXCEEDED, upsert_result.error());
 }
 
 TEST_F(MasterServiceTest, UpsertConflictReplicationTask) {

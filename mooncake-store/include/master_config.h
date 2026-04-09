@@ -40,6 +40,8 @@ struct MasterConfig {
     int64_t global_file_segment_size;
     std::string memory_allocator;
     std::string allocation_strategy;
+    std::string admission_strategy;
+    uint64_t admission_quota_bytes;
 
     // HTTP metadata server configuration
     bool enable_http_metadata_server;
@@ -115,6 +117,8 @@ class MasterServiceSupervisorConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    std::string admission_strategy = "noop";
+    uint64_t admission_quota_bytes = 0;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -183,6 +187,9 @@ class MasterServiceSupervisorConfig {
         } else {
             memory_allocator = BufferAllocatorType::OFFSET;
         }
+
+        admission_strategy = config.admission_strategy;
+        admission_quota_bytes = config.admission_quota_bytes;
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
@@ -279,6 +286,9 @@ class WrappedMasterServiceConfig {
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type =
         AllocationStrategyType::RANDOM;
+    AdmissionStrategyType admission_strategy_type =
+        AdmissionStrategyType::NOOP;
+    uint64_t admission_quota_bytes = 0;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -360,6 +370,20 @@ class WrappedMasterServiceConfig {
                             "(case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
+
+        if (config.admission_strategy == "quota") {
+            admission_strategy_type = AdmissionStrategyType::QUOTA;
+        } else if (config.admission_strategy.empty() ||
+                   config.admission_strategy == "noop") {
+            admission_strategy_type = AdmissionStrategyType::NOOP;
+        } else {
+            LOG(WARNING) << "Unrecognized admission_strategy value: '"
+                         << config.admission_strategy
+                         << "'. Defaulting to 'noop'. "
+                         << "Valid options are: noop, quota (case-sensitive)";
+            admission_strategy_type = AdmissionStrategyType::NOOP;
+        }
+        admission_quota_bytes = config.admission_quota_bytes;
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
@@ -469,6 +493,9 @@ class MasterServiceConfigBuilder {
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type_ =
         AllocationStrategyType::RANDOM;
+    AdmissionStrategyType admission_strategy_type_ =
+        AdmissionStrategyType::NOOP;
+    uint64_t admission_quota_bytes_ = 0;
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
@@ -586,6 +613,17 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_allocation_strategy_type(
         AllocationStrategyType type) {
         allocation_strategy_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_admission_strategy_type(
+        AdmissionStrategyType type) {
+        admission_strategy_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_admission_quota_bytes(uint64_t bytes) {
+        admission_quota_bytes_ = bytes;
         return *this;
     }
 
@@ -757,6 +795,9 @@ class MasterServiceConfig {
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type =
         AllocationStrategyType::RANDOM;
+    AdmissionStrategyType admission_strategy_type =
+        AdmissionStrategyType::NOOP;
+    uint64_t admission_quota_bytes = 0;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -809,6 +850,8 @@ class MasterServiceConfig {
         memory_allocator =
             config.enable_cxl ? cxl_allocator_type : config.memory_allocator;
         allocation_strategy_type = config.allocation_strategy_type;
+        admission_strategy_type = config.admission_strategy_type;
+        admission_quota_bytes = config.admission_quota_bytes;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -865,6 +908,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.global_file_segment_size = global_file_segment_size_;
     config.memory_allocator = memory_allocator_;
     config.allocation_strategy_type = allocation_strategy_type_;
+    config.admission_strategy_type = admission_strategy_type_;
+    config.admission_quota_bytes = admission_quota_bytes_;
     config.put_start_discard_timeout_sec = put_start_discard_timeout_sec_;
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;

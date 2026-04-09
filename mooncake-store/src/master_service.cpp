@@ -176,6 +176,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(
           CreateAllocationStrategy(config.allocation_strategy_type)),
+      admission_controller_(CreateAdmissionController(
+          config.admission_strategy_type, config.admission_quota_bytes)),
       enable_snapshot_restore_(config.enable_snapshot_restore),
       enable_snapshot_(config.enable_snapshot),
       snapshot_backup_dir_(config.snapshot_backup_dir),
@@ -842,6 +844,35 @@ auto MasterService::GetReplicaList(const std::string& key)
                                   default_kv_lease_ttl_);
 }
 
+AdmissionRequestContext MasterService::BuildAdmissionRequestContext(
+    AdmissionRequestContext::Operation operation, const std::string& key,
+    uint64_t value_length, const ReplicateConfig& config) const {
+    std::string logical_key = config.logical_key.empty() ? key : config.logical_key;
+    std::string canonical_key =
+        config.canonical_key.empty()
+            ? BuildCanonicalObjectKey(config.tenant_id, config.domain_id,
+                                      config.object_set, logical_key)
+            : config.canonical_key;
+    return AdmissionRequestContext{operation,
+                                   key,
+                                   value_length,
+                                   config.replica_num,
+                                   config.tenant_id,
+                                   config.domain_id,
+                                   config.object_set,
+                                   config.sharing_scope,
+                                   config.qos_tier,
+                                   std::move(logical_key),
+                                   std::move(canonical_key)};
+}
+
+tl::expected<void, ErrorCode> MasterService::AdmitWrite(
+    AdmissionRequestContext::Operation operation, const std::string& key,
+    uint64_t value_length, const ReplicateConfig& config) const {
+    return admission_controller_->Admit(
+        BuildAdmissionRequestContext(operation, key, value_length, config));
+}
+
 auto MasterService::AllocateAndInsertMetadata(
     MetadataShardAccessorRW& shard, const UUID& client_id,
     const std::string& key, uint64_t value_length,
@@ -959,6 +990,13 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             LOG(INFO) << "key=" << key << ", info=object_already_exists";
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
+    }
+
+    auto admission_result =
+        AdmitWrite(AdmissionRequestContext::Operation::PUT_START, key,
+                   slice_length, config);
+    if (!admission_result.has_value()) {
+        return tl::make_unexpected(admission_result.error());
     }
 
     return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
@@ -1241,6 +1279,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     // --- Case A: key does not exist (or was erased above) ---
     // Allocate fresh buffers, identical to PutStart.
     if (it == shard->metadata.end()) {
+        auto admission_result =
+            AdmitWrite(AdmissionRequestContext::Operation::UPSERT_START, key,
+                       slice_length, config);
+        if (!admission_result.has_value()) {
+            return tl::make_unexpected(admission_result.error());
+        }
         VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
         return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
                                          config, now);
@@ -1311,6 +1355,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         merged_config.with_hard_pin || metadata.IsHardPinned();
     merged_config.with_soft_pin =
         merged_config.with_soft_pin || metadata.IsSoftPinned();
+
+    auto admission_result =
+        AdmitWrite(AdmissionRequestContext::Operation::UPSERT_START, key,
+                   slice_length, merged_config);
+    if (!admission_result.has_value()) {
+        return tl::make_unexpected(admission_result.error());
+    }
 
     auto old_replicas = metadata.PopReplicas();
     if (!old_replicas.empty()) {

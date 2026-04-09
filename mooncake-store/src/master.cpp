@@ -135,6 +135,10 @@ DEFINE_string(memory_allocator, "offset",
 DEFINE_string(
     allocation_strategy, "random",
     "Allocation strategy for segments, random | free_ratio_first | cxl");
+DEFINE_string(admission_strategy, "noop",
+              "Admission strategy for writes, noop | quota");
+DEFINE_uint64(admission_quota_bytes, 0,
+              "Admission quota in bytes for quota strategy (0 = disabled)");
 DEFINE_bool(enable_http_metadata_server, false,
             "Enable HTTP metadata server instead of etcd");
 DEFINE_int32(http_metadata_server_port, 8080,
@@ -313,6 +317,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("allocation_strategy",
                              &master_config.allocation_strategy,
                              FLAGS_allocation_strategy);
+    default_config.GetString("admission_strategy",
+                             &master_config.admission_strategy,
+                             FLAGS_admission_strategy);
+    default_config.GetUInt64("admission_quota_bytes",
+                             &master_config.admission_quota_bytes,
+                             FLAGS_admission_quota_bytes);
     default_config.GetBool("enable_http_metadata_server",
                            &master_config.enable_http_metadata_server,
                            FLAGS_enable_http_metadata_server);
@@ -578,6 +588,16 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.allocation_strategy = FLAGS_allocation_strategy;
+    }
+    if ((google::GetCommandLineFlagInfo("admission_strategy", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.admission_strategy = FLAGS_admission_strategy;
+    }
+    if ((google::GetCommandLineFlagInfo("admission_quota_bytes", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.admission_quota_bytes = FLAGS_admission_quota_bytes;
     }
     if ((google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
          !info.is_default) ||
@@ -884,6 +904,9 @@ int main(int argc, char* argv[]) {
         << ", global_file_segment_size="
         << master_config.global_file_segment_size
         << ", memory_allocator=" << master_config.memory_allocator
+        << ", allocation_strategy=" << master_config.allocation_strategy
+        << ", admission_strategy=" << master_config.admission_strategy
+        << ", admission_quota_bytes=" << master_config.admission_quota_bytes
         << ", enable_http_metadata_server="
         << master_config.enable_http_metadata_server
         << ", http_metadata_server_port="

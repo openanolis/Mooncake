@@ -19,6 +19,7 @@
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include "admission_controller.h"
 #include "allocation_strategy.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
@@ -904,6 +905,14 @@ class MasterService {
     // Helper to clean up stale handles pointing to unmounted segments
     bool CleanupStaleHandles(ObjectMetadata& metadata);
 
+    AdmissionRequestContext BuildAdmissionRequestContext(
+        AdmissionRequestContext::Operation operation, const std::string& key,
+        uint64_t value_length, const ReplicateConfig& config) const;
+
+    tl::expected<void, ErrorCode> AdmitWrite(
+        AdmissionRequestContext::Operation operation, const std::string& key,
+        uint64_t value_length, const ReplicateConfig& config) const;
+
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
     auto AllocateAndInsertMetadata(
@@ -1191,6 +1200,7 @@ class MasterService {
     SegmentManager segment_manager_;
     BufferAllocatorType memory_allocator_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    std::shared_ptr<AdmissionController> admission_controller_;
 
     bool enable_snapshot_restore_ = false;
 
