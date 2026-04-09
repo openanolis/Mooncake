@@ -331,6 +331,19 @@ void loadGlobalConfig(GlobalConfig &config) {
         }
     }
 
+    const char *transport_isolation_strategy_env =
+        std::getenv("MC_TRANSPORT_ISOLATION_STRATEGY");
+    if (transport_isolation_strategy_env) {
+        if (strcmp(transport_isolation_strategy_env, "DEFAULT") == 0) {
+            config.transport_isolation_strategy_type =
+                TransportIsolationStrategyType::DEFAULT;
+        } else {
+            LOG(WARNING)
+                << "Ignore value from environment variable "
+                << "MC_TRANSPORT_ISOLATION_STRATEGY, it should be DEFAULT";
+        }
+    }
+
     const char *traffic_class_env = std::getenv("MC_IB_TC");
     if (traffic_class_env) {
         try {

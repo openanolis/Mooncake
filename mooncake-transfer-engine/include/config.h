@@ -30,6 +30,10 @@ enum class EndpointStoreType {
     SIEVE = 1,
 };
 
+enum class TransportIsolationStrategyType {
+    DEFAULT = 0,
+};
+
 struct GlobalConfig {
     size_t num_cq_per_ctx = 1;
     size_t num_comp_channels_per_ctx = 1;
@@ -60,6 +64,8 @@ struct GlobalConfig {
     int parallel_reg_mr = -1;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
+    TransportIsolationStrategyType transport_isolation_strategy_type =
+        TransportIsolationStrategyType::DEFAULT;
     int ib_traffic_class = -1;
     // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
     int ib_pci_relaxed_ordering_mode = 0;

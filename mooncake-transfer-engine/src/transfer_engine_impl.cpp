@@ -30,6 +30,7 @@
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 #include "transport/barex_transport/barex_transport.h"
+#include "transport_isolation_strategy.h"
 
 namespace mooncake {
 
@@ -183,11 +184,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #ifdef USE_ASCEND
     std::string mutable_server_name =
         local_server_name_ + ":npu_" + std::to_string(devicePhyId);
-    multi_transports_ =
-        std::make_shared<MultiTransport>(metadata_, mutable_server_name);
+    multi_transports_ = std::make_shared<MultiTransport>(
+        metadata_, mutable_server_name,
+        CreateTransportIsolationStrategy(
+            globalConfig().transport_isolation_strategy_type));
 #else
-    multi_transports_ =
-        std::make_shared<MultiTransport>(metadata_, local_server_name_);
+    multi_transports_ = std::make_shared<MultiTransport>(
+        metadata_, local_server_name_,
+        CreateTransportIsolationStrategy(
+            globalConfig().transport_isolation_strategy_type));
 #endif
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;

@@ -79,6 +79,10 @@ add_executable(topology_test ${WORKSPACE}/topology_test.cpp)
 target_link_libraries(topology_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME topology_test COMMAND topology_test)
 
+add_executable(transport_isolation_strategy_test ${WORKSPACE}/transport_isolation_strategy_test.cpp)
+target_link_libraries(transport_isolation_strategy_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME transport_isolation_strategy_test COMMAND transport_isolation_strategy_test)
+
 add_executable(memory_location_test ${WORKSPACE}/memory_location_test.cpp)
 target_link_libraries(memory_location_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME memory_location_test COMMAND memory_location_test)

@@ -62,9 +62,12 @@
 #include <cassert>
 
 namespace mooncake {
-MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
-                               std::string &local_server_name)
-    : metadata_(metadata), local_server_name_(local_server_name) {}
+MultiTransport::MultiTransport(
+    std::shared_ptr<TransferMetadata> metadata, std::string &local_server_name,
+    std::unique_ptr<TransportIsolationStrategy> isolation_strategy)
+    : metadata_(metadata),
+      local_server_name_(local_server_name),
+      isolation_strategy_(std::move(isolation_strategy)) {}
 
 MultiTransport::~MultiTransport() {}
 
@@ -355,20 +358,16 @@ Status MultiTransport::selectTransport(const TransferRequest &entry,
         return Status::InvalidArgument("Invalid target segment ID " +
                                        std::to_string(entry.target_id));
     }
-    auto proto = target_segment_desc->protocol;
-#ifdef USE_ASCEND_HETEROGENEOUS
-    // When USE_ASCEND_HETEROGENEOUS is enabled:
-    // - Target side directly reuses RDMA Transport
-    // - Initiator side uses heterogeneous_rdma_transport
-    if (target_segment_desc->protocol == "rdma") {
-        proto = "ascend";
+
+    TransportSelectionContext context{entry, *target_segment_desc,
+                                      transport_map_};
+    std::string protocol;
+    auto status = isolation_strategy_->selectProtocol(context, protocol);
+    if (!status.ok()) {
+        return status;
     }
-#endif
-    if (!transport_map_.count(proto)) {
-        return Status::NotSupportedTransport("Transport " + proto +
-                                             " not installed");
-    }
-    transport = transport_map_[proto].get();
+
+    transport = transport_map_.at(protocol).get();
     return Status::OK();
 }
 

@@ -15,9 +15,12 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <map>
+#include <memory>
 #include <unordered_map>
 
 #include "transport/transport.h"
+#include "transport_isolation_strategy.h"
 
 namespace mooncake {
 class MultiTransport {
@@ -28,7 +31,10 @@ class MultiTransport {
     using BatchDesc = Transport::BatchDesc;
 
     MultiTransport(std::shared_ptr<TransferMetadata> metadata,
-                   std::string &local_server_name);
+                   std::string &local_server_name,
+                   std::unique_ptr<TransportIsolationStrategy>
+                       isolation_strategy =
+                           std::make_unique<DefaultTransportIsolationStrategy>());
 
     ~MultiTransport();
 
@@ -59,6 +65,7 @@ class MultiTransport {
    private:
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
+    std::unique_ptr<TransportIsolationStrategy> isolation_strategy_;
     std::map<std::string, std::shared_ptr<Transport>> transport_map_;
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
