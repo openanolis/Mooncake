@@ -59,6 +59,8 @@ class WrappedMasterService {
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys);
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListByObject(const std::vector<LogicalObjectId>& object_ids);
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
@@ -174,16 +176,17 @@ class WrappedMasterService {
         const std::vector<StorageObjectMetadata>& metadatas);
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
-    tl::expected<UUID, ErrorCode> CreateCopyTask(
+    tl::expected<UUID, ErrorCode> CreateCopyTaskByObject(
         const LogicalObjectId& object_id,
         const std::vector<std::string>& targets);
 
     tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
                                                  const std::string& source,
                                                  const std::string& target);
-    tl::expected<UUID, ErrorCode> CreateMoveTask(const LogicalObjectId& object_id,
-                                                 const std::string& source,
-                                                 const std::string& target);
+    tl::expected<UUID, ErrorCode> CreateMoveTaskByObject(
+        const LogicalObjectId& object_id,
+        const std::string& source,
+        const std::string& target);
 
     tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
 

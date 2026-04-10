@@ -139,6 +139,8 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys);
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListByObject(const std::vector<LogicalObjectId>& object_ids);
 
     /**
      * @brief Starts a put operation

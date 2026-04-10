@@ -147,6 +147,8 @@ class Client {
      */
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys);
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQueryObject(
+        const std::vector<LogicalObjectId>& object_ids);
 
     /**
      * @brief Batch clear KV cache for specified object keys on a specific

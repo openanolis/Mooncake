@@ -353,7 +353,7 @@ sequenceDiagram
 - oplog apply now preserves `legacy_raw_key` when materializing standby metadata
 - namespace-native RPC and client entrypoints now expose `ExistObject`, `GetReplicaListByObject`, `PutObjectStart/PutObjectEnd/PutObjectRevoke`, `CopyObjectStart/CopyObjectEnd/CopyObjectRevoke`, `MoveObjectStart/MoveObjectEnd/MoveObjectRevoke`, `RemoveObject`, and object-identity `CreateCopyTask/CreateMoveTask`
 - admin/list/regex/remove metadata views now match on `logical_key`, while legacy raw-key alias lookup remains available for compatibility
-- admin HTTP surfaces now expose `/query_object` and `/get_all_objects` for namespace-first inspection
+- admin HTTP surfaces now expose `/query_object`, `/get_all_objects`, and `/batch_query_objects` for namespace-first inspection, and the batch object endpoint now routes through a namespace-native batch metadata path instead of per-object compatibility lookups
 - task execution now prefers `LogicalObjectId` from replicated task payloads and only falls back to legacy raw keys for backward compatibility
 - `processing_keys`, `replication_tasks`, and `offloading_tasks` now track `LogicalObjectId` instead of raw keys, so cleanup, replication, and offload lifecycle paths no longer depend on raw-key-primary bookkeeping
 
@@ -368,8 +368,8 @@ sequenceDiagram
 
 ### Compatibility boundary
 
-- legacy raw-key task/admin entrypoints are still retained as compatibility aliases during migration
-- admin and task flows now have namespace-first entrypoints, so new callers no longer need raw-key-primary routing
+- legacy raw-key task/admin entrypoints are retained only as compatibility aliases during migration
+- py/dummy/real admin-style replica inspection and async task creation now also expose object-identity entrypoints, including batch object-id inspection, so new callers no longer need raw-key-primary routing
 
 ## File Scope
 

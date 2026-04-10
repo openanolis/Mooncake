@@ -1092,6 +1092,17 @@ auto MasterService::GetReplicaListByObject(const LogicalObjectId& object_id)
                                   default_kv_lease_ttl_);
 }
 
+auto MasterService::BatchGetReplicaListByObject(
+    const std::vector<LogicalObjectId>& object_ids)
+    -> std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> {
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
+    results.reserve(object_ids.size());
+    for (const auto& object_id : object_ids) {
+        results.emplace_back(GetReplicaListByObject(object_id));
+    }
+    return results;
+}
+
 auto MasterService::ExistObject(const LogicalObjectId& object_id)
     -> tl::expected<bool, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);

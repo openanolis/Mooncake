@@ -245,8 +245,12 @@ class PyClient {
 
     virtual std::map<std::string, std::vector<Replica::Descriptor>>
     batch_get_replica_desc(const std::vector<std::string> &keys) = 0;
+    virtual std::map<LogicalObjectId, std::vector<Replica::Descriptor>>
+    batch_get_replica_desc(const std::vector<LogicalObjectId> &object_ids) = 0;
     virtual std::vector<Replica::Descriptor> get_replica_desc(
         const std::string &key) = 0;
+    virtual std::vector<Replica::Descriptor> get_replica_desc(
+        const LogicalObjectId &object_id) = 0;
 
     virtual int tearDownAll() = 0;
 

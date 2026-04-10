@@ -147,6 +147,12 @@ struct LogicalObjectId {
                logical_key == other.logical_key;
     }
 
+    bool operator<(const LogicalObjectId& other) const {
+        return std::tie(tenant_id, domain_id, object_set, logical_key) <
+               std::tie(other.tenant_id, other.domain_id, other.object_set,
+                        other.logical_key);
+    }
+
     friend std::ostream& operator<<(std::ostream& os,
                                     const LogicalObjectId& id) noexcept {
         return os << "LogicalObjectId: { tenant_id: " << id.tenant_id

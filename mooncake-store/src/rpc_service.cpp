@@ -65,6 +65,20 @@ std::string AppendMetricSections(std::string primary, std::string secondary) {
     return primary;
 }
 
+std::vector<std::string> SplitCommaSeparated(std::string_view input) {
+    std::vector<std::string> parts;
+    if (input.empty()) {
+        return parts;
+    }
+
+    std::string item;
+    std::istringstream iss{std::string(input)};
+    while (std::getline(iss, item, ',')) {
+        parts.push_back(std::move(item));
+    }
+    return parts;
+}
+
 void SetServiceUnavailable(coro_http::coro_http_response& resp,
                            std::string_view message) {
     resp.add_header("Content-Type", "text/plain; version=0.0.4");
@@ -455,16 +469,7 @@ void MasterAdminServer::InitHttpServer() {
                 return;
             }
 
-            auto keys_view = req.get_query_value("keys");
-            std::vector<std::string> keys;
-            if (!keys_view.empty()) {
-                std::string keys_str(keys_view);
-                std::string key;
-                std::istringstream iss(keys_str);
-                while (std::getline(iss, key, ',')) {
-                    keys.push_back(std::move(key));
-                }
-            }
+            auto keys = SplitCommaSeparated(req.get_query_value("keys"));
 
             resp.add_header("Content-Type", "application/json; charset=utf-8");
             if (keys.empty()) {
@@ -522,6 +527,109 @@ void MasterAdminServer::InitHttpServer() {
                 LOG(WARNING)
                     << "BatchGetReplicaList size mismatch: keys=" << keys.size()
                     << " results=" << results.size();
+            }
+            resp.set_status_and_content(status_type::ok, std::move(body));
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/batch_query_objects",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            auto service = GetActiveService();
+            if (!service) {
+                resp.add_header("Content-Type",
+                                "application/json; charset=utf-8");
+                resp.set_status_and_content(
+                    status_type::service_unavailable,
+                    "{\"success\":false,\"error\":\"service plane is not "
+                    "active\"}");
+                return;
+            }
+
+            auto tenant_ids = SplitCommaSeparated(req.get_query_value("tenant_ids"));
+            auto domain_ids = SplitCommaSeparated(req.get_query_value("domain_ids"));
+            auto object_sets = SplitCommaSeparated(req.get_query_value("object_sets"));
+            auto logical_keys =
+                SplitCommaSeparated(req.get_query_value("logical_keys"));
+
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
+            if (tenant_ids.empty() || domain_ids.empty() || object_sets.empty() ||
+                logical_keys.empty()) {
+                resp.set_status_and_content(
+                    status_type::bad_request,
+                    "{\"success\":false,\"error\":\"Provide matching comma-separated tenant_ids, domain_ids, object_sets, and logical_keys\"}");
+                return;
+            }
+            if (tenant_ids.size() != domain_ids.size() ||
+                tenant_ids.size() != object_sets.size() ||
+                tenant_ids.size() != logical_keys.size()) {
+                resp.set_status_and_content(
+                    status_type::bad_request,
+                    "{\"success\":false,\"error\":\"tenant_ids, domain_ids, object_sets, and logical_keys must have the same number of items\"}");
+                return;
+            }
+
+            std::vector<LogicalObjectId> object_ids;
+            object_ids.reserve(tenant_ids.size());
+            for (size_t i = 0; i < tenant_ids.size(); ++i) {
+                object_ids.push_back(LogicalObjectId{
+                    .tenant_id = std::move(tenant_ids[i]),
+                    .domain_id = std::move(domain_ids[i]),
+                    .object_set = std::move(object_sets[i]),
+                    .logical_key = std::move(logical_keys[i]),
+                });
+            }
+
+            auto results = service->BatchGetReplicaListByObject(object_ids);
+            const size_t n = std::min(object_ids.size(), results.size());
+
+            std::string body;
+            body.reserve(n * 768);
+            body += "{\"success\":true,\"data\":[";
+
+            for (size_t i = 0; i < n; ++i) {
+                if (i > 0) {
+                    body += ",";
+                }
+
+                body += "{\"object_id\":";
+                std::string object_json;
+                struct_json::to_json(object_ids[i], object_json);
+                body += object_json;
+                body += ",\"result\":";
+
+                if (!results[i].has_value()) {
+                    body += "{\"ok\":false,\"error\":\"";
+                    body += EscapeJson(toString(results[i].error()));
+                    body += "\"}";
+                    body += "}";
+                    continue;
+                }
+
+                body += "{\"ok\":true,\"values\":[";
+                bool first = true;
+                for (const auto& replica : results[i].value().replicas) {
+                    if (!replica.is_memory_replica()) {
+                        continue;
+                    }
+
+                    std::string tmp;
+                    struct_json::to_json(
+                        replica.get_memory_descriptor().buffer_descriptor, tmp);
+                    if (!first) {
+                        body += ",";
+                    }
+                    body += tmp;
+                    first = false;
+                }
+                body += "]}";
+                body += "}";
+            }
+
+            body += "]}";
+            if (results.size() != object_ids.size()) {
+                LOG(WARNING) << "BatchGetReplicaListByObject size mismatch: objects="
+                             << object_ids.size()
+                             << " results=" << results.size();
             }
             resp.set_status_and_content(status_type::ok, std::move(body));
         });
@@ -735,6 +843,49 @@ WrappedMasterService::BatchGetReplicaList(
     }
 
     if (failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_get_replica_list_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance()
+            .inc_batch_get_replica_list_partial_success(failure_count);
+    }
+
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+WrappedMasterService::BatchGetReplicaListByObject(
+    const std::vector<LogicalObjectId>& object_ids) {
+    ScopedVLogTimer timer(1, "BatchGetReplicaListByObject");
+    const size_t total_objects = object_ids.size();
+    timer.LogRequest("object_count=", total_objects);
+    MasterMetricManager::instance().inc_batch_get_replica_list_requests(
+        total_objects);
+
+    auto results = master_service_.BatchGetReplicaListByObject(object_ids);
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            failure_count++;
+            auto error = results[i].error();
+            if (error == ErrorCode::OBJECT_NOT_FOUND ||
+                error == ErrorCode::REPLICA_IS_NOT_READY) {
+                VLOG(1) << "BatchGetReplicaListByObject failed for object["
+                        << i << "] '" << object_ids[i]
+                        << "': " << toString(error);
+            } else {
+                LOG(ERROR) << "BatchGetReplicaListByObject failed for object["
+                           << i << "] '" << object_ids[i]
+                           << "': " << toString(error);
+            }
+        }
+    }
+
+    if (failure_count == total_objects) {
         MasterMetricManager::instance().inc_batch_get_replica_list_failures(
             failure_count);
     } else if (failure_count != 0) {
@@ -1474,11 +1625,11 @@ tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
         });
 }
 
-tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
+tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTaskByObject(
     const LogicalObjectId& object_id,
     const std::vector<std::string>& targets) {
     return execute_rpc(
-        "CreateCopyTask",
+        "CreateCopyTaskByObject",
         [&] { return master_service_.CreateCopyTask(object_id, targets); },
         [&](auto& timer) {
             timer.LogRequest("object_id=", object_id,
@@ -1506,11 +1657,11 @@ tl::expected<UUID, ErrorCode> WrappedMasterService::CreateMoveTask(
         });
 }
 
-tl::expected<UUID, ErrorCode> WrappedMasterService::CreateMoveTask(
+tl::expected<UUID, ErrorCode> WrappedMasterService::CreateMoveTaskByObject(
     const LogicalObjectId& object_id, const std::string& source,
     const std::string& target) {
     return execute_rpc(
-        "CreateMoveTask",
+        "CreateMoveTaskByObject",
         [&] { return master_service_.CreateMoveTask(object_id, source, target); },
         [&](auto& timer) {
             timer.LogRequest("object_id=", object_id, ", source=", source,
@@ -1672,6 +1823,9 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
             &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchGetReplicaListByObject>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutObjectStart>(
@@ -1773,10 +1927,7 @@ void RegisterRpcService(
             &mooncake::WrappedMasterService::CreateCopyTask)>(
         &wrapped_master_service);
     server.register_handler<
-        static_cast<tl::expected<UUID, ErrorCode> (
-            mooncake::WrappedMasterService::*)(const LogicalObjectId&,
-                                               const std::vector<std::string>&)>(
-            &mooncake::WrappedMasterService::CreateCopyTask)>(
+        &mooncake::WrappedMasterService::CreateCopyTaskByObject>(
         &wrapped_master_service);
     server.register_handler<
         static_cast<tl::expected<UUID, ErrorCode> (
@@ -1786,11 +1937,7 @@ void RegisterRpcService(
             &mooncake::WrappedMasterService::CreateMoveTask)>(
         &wrapped_master_service);
     server.register_handler<
-        static_cast<tl::expected<UUID, ErrorCode> (
-            mooncake::WrappedMasterService::*)(const LogicalObjectId&,
-                                               const std::string&,
-                                               const std::string&)>(
-            &mooncake::WrappedMasterService::CreateMoveTask)>(
+        &mooncake::WrappedMasterService::CreateMoveTaskByObject>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::QueryTask>(
         &wrapped_master_service);

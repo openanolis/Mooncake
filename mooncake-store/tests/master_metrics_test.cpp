@@ -501,6 +501,74 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     admin_server.Stop();
 }
 
+TEST_F(MasterMetricsTest, AdminServerExposesBatchObjectQueryEndpoint) {
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
+    service_config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(service_config);
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "admin_batch_object_segment";
+    segment.base = 0x300000000;
+    segment.size = 8 * 1024 * 1024;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.tenant_id = "tenant-a";
+    config.domain_id = "domain-a";
+    config.object_set = "set-a";
+    config.logical_key = "logical-a";
+
+    const std::string raw_key = "raw-admin-batch-object";
+    auto put_start = service->PutStart(client_id, raw_key, 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_TRUE(service->PutEnd(client_id, raw_key, ReplicaType::MEMORY)
+                    .has_value());
+
+    const int http_port = getFreeTcpPort();
+    MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
+                                   /*enable_metric_reporting=*/false);
+    ASSERT_TRUE(admin_server.Start());
+    admin_server.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin_server.SetServiceDelegate(service);
+    admin_server.SetServiceAvailable(true);
+
+    auto resp = FetchUrl(
+        http_port,
+        "/batch_query_objects?tenant_ids=tenant-a,tenant-a&domain_ids=domain-a,domain-a&object_sets=set-a,set-a&logical_keys=logical-a,missing");
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find("\"tenant_id\":\"tenant-a\""),
+              std::string::npos);
+    EXPECT_NE(resp.body.find("\"logical_key\":\"logical-a\""),
+              std::string::npos);
+    EXPECT_NE(resp.body.find("\"logical_key\":\"missing\""),
+              std::string::npos);
+    EXPECT_NE(resp.body.find("\"ok\":true"), std::string::npos);
+    EXPECT_NE(resp.body.find("OBJECT_NOT_FOUND"), std::string::npos);
+
+    auto success_only_resp = FetchUrl(
+        http_port,
+        "/batch_query_objects?tenant_ids=tenant-a&domain_ids=domain-a&object_sets=set-a&logical_keys=logical-a");
+    EXPECT_EQ(success_only_resp.http_status, 200);
+    EXPECT_NE(success_only_resp.body.find("\"success\":true"),
+              std::string::npos);
+    EXPECT_NE(success_only_resp.body.find("\"ok\":true"),
+              std::string::npos);
+    EXPECT_EQ(success_only_resp.body.find("OBJECT_NOT_FOUND"),
+              std::string::npos);
+
+    auto bad_resp = FetchUrl(
+        http_port,
+        "/batch_query_objects?tenant_ids=tenant-a&domain_ids=domain-a&object_sets=set-a,set-b&logical_keys=logical-a");
+    EXPECT_EQ(bad_resp.http_status, 400);
+    EXPECT_NE(bad_resp.body.find("same number of items"), std::string::npos);
+
+    admin_server.Stop();
+}
+
 TEST_F(MasterMetricsTest, BatchRequestTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();
@@ -528,6 +596,17 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
 
+    const auto baseline_batch_get_requests =
+        metrics.get_batch_get_replica_list_requests();
+    const auto baseline_batch_get_partial =
+        metrics.get_batch_get_replica_list_partial_successes();
+    const auto baseline_batch_get_failures =
+        metrics.get_batch_get_replica_list_failures();
+    const auto baseline_batch_get_items =
+        metrics.get_batch_get_replica_list_items();
+    const auto baseline_batch_get_failed_items =
+        metrics.get_batch_get_replica_list_failed_items();
+
     // Test BatchExistKey request (should all return false initially)
     auto batch_exist_result = service_.BatchExistKey(keys);
     ASSERT_EQ(batch_exist_result.size(), 3);
@@ -550,11 +629,16 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     // Test BatchGetReplicaList request (should all fail)
     auto batch_get_replica_result = service_.BatchGetReplicaList(keys);
     ASSERT_EQ(batch_get_replica_result.size(), 3);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 1);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 0);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_failures(), 1);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_items(), 3);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(), 3);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_requests(),
+              baseline_batch_get_requests + 1);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(),
+              baseline_batch_get_partial + 0);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_failures(),
+              baseline_batch_get_failures + 1);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_items(),
+              baseline_batch_get_items + 3);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(),
+              baseline_batch_get_failed_items + 3);
 
     // Test BatchPutEnd request
     auto batch_put_end_result = service_.BatchPutEnd(client_id, keys);
@@ -577,11 +661,16 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     // Test BatchGetReplicaList again (should all succeed now)
     auto batch_get_replica_result2 = service_.BatchGetReplicaList(keys);
     ASSERT_EQ(batch_get_replica_result2.size(), 3);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 2);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 0);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_failures(), 1);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_items(), 6);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(), 3);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_requests(),
+              baseline_batch_get_requests + 2);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(),
+              baseline_batch_get_partial + 0);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_failures(),
+              baseline_batch_get_failures + 1);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_items(),
+              baseline_batch_get_items + 6);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(),
+              baseline_batch_get_failed_items + 3);
 
     // Test BatchPutRevoke request (should all fail)
     auto batch_put_revoke_result = service_.BatchPutRevoke(client_id, keys);
@@ -597,11 +686,16 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     value_lengths.push_back(512);
     auto batch_get_replica_result3 = service_.BatchGetReplicaList(keys);
     ASSERT_EQ(batch_get_replica_result3.size(), 4);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 3);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(), 1);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_failures(), 1);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_items(), 10);
-    ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(), 4);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_requests(),
+              baseline_batch_get_requests + 3);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_partial_successes(),
+              baseline_batch_get_partial + 1);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_failures(),
+              baseline_batch_get_failures + 1);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_items(),
+              baseline_batch_get_items + 10);
+    ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(),
+              baseline_batch_get_failed_items + 4);
 
     auto batch_put_start_result2 =
         service_.BatchPutStart(client_id, keys, value_lengths, config);

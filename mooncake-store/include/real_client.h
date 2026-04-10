@@ -589,7 +589,11 @@ class RealClient : public PyClient {
 
     std::map<std::string, std::vector<Replica::Descriptor>>
     batch_get_replica_desc(const std::vector<std::string> &keys);
+    std::map<LogicalObjectId, std::vector<Replica::Descriptor>>
+    batch_get_replica_desc(const std::vector<LogicalObjectId> &object_ids);
     std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
+    std::vector<Replica::Descriptor> get_replica_desc(
+        const LogicalObjectId &object_id);
 
     tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
 

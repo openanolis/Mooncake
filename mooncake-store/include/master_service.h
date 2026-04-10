@@ -205,6 +205,9 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
     auto GetReplicaListByObject(const LogicalObjectId& object_id)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
+    auto BatchGetReplicaListByObject(
+        const std::vector<LogicalObjectId>& object_ids)
+        -> std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>;
 
     /**
      * @brief Start a put operation for an object

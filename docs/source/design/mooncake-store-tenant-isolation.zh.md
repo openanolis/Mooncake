@@ -512,7 +512,7 @@ sequenceDiagram
 - oplog apply 在 standby 侧落库时会保留 `legacy_raw_key`
 - namespace-native 的 RPC / client 入口已经补齐 `ExistObject`、`GetReplicaListByObject`、`PutObjectStart/PutObjectEnd/PutObjectRevoke`、`CopyObjectStart/CopyObjectEnd/CopyObjectRevoke`、`MoveObjectStart/MoveObjectEnd/MoveObjectRevoke`、`RemoveObject` 以及 object-identity 版本的 `CreateCopyTask/CreateMoveTask`
 - admin/list/regex/remove 等 metadata 视图已经切到按 `logical_key` 匹配；legacy raw-key alias lookup 继续保留兼容
-- admin HTTP 入口新增 `/query_object` 和 `/get_all_objects`，namespace-first 巡检不再依赖 raw-key 列表
+- admin HTTP 入口新增 `/query_object`、`/get_all_objects` 和 `/batch_query_objects`，namespace-first 巡检不再依赖 raw-key 列表；其中 batch object 查询也已经切到 namespace-native 的批量 metadata 路径，而不是逐个对象走兼容查找
 - 任务执行路径现在会优先使用 task payload 里的 `LogicalObjectId`，只在兼容旧任务时才回退到 legacy raw key
 - `processing_keys`、`replication_tasks`、`offloading_tasks` 等后台维护状态也已经切到按 `LogicalObjectId` 跟踪，避免后台清理、复制和 offload 生命周期继续把 raw key 当成主身份
 
@@ -532,8 +532,9 @@ sequenceDiagram
 
 当前仍保留：
 
-- legacy raw-key 的 task/admin 入口，作为迁移期兼容 alias
-- 旧任务 payload 的 raw key 回退路径，用于兼容已下发但未执行完成的历史任务
+- legacy raw-key 的 task/admin 入口仅作为迁移期兼容 alias 保留
+- py/dummy/real 这类管理/巡检侧的 replica 查询与异步 task 创建也已经补齐 batch object-id inspection，新调用方不再需要依赖 raw-key-primary 路径
+- py/dummy/real 这类管理/巡检侧的 replica 查询与异步 task 创建也已经补齐 object-identity 入口，新调用方不再需要依赖 raw-key-primary 路径
 
 ---
 

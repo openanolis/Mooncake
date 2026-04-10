@@ -3463,6 +3463,28 @@ std::vector<Replica::Descriptor> RealClient::get_replica_desc(
     return replica_list;
 }
 
+std::vector<Replica::Descriptor> RealClient::get_replica_desc(
+    const LogicalObjectId &object_id) {
+    auto query_result = client_->QueryObject(object_id);
+    if (!query_result) {
+        std::vector<Replica::Descriptor> replica_list = {};
+        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
+            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
+            LOG(ERROR) << "Object not found for object_id: " << object_id;
+        } else {
+            LOG(ERROR) << "Query failed for object_id: " << object_id
+                       << " with error: " << toString(query_result.error());
+        }
+        return replica_list;
+    }
+    const std::vector<Replica::Descriptor> &replica_list =
+        query_result.value().replicas;
+    if (replica_list.empty()) {
+        LOG(ERROR) << "Empty replica list for object_id: " << object_id;
+    }
+    return replica_list;
+}
+
 std::map<std::string, std::vector<Replica::Descriptor>>
 RealClient::batch_get_replica_desc(const std::vector<std::string> &keys) {
     auto query_results = client_->BatchQuery(keys);
@@ -3480,6 +3502,32 @@ RealClient::batch_get_replica_desc(const std::vector<std::string> &keys) {
         } else {
             LOG(ERROR) << "batch_get_replica failed for key: " << keys[i]
                        << " with error: " << toString(query_results[i].error());
+        }
+    }
+    return replica_map;
+}
+
+std::map<LogicalObjectId, std::vector<Replica::Descriptor>>
+RealClient::batch_get_replica_desc(
+    const std::vector<LogicalObjectId> &object_ids) {
+    auto query_results = client_->BatchQueryObject(object_ids);
+    std::map<LogicalObjectId, std::vector<Replica::Descriptor>> replica_map;
+    if (query_results.size() != object_ids.size()) {
+        LOG(ERROR) << "Batch query response size mismatch in "
+                      "batch_get_replica_desc(object_ids): expected "
+                   << object_ids.size() << ", got " << query_results.size()
+                   << ".";
+        return replica_map;
+    }
+
+    for (size_t i = 0; i < query_results.size(); ++i) {
+        if (query_results[i]) {
+            replica_map[object_ids[i]] = query_results[i].value().replicas;
+        } else {
+            LOG(ERROR) << "batch_get_replica failed for object_id: "
+                       << object_ids[i]
+                       << " with error: "
+                       << toString(query_results[i].error());
         }
     }
     return replica_map;

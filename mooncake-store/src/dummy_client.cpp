@@ -857,9 +857,33 @@ DummyClient::batch_get_replica_desc(const std::vector<std::string>& keys) {
     std::map<std::string, std::vector<Replica::Descriptor>> replica_list_map =
         {};
     auto batch_result =
-        invoke_rpc<&RealClient::batch_get_replica_desc,
-                   std::map<std::string, std::vector<Replica::Descriptor>>>(
-            keys);
+        invoke_rpc<
+            static_cast<std::map<std::string, std::vector<Replica::Descriptor>>
+                        (RealClient::*)(const std::vector<std::string>&)>(
+                &RealClient::batch_get_replica_desc),
+            std::map<std::string, std::vector<Replica::Descriptor>>>(keys);
+    if (!batch_result.has_value()) {
+        LOG(ERROR) << "Batch get replica failed."
+                   << "Error is: " << toString(batch_result.error());
+        return replica_list_map;
+    }
+    replica_list_map = std::move(batch_result.value());
+    return replica_list_map;
+}
+
+std::map<LogicalObjectId, std::vector<Replica::Descriptor>>
+DummyClient::batch_get_replica_desc(
+    const std::vector<LogicalObjectId>& object_ids) {
+    std::map<LogicalObjectId, std::vector<Replica::Descriptor>> replica_list_map =
+        {};
+    auto batch_result =
+        invoke_rpc<
+            static_cast<std::map<LogicalObjectId,
+                                 std::vector<Replica::Descriptor>>
+                        (RealClient::*)(const std::vector<LogicalObjectId>&)>(
+                &RealClient::batch_get_replica_desc),
+            std::map<LogicalObjectId, std::vector<Replica::Descriptor>>>(
+            object_ids);
     if (!batch_result.has_value()) {
         LOG(ERROR) << "Batch get replica failed."
                    << "Error is: " << toString(batch_result.error());
@@ -872,10 +896,28 @@ DummyClient::batch_get_replica_desc(const std::vector<std::string>& keys) {
 std::vector<Replica::Descriptor> DummyClient::get_replica_desc(
     const std::string& key) {
     std::vector<Replica::Descriptor> replica_list = {};
-    auto result = invoke_rpc<&RealClient::get_replica_desc,
-                             std::vector<Replica::Descriptor>>(key);
+    auto result = invoke_rpc<
+        static_cast<std::vector<Replica::Descriptor> (RealClient::*)(
+            const std::string&)>(&RealClient::get_replica_desc),
+        std::vector<Replica::Descriptor>>(key);
     if (!result.has_value()) {
         LOG(ERROR) << "Get replica failed for key: " << key
+                   << " with error: " << toString(result.error());
+        return replica_list;
+    }
+    replica_list = std::move(result.value());
+    return replica_list;
+}
+
+std::vector<Replica::Descriptor> DummyClient::get_replica_desc(
+    const LogicalObjectId& object_id) {
+    std::vector<Replica::Descriptor> replica_list = {};
+    auto result = invoke_rpc<
+        static_cast<std::vector<Replica::Descriptor> (RealClient::*)(
+            const LogicalObjectId&)>(&RealClient::get_replica_desc),
+        std::vector<Replica::Descriptor>>(object_id);
+    if (!result.has_value()) {
+        LOG(ERROR) << "Get replica failed for object_id: " << object_id
                    << " with error: " << toString(result.error());
         return replica_list;
     }

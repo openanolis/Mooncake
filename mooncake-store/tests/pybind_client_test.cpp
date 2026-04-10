@@ -648,6 +648,14 @@ TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {
     EXPECT_EQ(desc_map[key][0].is_memory_replica(), true)
         << "batch_get_replica_desc should return memory replica";
 
+    LogicalObjectId object_id{"default", "default", "default", key};
+    std::vector<LogicalObjectId> object_ids = {object_id};
+    auto object_desc_map = py_client_->batch_get_replica_desc(object_ids);
+    ASSERT_EQ(object_desc_map[object_id].size(), 1)
+        << "batch_get_replica_desc(object_ids) should return 1 desc";
+    EXPECT_TRUE(object_desc_map[object_id][0].is_memory_replica())
+        << "batch_get_replica_desc(object_ids) should return memory replica";
+
     // test batch_get_replica_desc with error keys
     std::vector<std::string> keys1 = {"test_key_1"};
     std::map<std::string, std::vector<Replica::Descriptor>> desc_map1 =
@@ -694,10 +702,20 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
     config.preferred_segment = client1_addr;
     ASSERT_EQ(py_client_->put(key, data_span, config), 0);
 
+    LogicalObjectId object_id{"default", "default", "default", key};
+    auto object_desc = py_client_->get_replica_desc(object_id);
+    ASSERT_EQ(object_desc.size(), 1)
+        << "get_replica_desc(object_id) should return one replica";
+    EXPECT_TRUE(object_desc[0].is_memory_replica());
+
     // Test create copy task from client 1 to client 2
     auto copy_res = py_client_->create_copy_task(key, {client2_addr});
     ASSERT_TRUE(copy_res.has_value()) << "Copy should return a task ID";
     UUID copy_task_id = copy_res.value();
+    auto copy_object_res =
+        py_client_->create_copy_task(object_id, {client2_addr});
+    ASSERT_TRUE(copy_object_res.has_value())
+        << "Copy(object_id) should return a task ID";
 
     // Query Copy Task
     auto query_copy_res = py_client_->query_task(copy_task_id);
@@ -710,6 +728,10 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
         py_client_->create_move_task(key, client1_addr, client2_addr);
     ASSERT_TRUE(move_res.has_value()) << "Move should return a task ID";
     UUID move_task_id = move_res.value();
+    auto move_object_res =
+        py_client_->create_move_task(object_id, client1_addr, client2_addr);
+    ASSERT_TRUE(move_object_res.has_value())
+        << "Move(object_id) should return a task ID";
 
     // Query Move Task
     auto query_move_res = py_client_->query_task(move_task_id);

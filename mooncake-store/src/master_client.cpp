@@ -73,6 +73,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaListByObject> {
+    static constexpr const char* value = "BatchGetReplicaListByObject";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PutStart> {
     static constexpr const char* value = "PutStart";
 };
@@ -292,12 +297,8 @@ struct RpcNameTraits<static_cast<tl::expected<UUID, ErrorCode> (
 };
 
 template <>
-struct RpcNameTraits<static_cast<tl::expected<UUID, ErrorCode> (
-                         WrappedMasterService::*)(
-                             const LogicalObjectId&,
-                             const std::vector<std::string>&)>(
-                         &WrappedMasterService::CreateCopyTask)> {
-    static constexpr const char* value = "CreateCopyTask";
+struct RpcNameTraits<&WrappedMasterService::CreateCopyTaskByObject> {
+    static constexpr const char* value = "CreateCopyTaskByObject";
 };
 
 template <>
@@ -310,12 +311,8 @@ struct RpcNameTraits<static_cast<tl::expected<UUID, ErrorCode> (
 };
 
 template <>
-struct RpcNameTraits<static_cast<tl::expected<UUID, ErrorCode> (
-                         WrappedMasterService::*)(const LogicalObjectId&,
-                                                  const std::string&,
-                                                  const std::string&)>(
-                         &WrappedMasterService::CreateMoveTask)> {
-    static constexpr const char* value = "CreateMoveTask";
+struct RpcNameTraits<&WrappedMasterService::CreateMoveTaskByObject> {
+    static constexpr const char* value = "CreateMoveTaskByObject";
 };
 
 template <>
@@ -579,6 +576,19 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
                                    GetReplicaListResponse>(object_keys.size(),
                                                            object_keys);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetReplicaListByObject(
+    const std::vector<LogicalObjectId>& object_ids) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaListByObject");
+    timer.LogRequest("object_count=", object_ids.size());
+
+    auto result =
+        invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaListByObject,
+                         GetReplicaListResponse>(object_ids.size(), object_ids);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -1021,12 +1031,9 @@ tl::expected<UUID, ErrorCode> MasterClient::CreateCopyTask(
     timer.LogRequest("object_id=", object_id,
                      ", targets_size=", targets.size());
 
-    auto result = invoke_rpc<
-        static_cast<tl::expected<UUID, ErrorCode> (
-            WrappedMasterService::*)(const LogicalObjectId&,
-                                     const std::vector<std::string>&)>(
-            &WrappedMasterService::CreateCopyTask),
-        UUID>(object_id, targets);
+    auto result =
+        invoke_rpc<&WrappedMasterService::CreateCopyTaskByObject, UUID>(
+            object_id, targets);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1054,13 +1061,9 @@ tl::expected<UUID, ErrorCode> MasterClient::CreateMoveTask(
     timer.LogRequest("object_id=", object_id, ", source=", source,
                      ", target=", target);
 
-    auto result = invoke_rpc<
-        static_cast<tl::expected<UUID, ErrorCode> (
-            WrappedMasterService::*)(const LogicalObjectId&,
-                                     const std::string&,
-                                     const std::string&)>(
-            &WrappedMasterService::CreateMoveTask),
-        UUID>(object_id, source, target);
+    auto result =
+        invoke_rpc<&WrappedMasterService::CreateMoveTaskByObject, UUID>(
+            object_id, source, target);
     timer.LogResponseExpected(result);
     return result;
 }
