@@ -507,6 +507,9 @@ sequenceDiagram
 - domain/object_set locality 参与 preferred-segment 决策
 - master 内存 metadata 主表已经切换为以 `LogicalObjectId` 为主键
 - 旧 raw key 通过 alias 映射继续兼容，因此现有 key-based API 在迁移期仍可工作
+- hot-standby 的 snapshot 加载已经恢复为以 `LogicalObjectId` 为主键的 metadata，并保留 legacy raw-key alias
+- standby metadata 导出已经切换为 identity-native 的 `(LogicalObjectId, StandbyObjectMetadata)` 结果，便于 promotion / recovery 直接消费
+- oplog apply 在 standby 侧落库时会保留 `legacy_raw_key`
 
 ## 11.2 TENT runtime 侧
 
@@ -524,9 +527,9 @@ sequenceDiagram
 
 还未完整补齐的是：
 
-- reuse isolation
-- tenant/domain secondary index
-- scoped metadata query / regex / remove
+- namespace-native RPC / client API
+- 管理与查询接口里剩余的 raw-key-primary 语义
+- regex / list / remove 从 legacy raw-key 视图迁移到 logical identity 视图
 
 ---
 

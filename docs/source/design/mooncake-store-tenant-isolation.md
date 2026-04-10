@@ -348,6 +348,9 @@ sequenceDiagram
 - domain/object_set locality participates in preferred-segment decisions
 - master metadata storage now uses `LogicalObjectId` as the in-memory primary key
 - legacy raw key lookup is preserved through alias mapping, so key-based APIs keep working during migration
+- hot-standby snapshot loading now restores `LogicalObjectId`-keyed metadata and preserves legacy raw-key aliases for compatibility
+- standby metadata export now returns identity-native `(LogicalObjectId, StandbyObjectMetadata)` pairs for promotion/recovery flows
+- oplog apply now preserves `legacy_raw_key` when materializing standby metadata
 
 #### TENT runtime side
 
@@ -360,9 +363,9 @@ sequenceDiagram
 
 ### Planned next extension
 
-- reuse isolation as an explicit metadata layer
-- tenant/domain secondary indexes for scoped metadata lookup
-- scoped query/regex/remove APIs or internal helpers
+- namespace-native RPC and client APIs
+- retiring remaining raw-key-primary assumptions from management/query surfaces
+- extending regex/list/remove semantics from legacy raw-key views to logical identity views
 
 ## File Scope
 

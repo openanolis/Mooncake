@@ -534,7 +534,7 @@ void MasterService::RebuildShardIndexes(MetadataShard& shard) const {
     }
 }
 
-const std::unordered_set<LogicalObjectId, MasterService::LogicalObjectIdHash>*
+const std::unordered_set<LogicalObjectId, LogicalObjectIdHash>*
 MasterService::FindScopedKeys(const MetadataShard& shard,
                               const std::string& tenant_id,
                               const std::string& domain_id) const {

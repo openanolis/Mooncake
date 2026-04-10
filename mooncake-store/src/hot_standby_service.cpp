@@ -55,28 +55,53 @@ HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
 // StandbyMetadataStore implementation
 bool HotStandbyService::StandbyMetadataStore::PutMetadata(
     const std::string& key, const StandbyObjectMetadata& metadata) {
+    StandbyObjectMetadata materialized = metadata;
+    materialized.legacy_raw_key = key;
+    LogicalObjectId object_id{materialized.tenant_id,
+                              materialized.domain_id,
+                              materialized.object_set,
+                              materialized.logical_key.empty()
+                                  ? key
+                                  : materialized.logical_key};
+    return PutMetadata(object_id, materialized);
+}
+
+bool HotStandbyService::StandbyMetadataStore::PutMetadata(
+    const LogicalObjectId& object_id, const StandbyObjectMetadata& metadata) {
     std::lock_guard<std::mutex> lock(mutex_);
-    store_[key] = metadata;
-    VLOG(2) << "StandbyMetadataStore: stored metadata for key=" << key
-            << ", replicas=" << metadata.replicas.size()
-            << ", size=" << metadata.size;
+    StandbyObjectMetadata materialized = metadata;
+    if (materialized.logical_key.empty()) {
+        materialized.logical_key = object_id.logical_key;
+    }
+    if (materialized.legacy_raw_key.empty()) {
+        materialized.legacy_raw_key = object_id.logical_key;
+    }
+    store_[object_id] = materialized;
+    raw_key_to_id_[materialized.legacy_raw_key] = object_id;
+    VLOG(2) << "StandbyMetadataStore: stored metadata for key="
+            << materialized.legacy_raw_key
+            << ", replicas=" << materialized.replicas.size()
+            << ", size=" << materialized.size;
     return true;
 }
 
 bool HotStandbyService::StandbyMetadataStore::Put(const std::string& key,
                                                   const std::string& payload) {
-    // Legacy interface - create empty metadata
+    (void)payload;
     StandbyObjectMetadata metadata;
-    std::lock_guard<std::mutex> lock(mutex_);
-    store_[key] = metadata;
-    return true;
+    metadata.legacy_raw_key = key;
+    return PutMetadata(key, metadata);
 }
 
 std::optional<StandbyObjectMetadata>
 HotStandbyService::StandbyMetadataStore::GetMetadata(
     const std::string& key) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = store_.find(key);
+    auto alias_it = raw_key_to_id_.find(key);
+    if (alias_it == raw_key_to_id_.end()) {
+        return std::nullopt;
+    }
+    auto it = store_.find(alias_it->second);
     if (it != store_.end()) {
         return it->second;
     }
@@ -85,18 +110,26 @@ HotStandbyService::StandbyMetadataStore::GetMetadata(
 
 bool HotStandbyService::StandbyMetadataStore::Remove(const std::string& key) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = store_.find(key);
+    auto alias_it = raw_key_to_id_.find(key);
+    if (alias_it == raw_key_to_id_.end()) {
+        return false;
+    }
+    auto it = store_.find(alias_it->second);
     if (it != store_.end()) {
+        raw_key_to_id_.erase(alias_it);
         store_.erase(it);
         return true;
     }
+    raw_key_to_id_.erase(alias_it);
     return false;
 }
 
 bool HotStandbyService::StandbyMetadataStore::Exists(
     const std::string& key) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return store_.find(key) != store_.end();
+    auto alias_it = raw_key_to_id_.find(key);
+    return alias_it != raw_key_to_id_.end() &&
+           store_.find(alias_it->second) != store_.end();
 }
 
 size_t HotStandbyService::StandbyMetadataStore::GetKeyCount() const {
@@ -107,10 +140,11 @@ size_t HotStandbyService::StandbyMetadataStore::GetKeyCount() const {
 void HotStandbyService::StandbyMetadataStore::Clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     store_.clear();
+    raw_key_to_id_.clear();
 }
 
 void HotStandbyService::StandbyMetadataStore::Snapshot(
-    std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const {
+    std::vector<std::pair<LogicalObjectId, StandbyObjectMetadata>>& out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     out.clear();
     out.reserve(store_.size());
@@ -636,7 +670,7 @@ uint64_t HotStandbyService::GetLatestAppliedSequenceId() const {
 }
 
 bool HotStandbyService::ExportMetadataSnapshot(
-    std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const {
+    std::vector<std::pair<LogicalObjectId, StandbyObjectMetadata>>& out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!metadata_store_) {
         out.clear();

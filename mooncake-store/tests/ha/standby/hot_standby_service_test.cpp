@@ -39,7 +39,10 @@ LoadedSnapshot MakeSnapshot(std::string snapshot_id, uint64_t seq_id,
     metadata.client_id = UUID{1, 2};
     metadata.size = size;
     metadata.last_sequence_id = seq_id;
-    snapshot.metadata.emplace_back(std::move(key), metadata);
+    metadata.logical_key = key;
+    metadata.legacy_raw_key = key;
+    snapshot.metadata.emplace_back(
+        LogicalObjectId{"default", "default", "default", key}, metadata);
     return snapshot;
 }
 
@@ -88,7 +91,11 @@ std::unique_ptr<HotStandbyService> CreateSnapshotOnlyReadyStandby(
     metadata.client_id = UUID{1, 2};
     metadata.size = 4096;
     metadata.last_sequence_id = 42;
-    snapshot.metadata.emplace_back("key-1", metadata);
+    metadata.logical_key = "key-1";
+    metadata.legacy_raw_key = "key-1";
+    snapshot.metadata.emplace_back(
+        LogicalObjectId{"default", "default", "default", "key-1"},
+        metadata);
 
     service->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
         std::optional<LoadedSnapshot>(snapshot)));
@@ -340,10 +347,11 @@ TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWithSnapshot) {
     EXPECT_EQ(42u, status.primary_seq_id);
     EXPECT_TRUE(status.is_connected);
 
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    std::vector<std::pair<LogicalObjectId, StandbyObjectMetadata>> exported;
     EXPECT_TRUE(service_->ExportMetadataSnapshot(exported));
     ASSERT_EQ(1u, exported.size());
-    EXPECT_EQ("key-1", exported[0].first);
+    EXPECT_EQ("key-1", exported[0].first.logical_key);
+    EXPECT_EQ("key-1", exported[0].second.legacy_raw_key);
     EXPECT_EQ(4096u, exported[0].second.size);
 }
 
@@ -372,10 +380,11 @@ TEST_F(HotStandbyServiceTest,
     EXPECT_EQ(84u, service_->GetLatestAppliedSequenceId());
     EXPECT_EQ(1u, service_->GetMetadataCount());
 
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    std::vector<std::pair<LogicalObjectId, StandbyObjectMetadata>> exported;
     ASSERT_TRUE(service_->ExportMetadataSnapshot(exported));
     ASSERT_EQ(1u, exported.size());
-    EXPECT_EQ("key-new", exported[0].first);
+    EXPECT_EQ("key-new", exported[0].first.logical_key);
+    EXPECT_EQ("key-new", exported[0].second.legacy_raw_key);
     EXPECT_EQ(8192u, exported[0].second.size);
     EXPECT_EQ(84u, exported[0].second.last_sequence_id);
 }
@@ -400,7 +409,7 @@ TEST_F(HotStandbyServiceTest, TestGetMetadataCount) {
 }
 
 TEST_F(HotStandbyServiceTest, TestExportMetadataSnapshot) {
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> snapshot;
+    std::vector<std::pair<LogicalObjectId, StandbyObjectMetadata>> snapshot;
     EXPECT_TRUE(service_->ExportMetadataSnapshot(snapshot));
     EXPECT_TRUE(snapshot.empty());
 }

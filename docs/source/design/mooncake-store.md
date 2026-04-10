@@ -1050,5 +1050,7 @@ When to bump the version:
 :caption: Related Design Docs
 :maxdepth: 1
 
+mooncake-store-tenant-isolation
+mooncake-store-tenant-isolation.zh
 ssd-offload
 :::

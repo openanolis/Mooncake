@@ -499,7 +499,7 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
 
     // Convert to StandbyObjectMetadata and store
     StandbyObjectMetadata metadata =
-        payload.ToStandbyMetadata(entry.sequence_id);
+        payload.ToStandbyMetadata(entry.sequence_id, entry.object_key);
 
     if (!metadata_store_->PutMetadata(entry.object_key, metadata)) {
         LOG(ERROR) << "OpLogApplier: failed to PutMetadata key="

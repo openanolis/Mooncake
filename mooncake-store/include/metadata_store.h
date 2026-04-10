@@ -29,6 +29,7 @@ struct StandbyObjectMetadata {
     std::string qos_tier{"default"};
     std::string logical_key{};
     std::string canonical_key{};
+    std::string legacy_raw_key{};
     std::vector<Replica::Descriptor> replicas;
     // NOTE: Lease information is NOT stored because:
     // 1. Standby does not perform eviction, so lease info is not used
@@ -67,7 +68,9 @@ struct MetadataPayload {
              replicas);
 
     // Convert to StandbyObjectMetadata
-    StandbyObjectMetadata ToStandbyMetadata(uint64_t sequence_id) const {
+    StandbyObjectMetadata ToStandbyMetadata(uint64_t sequence_id,
+                                            const std::string& legacy_raw_key =
+                                                std::string()) const {
         StandbyObjectMetadata meta;
         meta.client_id = client_id;
         meta.size = size;
@@ -78,6 +81,7 @@ struct MetadataPayload {
         meta.qos_tier = qos_tier;
         meta.logical_key = logical_key;
         meta.canonical_key = canonical_key;
+        meta.legacy_raw_key = legacy_raw_key;
         meta.replicas = replicas;
         meta.last_sequence_id = sequence_id;
         return meta;
@@ -102,6 +106,9 @@ class MetadataStore {
      * @return true on success, false on failure
      */
     virtual bool PutMetadata(const std::string& key,
+                             const StandbyObjectMetadata& metadata) = 0;
+
+    virtual bool PutMetadata(const LogicalObjectId& object_id,
                              const StandbyObjectMetadata& metadata) = 0;
 
     /**

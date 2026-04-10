@@ -114,10 +114,11 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     EXPECT_EQ(descriptor_.last_included_seq, status.applied_seq_id);
     EXPECT_EQ(descriptor_.last_included_seq, status.primary_seq_id);
 
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    std::vector<std::pair<LogicalObjectId, StandbyObjectMetadata>> exported;
     ASSERT_TRUE(service.ExportMetadataSnapshot(exported));
     ASSERT_EQ(1u, exported.size());
-    EXPECT_EQ(kDefaultTestObjectKey, exported.front().first);
+    EXPECT_EQ(kDefaultTestObjectKey, exported.front().first.logical_key);
+    EXPECT_EQ(kDefaultTestObjectKey, exported.front().second.legacy_raw_key);
     EXPECT_EQ(kDefaultTestObjectSize, exported.front().second.size);
     EXPECT_EQ(descriptor_.last_included_seq,
               exported.front().second.last_sequence_id);

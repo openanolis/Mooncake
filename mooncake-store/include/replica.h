@@ -2,6 +2,8 @@
 
 #include <glog/logging.h>
 
+#include <boost/functional/hash.hpp>
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -154,6 +156,17 @@ struct LogicalObjectId {
     }
 };
 YLT_REFL(LogicalObjectId, tenant_id, domain_id, object_set, logical_key);
+
+struct LogicalObjectIdHash {
+    std::size_t operator()(const LogicalObjectId& object_id) const {
+        std::size_t seed = 0;
+        boost::hash_combine(seed, object_id.tenant_id);
+        boost::hash_combine(seed, object_id.domain_id);
+        boost::hash_combine(seed, object_id.object_set);
+        boost::hash_combine(seed, object_id.logical_key);
+        return seed;
+    }
+};
 
 struct ReuseIdentity {
     std::string tenant_id{"default"};
