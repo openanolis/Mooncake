@@ -146,7 +146,8 @@ class HotStandbyService {
     // This is used by MasterServiceSupervisor to initialize the new Primary
     // after leader election (fast recovery).
     bool ExportMetadataSnapshot(
-        std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const;
+        std::vector<std::pair<LogicalObjectId, StandbyObjectMetadata>>& out)
+        const;
 
     // Inject a snapshot provider (from external snapshot implementation).
     void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
@@ -224,6 +225,8 @@ class HotStandbyService {
        public:
         bool PutMetadata(const std::string& key,
                          const StandbyObjectMetadata& metadata) override;
+        bool PutMetadata(const LogicalObjectId& object_id,
+                         const StandbyObjectMetadata& metadata) override;
         bool Put(const std::string& key,
                  const std::string& payload = std::string()) override;
         std::optional<StandbyObjectMetadata> GetMetadata(
@@ -235,12 +238,15 @@ class HotStandbyService {
 
         // Snapshot for promotion/restore.
         void Snapshot(
-            std::vector<std::pair<std::string, StandbyObjectMetadata>>& out)
+            std::vector<std::pair<LogicalObjectId, StandbyObjectMetadata>>& out)
             const;
 
        private:
         mutable std::mutex mutex_;
-        std::unordered_map<std::string, StandbyObjectMetadata> store_;
+        std::unordered_map<LogicalObjectId, StandbyObjectMetadata,
+                           LogicalObjectIdHash>
+            store_;
+        std::unordered_map<std::string, LogicalObjectId> raw_key_to_id_;
     };
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
     std::unique_ptr<SnapshotProvider> snapshot_provider_{

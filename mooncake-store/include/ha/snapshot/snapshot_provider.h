@@ -15,7 +15,7 @@ namespace mooncake {
 struct LoadedSnapshot {
     std::string snapshot_id;
     uint64_t snapshot_sequence_id{0};
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> metadata;
+    std::vector<std::pair<LogicalObjectId, StandbyObjectMetadata>> metadata;
 };
 
 /**

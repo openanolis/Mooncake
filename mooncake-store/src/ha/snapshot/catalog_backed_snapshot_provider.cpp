@@ -190,7 +190,7 @@ DeserializeStandbyObjectMetadata(
     }
 }
 
-tl::expected<std::vector<std::pair<std::string, StandbyObjectMetadata>>,
+tl::expected<std::vector<std::pair<LogicalObjectId, StandbyObjectMetadata>>,
              ErrorCode>
 DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
                                    const SegmentView& segment_view,
@@ -212,7 +212,7 @@ DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
         return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
     }
 
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> snapshot;
+    std::vector<std::pair<LogicalObjectId, StandbyObjectMetadata>> snapshot;
     const auto now = std::chrono::system_clock::now();
     for (uint32_t i = 0; i < shards->via.map.size; ++i) {
         const auto& shard_blob = shards->via.map.ptr[i].val;
@@ -269,7 +269,17 @@ DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
                 if (!metadata_result->has_value()) {
                     continue;
                 }
-                snapshot.emplace_back(key, std::move(metadata_result->value()));
+                metadata_result->value().legacy_raw_key = key;
+                const auto logical_key =
+                    metadata_result->value().logical_key.empty()
+                        ? key
+                        : metadata_result->value().logical_key;
+                snapshot.emplace_back(
+                    LogicalObjectId{metadata_result->value().tenant_id,
+                                    metadata_result->value().domain_id,
+                                    metadata_result->value().object_set,
+                                    logical_key},
+                    std::move(metadata_result->value()));
             } catch (const std::exception& ex) {
                 LOG(ERROR) << "Failed to parse snapshot metadata item: "
                            << ex.what();

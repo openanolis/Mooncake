@@ -886,17 +886,6 @@ class MasterService {
         }
     };
 
-    struct LogicalObjectIdHash {
-        size_t operator()(const LogicalObjectId& id) const {
-            size_t seed = 0;
-            boost::hash_combine(seed, id.tenant_id);
-            boost::hash_combine(seed, id.domain_id);
-            boost::hash_combine(seed, id.object_set);
-            boost::hash_combine(seed, id.logical_key);
-            return seed;
-        }
-    };
-
     struct TenantDomainKeyHash {
         size_t operator()(const TenantDomainKey& key) const {
             size_t seed = 0;
