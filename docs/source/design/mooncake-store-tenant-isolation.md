@@ -351,6 +351,7 @@ sequenceDiagram
 - hot-standby snapshot loading now restores `LogicalObjectId`-keyed metadata and preserves legacy raw-key aliases for compatibility
 - standby metadata export now returns identity-native `(LogicalObjectId, StandbyObjectMetadata)` pairs for promotion/recovery flows
 - oplog apply now preserves `legacy_raw_key` when materializing standby metadata
+- namespace-native RPC and client entrypoints now expose `ExistObject`, `GetReplicaListByObject`, `PutObjectStart/PutObjectEnd/PutObjectRevoke`, and `RemoveObject`
 
 #### TENT runtime side
 
@@ -363,7 +364,7 @@ sequenceDiagram
 
 ### Planned next extension
 
-- namespace-native RPC and client APIs
+- extending namespace-native RPC and client coverage across the remaining object lifecycle paths
 - retiring remaining raw-key-primary assumptions from management/query surfaces
 - extending regex/list/remove semantics from legacy raw-key views to logical identity views
 

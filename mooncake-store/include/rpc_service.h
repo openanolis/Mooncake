@@ -30,6 +30,7 @@ class WrappedMasterService {
     ~WrappedMasterService();
 
     tl::expected<bool, ErrorCode> ExistKey(const std::string& key);
+    tl::expected<bool, ErrorCode> ExistObject(const LogicalObjectId& object_id);
 
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
@@ -53,6 +54,8 @@ class WrappedMasterService {
 
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
         const std::string& key);
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListByObject(
+        const LogicalObjectId& object_id);
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys);
@@ -60,11 +63,17 @@ class WrappedMasterService {
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config);
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutObjectStart(
+        const UUID& client_id, const PutObjectRequest& request);
+    tl::expected<void, ErrorCode> PutObjectEnd(
+        const UUID& client_id, const PutObjectStateRequest& request);
 
     tl::expected<void, ErrorCode> PutEnd(const UUID& client_id,
                                          const std::string& key,
                                          ReplicaType replica_type);
 
+    tl::expected<void, ErrorCode> PutObjectRevoke(
+        const UUID& client_id, const PutObjectStateRequest& request);
     tl::expected<void, ErrorCode> PutRevoke(const UUID& client_id,
                                             const std::string& key,
                                             ReplicaType replica_type);
@@ -106,6 +115,8 @@ class WrappedMasterService {
 
     tl::expected<void, ErrorCode> Remove(const std::string& key,
                                          bool force = false);
+    tl::expected<void, ErrorCode> RemoveObject(
+        const RemoveObjectRequest& request);
 
     tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str,
                                                 bool force = false);

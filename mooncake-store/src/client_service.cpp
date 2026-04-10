@@ -722,6 +722,19 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms));
 }
 
+tl::expected<QueryResult, ErrorCode> Client::QueryObject(
+    const LogicalObjectId& object_id) {
+    std::chrono::steady_clock::time_point start_time =
+        std::chrono::steady_clock::now();
+    auto result = master_client_.GetReplicaListByObject(object_id);
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return QueryResult(
+        std::move(result.value().replicas),
+        start_time + std::chrono::milliseconds(result.value().lease_ttl_ms));
+}
+
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys) {
     std::chrono::steady_clock::time_point start_time =
@@ -1231,6 +1244,89 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 
     // End put operation
     auto end_result = master_client_.PutEnd(key, ReplicaType::MEMORY);
+    if (!end_result) {
+        ErrorCode err = end_result.error();
+        LOG(ERROR) << "Failed to end put operation: " << err;
+        return tl::unexpected(err);
+    }
+
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::PutObject(
+    const LogicalObjectId& object_id, std::vector<Slice>& slices,
+    const ReplicateConfig& config) {
+    std::vector<size_t> slice_lengths;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        slice_lengths.emplace_back(slices[i].size);
+    }
+
+    ReplicateConfig client_cfg = config;
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
+
+    uint64_t total_slice_length = 0;
+    for (const auto& slice_length : slice_lengths) {
+        total_slice_length += slice_length;
+    }
+
+    auto start_result = master_client_.PutObjectStart(
+        PutObjectRequest{object_id, total_slice_length, client_cfg});
+    if (!start_result) {
+        ErrorCode err = start_result.error();
+        if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            VLOG(1) << "object_already_exists object_id=" << object_id;
+            return {};
+        }
+        if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
+            LOG(WARNING) << "Failed to start put operation for object_id="
+                         << object_id << PUT_NO_SPACE_HELPER_STR;
+        } else {
+            LOG(ERROR) << "Failed to start put operation for object_id="
+                       << object_id << ": " << toString(err);
+        }
+        return tl::unexpected(err);
+    }
+
+    auto t0_put = std::chrono::steady_clock::now();
+
+    if (storage_backend_) {
+        for (auto it = start_result.value().rbegin();
+             it != start_result.value().rend(); ++it) {
+            const auto& replica = *it;
+            if (replica.is_disk_replica()) {
+                auto disk_descriptor = replica.get_disk_descriptor();
+                PutToLocalFile(object_id.logical_key, slices, disk_descriptor);
+                break;
+            }
+        }
+    }
+
+    for (const auto& replica : start_result.value()) {
+        if (replica.is_memory_replica()) {
+            ErrorCode transfer_err = TransferWrite(replica, slices, &client_cfg);
+            if (transfer_err != ErrorCode::OK) {
+                auto revoke_result = master_client_.PutObjectRevoke(
+                    PutObjectStateRequest{object_id, ReplicaType::MEMORY});
+                if (!revoke_result) {
+                    LOG(ERROR) << "Failed to revoke put operation";
+                    return tl::unexpected(revoke_result.error());
+                }
+                return tl::unexpected(transfer_err);
+            }
+        }
+    }
+
+    auto us_put = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - t0_put)
+                      .count();
+    if (metrics_) {
+        metrics_->transfer_metric.put_latency_us.observe(us_put);
+    }
+
+    auto end_result = master_client_.PutObjectEnd(
+        PutObjectStateRequest{object_id, ReplicaType::MEMORY});
     if (!end_result) {
         ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end put operation: " << err;
@@ -2021,6 +2117,16 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::RemoveObject(
+    const LogicalObjectId& object_id, bool force) {
+    auto result =
+        master_client_.RemoveObject(RemoveObjectRequest{object_id, force});
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return {};
+}
+
 tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
                                                     bool force) {
     auto result = master_client_.RemoveByRegex(str, force);
@@ -2202,6 +2308,12 @@ tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
 
 tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
     auto result = master_client_.ExistKey(key);
+    return result;
+}
+
+tl::expected<bool, ErrorCode> Client::IsExistObject(
+    const LogicalObjectId& object_id) {
+    auto result = master_client_.ExistObject(object_id);
     return result;
 }
 

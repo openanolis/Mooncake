@@ -64,6 +64,8 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<bool, ErrorCode> ExistKey(
         const std::string& object_key);
+    [[nodiscard]] tl::expected<bool, ErrorCode> ExistObject(
+        const LogicalObjectId& object_id);
 
     /**
      * @brief Checks if multiple objects exist
@@ -114,6 +116,8 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
     GetReplicaList(const std::string& object_key);
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaListByObject(const LogicalObjectId& object_id);
 
     /**
      * @brief Retrieves replica lists for object keys that match a regex
@@ -148,6 +152,10 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
     PutStart(const std::string& key, const std::vector<size_t>& slice_lengths,
              const ReplicateConfig& config);
+    [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    PutObjectStart(const PutObjectRequest& request);
+    [[nodiscard]] tl::expected<void, ErrorCode> PutObjectEnd(
+        const PutObjectStateRequest& request);
 
     /**
      * @brief Starts a batch of put operations for N objects
@@ -186,6 +194,8 @@ class MasterClient {
      * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
+    [[nodiscard]] tl::expected<void, ErrorCode> PutObjectRevoke(
+        const PutObjectStateRequest& request);
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
         const std::string& key, ReplicaType replica_type);
 
@@ -235,6 +245,8 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> Remove(const std::string& key,
                                                        bool force = false);
+    [[nodiscard]] tl::expected<void, ErrorCode> RemoveObject(
+        const RemoveObjectRequest& request);
 
     /**
      * @brief Removes objects from the master whose keys match a regex pattern.

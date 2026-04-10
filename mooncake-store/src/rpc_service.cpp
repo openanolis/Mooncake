@@ -481,6 +481,15 @@ tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
         [] { MasterMetricManager::instance().inc_exist_key_failures(); });
 }
 
+tl::expected<bool, ErrorCode> WrappedMasterService::ExistObject(
+    const LogicalObjectId& object_id) {
+    return execute_rpc(
+        "ExistObject", [&] { return master_service_.ExistObject(object_id); },
+        [&](auto& timer) { timer.LogRequest("object_id=", object_id); },
+        [] { MasterMetricManager::instance().inc_exist_key_requests(); },
+        [] { MasterMetricManager::instance().inc_exist_key_failures(); });
+}
+
 std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     const std::vector<std::string>& keys) {
     ScopedVLogTimer timer(1, "BatchExistKey");
@@ -621,6 +630,18 @@ WrappedMasterService::GetReplicaList(const std::string& key) {
         });
 }
 
+tl::expected<GetReplicaListResponse, ErrorCode>
+WrappedMasterService::GetReplicaListByObject(const LogicalObjectId& object_id) {
+    return execute_rpc(
+        "GetReplicaListByObject",
+        [&] { return master_service_.GetReplicaListByObject(object_id); },
+        [&](auto& timer) { timer.LogRequest("object_id=", object_id); },
+        [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_get_replica_list_failures();
+        });
+}
+
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(
     const std::vector<std::string>& keys) {
@@ -685,6 +706,35 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
         [] { MasterMetricManager::instance().inc_put_start_failures(); });
 }
 
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+WrappedMasterService::PutObjectStart(const UUID& client_id,
+                                     const PutObjectRequest& request) {
+    return execute_rpc(
+        "PutObjectStart",
+        [&] { return master_service_.PutObjectStart(client_id, request); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id,
+                             ", object_id=", request.object_id,
+                             ", slice_length=", request.slice_length);
+        },
+        [&] { MasterMetricManager::instance().inc_put_start_requests(); },
+        [] { MasterMetricManager::instance().inc_put_start_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::PutObjectEnd(
+    const UUID& client_id, const PutObjectStateRequest& request) {
+    return execute_rpc(
+        "PutObjectEnd",
+        [&] { return master_service_.PutObjectEnd(client_id, request); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id,
+                             ", object_id=", request.object_id,
+                             ", replica_type=", request.replica_type);
+        },
+        [] { MasterMetricManager::instance().inc_put_end_requests(); },
+        [] { MasterMetricManager::instance().inc_put_end_failures(); });
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     const UUID& client_id, const std::string& key, ReplicaType replica_type) {
     return execute_rpc(
@@ -696,6 +746,20 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
         },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
         [] { MasterMetricManager::instance().inc_put_end_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::PutObjectRevoke(
+    const UUID& client_id, const PutObjectStateRequest& request) {
+    return execute_rpc(
+        "PutObjectRevoke",
+        [&] { return master_service_.PutObjectRevoke(client_id, request); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id,
+                             ", object_id=", request.object_id,
+                             ", replica_type=", request.replica_type);
+        },
+        [] { MasterMetricManager::instance().inc_put_revoke_requests(); },
+        [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
@@ -1023,6 +1087,18 @@ tl::expected<void, ErrorCode> WrappedMasterService::Remove(
     return execute_rpc(
         "Remove", [&] { return master_service_.Remove(key, force); },
         [&](auto& timer) { timer.LogRequest("key=", key, ", force=", force); },
+        [] { MasterMetricManager::instance().inc_remove_requests(); },
+        [] { MasterMetricManager::instance().inc_remove_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::RemoveObject(
+    const RemoveObjectRequest& request) {
+    return execute_rpc(
+        "RemoveObject", [&] { return master_service_.RemoveObject(request); },
+        [&](auto& timer) {
+            timer.LogRequest("object_id=", request.object_id,
+                             ", force=", request.force);
+        },
         [] { MasterMetricManager::instance().inc_remove_requests(); },
         [] { MasterMetricManager::instance().inc_remove_failures(); });
 }
@@ -1404,6 +1480,8 @@ void RegisterRpcService(
     mooncake::WrappedMasterService& wrapped_master_service) {
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::ExistObject>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchReplicaClear>(
@@ -1413,12 +1491,21 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
         &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetReplicaListByObject>(
+        &wrapped_master_service);
     server
         .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
             &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutStart>(
         &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::PutObjectStart>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::PutObjectEnd>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::PutObjectRevoke>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutRevoke>(
         &wrapped_master_service);
@@ -1441,6 +1528,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::BatchUpsertRevoke>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Remove>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::RemoveObject>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::RemoveByRegex>(
         &wrapped_master_service);

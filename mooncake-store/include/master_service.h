@@ -106,6 +106,8 @@ class MasterService {
      * @return ErrorCode::OK if exists, otherwise return other ErrorCode
      */
     auto ExistKey(const std::string& key) -> tl::expected<bool, ErrorCode>;
+    auto ExistObject(const LogicalObjectId& object_id)
+        -> tl::expected<bool, ErrorCode>;
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys);
@@ -199,6 +201,8 @@ class MasterService {
      */
     auto GetReplicaList(const std::string& key)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
+    auto GetReplicaListByObject(const LogicalObjectId& object_id)
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
      * @brief Start a put operation for an object
@@ -211,6 +215,12 @@ class MasterService {
     auto PutStart(const UUID& client_id, const std::string& key,
                   const uint64_t slice_length, const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    auto PutObjectStart(const UUID& client_id,
+                        const PutObjectRequest& request)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    auto PutObjectEnd(const UUID& client_id,
+                      const PutObjectStateRequest& request)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Complete a put operation, replica_type indicates the type of
@@ -233,6 +243,9 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
+    auto PutObjectRevoke(const UUID& client_id,
+                         const PutObjectStateRequest& request)
+        -> tl::expected<void, ErrorCode>;
     auto PutRevoke(const UUID& client_id, const std::string& key,
                    ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
 
@@ -377,6 +390,8 @@ class MasterService {
      * found
      */
     auto Remove(const std::string& key, bool force = false)
+        -> tl::expected<void, ErrorCode>;
+    auto RemoveObject(const RemoveObjectRequest& request)
         -> tl::expected<void, ErrorCode>;
 
     /**

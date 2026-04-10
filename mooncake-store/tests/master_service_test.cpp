@@ -789,6 +789,51 @@ TEST_F(MasterServiceTest, GetReplicaList) {
     EXPECT_FALSE(replica_list_local.empty());
 }
 
+TEST_F(MasterServiceTest, ObjectIdentityApis) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const LogicalObjectId object_id{"tenant-a", "domain-a", "set-a",
+                                    "logical-key"};
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const PutObjectRequest put_request{object_id, 1024, config};
+
+    auto missing_exist = service_->ExistObject(object_id);
+    ASSERT_TRUE(missing_exist.has_value());
+    EXPECT_FALSE(missing_exist.value());
+
+    auto put_start_result = service_->PutObjectStart(client_id, put_request);
+    ASSERT_TRUE(put_start_result.has_value());
+    EXPECT_FALSE(put_start_result->empty());
+
+    auto during_put_query = service_->GetReplicaListByObject(object_id);
+    EXPECT_FALSE(during_put_query.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, during_put_query.error());
+
+    auto put_end_result = service_->PutObjectEnd(
+        client_id, PutObjectStateRequest{object_id, ReplicaType::MEMORY});
+    ASSERT_TRUE(put_end_result.has_value());
+
+    auto exist_result = service_->ExistObject(object_id);
+    ASSERT_TRUE(exist_result.has_value());
+    EXPECT_TRUE(exist_result.value());
+
+    auto get_result = service_->GetReplicaListByObject(object_id);
+    ASSERT_TRUE(get_result.has_value());
+    ASSERT_EQ(1u, get_result->replicas.size());
+    EXPECT_EQ(ReplicaStatus::COMPLETE, get_result->replicas[0].status);
+
+    auto remove_result =
+        service_->RemoveObject(RemoveObjectRequest{object_id, true});
+    ASSERT_TRUE(remove_result.has_value());
+
+    auto exist_after_remove = service_->ExistObject(object_id);
+    ASSERT_TRUE(exist_after_remove.has_value());
+    EXPECT_FALSE(exist_after_remove.value());
+}
+
 TEST_F(MasterServiceTest, RemoveObject) {
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);

@@ -28,6 +28,11 @@ struct RpcNameTraits<&WrappedMasterService::ExistKey> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ExistObject> {
+    static constexpr const char* value = "ExistObject";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
     static constexpr const char* value = "BatchExistKey";
 };
@@ -35,6 +40,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
     static constexpr const char* value = "GetReplicaList";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetReplicaListByObject> {
+    static constexpr const char* value = "GetReplicaListByObject";
 };
 
 template <>
@@ -68,6 +78,16 @@ struct RpcNameTraits<&WrappedMasterService::PutStart> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::PutObjectStart> {
+    static constexpr const char* value = "PutObjectStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::PutObjectEnd> {
+    static constexpr const char* value = "PutObjectEnd";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchPutStart> {
     static constexpr const char* value = "BatchPutStart";
 };
@@ -80,6 +100,11 @@ struct RpcNameTraits<&WrappedMasterService::PutEnd> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::BatchPutEnd> {
     static constexpr const char* value = "BatchPutEnd";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::PutObjectRevoke> {
+    static constexpr const char* value = "PutObjectRevoke";
 };
 
 template <>
@@ -125,6 +150,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchUpsertRevoke> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::Remove> {
     static constexpr const char* value = "Remove";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RemoveObject> {
+    static constexpr const char* value = "RemoveObject";
 };
 
 template <>
@@ -390,6 +420,17 @@ tl::expected<bool, ErrorCode> MasterClient::ExistKey(
     return result;
 }
 
+tl::expected<bool, ErrorCode> MasterClient::ExistObject(
+    const LogicalObjectId& object_id) {
+    ScopedVLogTimer timer(1, "MasterClient::ExistObject");
+    timer.LogRequest("object_id=", object_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::ExistObject, bool>(object_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     const std::vector<std::string>& object_keys) {
     ScopedVLogTimer timer(1, "MasterClient::BatchExistKey");
@@ -463,6 +504,17 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     return result;
 }
 
+tl::expected<GetReplicaListResponse, ErrorCode>
+MasterClient::GetReplicaListByObject(const LogicalObjectId& object_id) {
+    ScopedVLogTimer timer(1, "MasterClient::GetReplicaListByObject");
+    timer.LogRequest("object_id=", object_id);
+
+    auto result = invoke_rpc<&WrappedMasterService::GetReplicaListByObject,
+                             GetReplicaListResponse>(object_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
     ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
@@ -490,6 +542,32 @@ MasterClient::PutStart(const std::string& key,
     auto result = invoke_rpc<&WrappedMasterService::PutStart,
                              std::vector<Replica::Descriptor>>(
         client_id_, key, total_slice_length, config);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+MasterClient::PutObjectStart(const PutObjectRequest& request) {
+    ScopedVLogTimer timer(1, "MasterClient::PutObjectStart");
+    timer.LogRequest("object_id=", request.object_id,
+                     ", slice_length=", request.slice_length);
+
+    auto result = invoke_rpc<&WrappedMasterService::PutObjectStart,
+                             std::vector<Replica::Descriptor>>(client_id_,
+                                                               request);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::PutObjectEnd(
+    const PutObjectStateRequest& request) {
+    ScopedVLogTimer timer(1, "MasterClient::PutObjectEnd");
+    timer.LogRequest("object_id=", request.object_id,
+                     ", replica_type=", request.replica_type);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::PutObjectEnd, void>(client_id_,
+                                                               request);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -538,6 +616,18 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
         keys.size(), client_id_, keys);
     timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::PutObjectRevoke(
+    const PutObjectStateRequest& request) {
+    ScopedVLogTimer timer(1, "MasterClient::PutObjectRevoke");
+    timer.LogRequest("object_id=", request.object_id,
+                     ", replica_type=", request.replica_type);
+
+    auto result = invoke_rpc<&WrappedMasterService::PutObjectRevoke, void>(
+        client_id_, request);
+    timer.LogResponseExpected(result);
     return result;
 }
 
@@ -658,6 +748,18 @@ tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key,
     timer.LogRequest("key=", key, ", force=", force);
 
     auto result = invoke_rpc<&WrappedMasterService::Remove, void>(key, force);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::RemoveObject(
+    const RemoveObjectRequest& request) {
+    ScopedVLogTimer timer(1, "MasterClient::RemoveObject");
+    timer.LogRequest("object_id=", request.object_id,
+                     ", force=", request.force);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::RemoveObject, void>(request);
     timer.LogResponseExpected(result);
     return result;
 }

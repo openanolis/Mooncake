@@ -125,6 +125,8 @@ class Client {
      * indicating failure
      */
     tl::expected<QueryResult, ErrorCode> Query(const std::string& object_key);
+    tl::expected<QueryResult, ErrorCode> QueryObject(
+        const LogicalObjectId& object_id);
 
     /**
      * @brief Queries replica lists for object keys that match a regex pattern.
@@ -196,6 +198,9 @@ class Client {
     tl::expected<void, ErrorCode> Put(const ObjectKey& key,
                                       std::vector<Slice>& slices,
                                       const ReplicateConfig& config);
+    tl::expected<void, ErrorCode> PutObject(const LogicalObjectId& object_id,
+                                            std::vector<Slice>& slices,
+                                            const ReplicateConfig& config);
 
     /**
      * @brief Batch put data with replication
@@ -239,6 +244,8 @@ class Client {
      */
     tl::expected<void, ErrorCode> Remove(const ObjectKey& key,
                                          bool force = false);
+    tl::expected<void, ErrorCode> RemoveObject(const LogicalObjectId& object_id,
+                                               bool force = false);
 
     /**
      * @brief Removes objects from the store whose keys match a regex pattern.
@@ -325,6 +332,7 @@ class Client {
      * exists, other ErrorCode for errors
      */
     tl::expected<bool, ErrorCode> IsExist(const std::string& key);
+    tl::expected<bool, ErrorCode> IsExistObject(const LogicalObjectId& object_id);
 
     /**
      * @brief Checks if multiple objects exist

@@ -41,6 +41,25 @@ struct GetReplicaListResponse {
 };
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms);
 
+struct PutObjectRequest {
+    LogicalObjectId object_id;
+    uint64_t slice_length{0};
+    ReplicateConfig config;
+};
+YLT_REFL(PutObjectRequest, object_id, slice_length, config);
+
+struct PutObjectStateRequest {
+    LogicalObjectId object_id;
+    ReplicaType replica_type{ReplicaType::MEMORY};
+};
+YLT_REFL(PutObjectStateRequest, object_id, replica_type);
+
+struct RemoveObjectRequest {
+    LogicalObjectId object_id;
+    bool force{false};
+};
+YLT_REFL(RemoveObjectRequest, object_id, force);
+
 /**
  * @brief Response structure for GetStorageConfig operation
  */

@@ -1013,6 +1013,64 @@ auto MasterService::GetReplicaList(const std::string& key)
                                   default_kv_lease_ttl_);
 }
 
+auto MasterService::GetReplicaListByObject(const LogicalObjectId& object_id)
+    -> tl::expected<GetReplicaListResponse, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataShardAccessorRO shard(this, getShardIndex(object_id.logical_key));
+
+    MasterMetricManager::instance().inc_total_get_nums();
+
+    auto it = shard->metadata.find(object_id);
+    if (it == shard->metadata.end() || !it->second.IsValid()) {
+        VLOG(1) << "object_id=" << object_id << ", info=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    const auto& metadata = it->second;
+
+    std::vector<Replica::Descriptor> replica_list;
+    metadata.VisitReplicas(
+        &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
+            replica_list.emplace_back(replica.get_descriptor());
+        });
+
+    if (replica_list.empty()) {
+        LOG(WARNING) << "object_id=" << object_id
+                     << ", error=replica_not_ready";
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    if (replica_list[0].is_memory_replica()) {
+        MasterMetricManager::instance().inc_mem_cache_hit_nums();
+    } else if (replica_list[0].is_disk_replica()) {
+        MasterMetricManager::instance().inc_file_cache_hit_nums();
+    }
+    MasterMetricManager::instance().inc_valid_get_nums();
+    metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+
+    return GetReplicaListResponse(std::move(replica_list),
+                                  default_kv_lease_ttl_);
+}
+
+auto MasterService::ExistObject(const LogicalObjectId& object_id)
+    -> tl::expected<bool, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataShardAccessorRO shard(this, getShardIndex(object_id.logical_key));
+    auto it = shard->metadata.find(object_id);
+    return it != shard->metadata.end() && it->second.IsValid();
+}
+
+auto MasterService::PutObjectStart(const UUID& client_id,
+                                   const PutObjectRequest& request)
+    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    ReplicateConfig config = request.config;
+    config.tenant_id = request.object_id.tenant_id;
+    config.domain_id = request.object_id.domain_id;
+    config.object_set = request.object_id.object_set;
+    config.logical_key = request.object_id.logical_key;
+    return PutStart(client_id, request.object_id.logical_key,
+                    request.slice_length, config);
+}
+
 AdmissionRequestContext MasterService::BuildAdmissionRequestContext(
     AdmissionRequestContext::Operation operation, const std::string& key,
     uint64_t value_length, const ReplicateConfig& config) const {
@@ -1307,6 +1365,13 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                                      config, now);
 }
 
+auto MasterService::PutObjectEnd(const UUID& client_id,
+                                 const PutObjectStateRequest& request)
+    -> tl::expected<void, ErrorCode> {
+    return PutEnd(client_id, request.object_id.logical_key,
+                  request.replica_type);
+}
+
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                            ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
@@ -1408,6 +1473,13 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                     .object_size;
         });
     return {};
+}
+
+auto MasterService::PutObjectRevoke(const UUID& client_id,
+                                    const PutObjectStateRequest& request)
+    -> tl::expected<void, ErrorCode> {
+    return PutRevoke(client_id, request.object_id.logical_key,
+                     request.replica_type);
 }
 
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
@@ -2231,6 +2303,36 @@ auto MasterService::Remove(const std::string& key, bool force)
 
     // Remove object metadata
     accessor.Erase();
+    return {};
+}
+
+auto MasterService::RemoveObject(const RemoveObjectRequest& request)
+    -> tl::expected<void, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataShardAccessorRW shard(this, getShardIndex(request.object_id.logical_key));
+    auto it = shard->metadata.find(request.object_id);
+    if (it == shard->metadata.end() || !it->second.IsValid()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    auto& metadata = it->second;
+    if (!request.force && !metadata.IsLeaseExpired()) {
+        VLOG(1) << "object_id=" << request.object_id << ", error=object_has_lease";
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+    }
+    if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
+        LOG(ERROR) << "object_id=" << request.object_id << ", error=replica_not_ready";
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    if (shard->replication_tasks.contains(metadata.legacy_raw_key)) {
+        LOG(ERROR) << "object_id=" << request.object_id
+                   << ", error=object_has_replication_task";
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+    }
+
+    ReleaseLiveBytes(metadata);
+    UnindexMetadata(*shard.operator->(), it->first, it->second);
+    shard->metadata.erase(it);
     return {};
 }
 
