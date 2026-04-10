@@ -352,6 +352,8 @@ sequenceDiagram
 - standby metadata export now returns identity-native `(LogicalObjectId, StandbyObjectMetadata)` pairs for promotion/recovery flows
 - oplog apply now preserves `legacy_raw_key` when materializing standby metadata
 - namespace-native RPC and client entrypoints now expose `ExistObject`, `GetReplicaListByObject`, `PutObjectStart/PutObjectEnd/PutObjectRevoke`, and `RemoveObject`
+- admin/list/regex/remove metadata views now match on `logical_key`, while legacy raw-key alias lookup remains available for compatibility
+- `processing_keys`, `replication_tasks`, and `offloading_tasks` now track `LogicalObjectId` instead of raw keys, so cleanup, replication, and offload lifecycle paths no longer depend on raw-key-primary bookkeeping
 
 #### TENT runtime side
 
@@ -365,8 +367,7 @@ sequenceDiagram
 ### Planned next extension
 
 - extending namespace-native RPC and client coverage across the remaining object lifecycle paths
-- retiring remaining raw-key-primary assumptions from management/query surfaces
-- extending regex/list/remove semantics from legacy raw-key views to logical identity views
+- retiring the remaining raw-key-primary assumptions from admin and background-maintenance paths
 
 ## File Scope
 

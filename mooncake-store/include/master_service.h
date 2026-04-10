@@ -943,11 +943,14 @@ class MasterService {
                                               LogicalObjectIdHash>,
                            ReuseKeyHash>
             reuse_candidates GUARDED_BY(mutex);
-        std::unordered_set<std::string> processing_keys GUARDED_BY(mutex);
-        std::unordered_map<std::string, const ReplicationTask> replication_tasks
+        std::unordered_set<LogicalObjectId, LogicalObjectIdHash> processing_keys
             GUARDED_BY(mutex);
-        std::unordered_map<std::string, const OffloadingTask> offloading_tasks
-            GUARDED_BY(mutex);
+        std::unordered_map<LogicalObjectId, const ReplicationTask,
+                           LogicalObjectIdHash>
+            replication_tasks GUARDED_BY(mutex);
+        std::unordered_map<LogicalObjectId, const OffloadingTask,
+                           LogicalObjectIdHash>
+            offloading_tasks GUARDED_BY(mutex);
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
@@ -1001,6 +1004,10 @@ class MasterService {
     void UnindexMetadata(MetadataShard& shard, const LogicalObjectId& object_id,
                          const ObjectMetadata& metadata) const;
     void RebuildShardIndexes(MetadataShard& shard) const;
+    std::optional<size_t> FindShardIndexByObjectId(
+        const LogicalObjectId& object_id) const;
+    std::optional<std::string> FindLegacyKeyByObjectId(
+        const LogicalObjectId& object_id) const;
     const std::unordered_set<LogicalObjectId, LogicalObjectIdHash>* FindScopedKeys(
         const MetadataShard& shard, const std::string& tenant_id,
         const std::string& domain_id) const;
@@ -1095,8 +1102,14 @@ class MasterService {
               it_(alias_it_ != shard_guard_->raw_key_to_id.end()
                       ? shard_guard_->metadata.find(alias_it_->second)
                       : shard_guard_->metadata.end()),
-              processing_it_(shard_guard_->processing_keys.find(key)),
-              replication_task_it_(shard_guard_->replication_tasks.find(key)) {
+              processing_it_(alias_it_ != shard_guard_->raw_key_to_id.end()
+                                 ? shard_guard_->processing_keys.find(
+                                       alias_it_->second)
+                                 : shard_guard_->processing_keys.end()),
+              replication_task_it_(
+                  alias_it_ != shard_guard_->raw_key_to_id.end()
+                      ? shard_guard_->replication_tasks.find(alias_it_->second)
+                      : shard_guard_->replication_tasks.end()) {
             if (it_ != shard_guard_->metadata.end()) {
                 if (service_->CleanupStaleHandles(it_->second)) {
                     this->Erase();
@@ -1193,9 +1206,10 @@ class MasterService {
         std::unordered_map<std::string, LogicalObjectId>::iterator alias_it_;
         std::unordered_map<LogicalObjectId, ObjectMetadata,
                            LogicalObjectIdHash>::iterator it_;
-        std::unordered_set<std::string>::iterator processing_it_;
-        std::unordered_map<std::string, const ReplicationTask>::iterator
-            replication_task_it_;
+        std::unordered_set<LogicalObjectId, LogicalObjectIdHash>::iterator
+            processing_it_;
+        std::unordered_map<LogicalObjectId, const ReplicationTask,
+                           LogicalObjectIdHash>::iterator replication_task_it_;
     };
 
     class MetadataSerializer {
@@ -1252,7 +1266,10 @@ class MasterService {
               it_(alias_it_ != shard_guard_->raw_key_to_id.end()
                       ? shard_guard_->metadata.find(alias_it_->second)
                       : shard_guard_->metadata.end()),
-              processing_it_(shard_guard_->processing_keys.find(key)) {}
+              processing_it_(alias_it_ != shard_guard_->raw_key_to_id.end()
+                                 ? shard_guard_->processing_keys.find(
+                                       alias_it_->second)
+                                 : shard_guard_->processing_keys.end()) {}
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
@@ -1280,7 +1297,8 @@ class MasterService {
         std::unordered_map<std::string, LogicalObjectId>::const_iterator alias_it_;
         std::unordered_map<LogicalObjectId, ObjectMetadata,
                            LogicalObjectIdHash>::const_iterator it_;
-        std::unordered_set<std::string>::const_iterator processing_it_;
+        std::unordered_set<LogicalObjectId, LogicalObjectIdHash>::const_iterator
+            processing_it_;
     };
 
     friend class MetadataAccessorRW;

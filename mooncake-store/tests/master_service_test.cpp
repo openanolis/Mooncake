@@ -798,6 +798,9 @@ TEST_F(MasterServiceTest, ObjectIdentityApis) {
                                     "logical-key"};
     ReplicateConfig config;
     config.replica_num = 1;
+    config.tenant_id = object_id.tenant_id;
+    config.domain_id = object_id.domain_id;
+    config.object_set = object_id.object_set;
     const PutObjectRequest put_request{object_id, 1024, config};
 
     auto missing_exist = service_->ExistObject(object_id);
@@ -832,6 +835,46 @@ TEST_F(MasterServiceTest, ObjectIdentityApis) {
     auto exist_after_remove = service_->ExistObject(object_id);
     ASSERT_TRUE(exist_after_remove.has_value());
     EXPECT_FALSE(exist_after_remove.value());
+}
+
+TEST_F(MasterServiceTest, RemoveObjectBlocksIdentityWhenReplicationTaskExists) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context1 =
+        PrepareSimpleSegment(*service_, "segment_1");
+    [[maybe_unused]] const auto context2 =
+        PrepareSimpleSegment(*service_, "segment_2");
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_1";
+    config.tenant_id = "tenant-a";
+    config.domain_id = "domain-a";
+    config.object_set = "set-a";
+    config.logical_key = "logical-visible-key";
+    const LogicalObjectId object_id{"tenant-a", "domain-a", "set-a",
+                                    "logical-visible-key"};
+
+    auto put_start_result =
+        service_->PutStart(client_id, "legacy-alias-key", 1024, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, "legacy-alias-key", ReplicaType::MEMORY)
+            .has_value());
+
+    auto copy_start_result = service_->CopyStart(client_id, "legacy-alias-key",
+                                                 "segment_1", {"segment_2"});
+    ASSERT_TRUE(copy_start_result.has_value());
+
+    auto blocked_remove =
+        service_->RemoveObject(RemoveObjectRequest{object_id, true});
+    ASSERT_FALSE(blocked_remove.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, blocked_remove.error());
+
+    ASSERT_TRUE(service_->CopyEnd(client_id, "legacy-alias-key").has_value());
+
+    auto remove_result = service_->RemoveObject(RemoveObjectRequest{object_id, true});
+    EXPECT_TRUE(remove_result.has_value());
 }
 
 TEST_F(MasterServiceTest, RemoveObject) {
@@ -4988,22 +5031,26 @@ TEST_F(MasterServiceTest, ScopedMetadataQueriesStayWithinTenantDomain) {
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
-    auto put_object = [&](const std::string& key, const std::string& tenant_id,
+    auto put_object = [&](const std::string& raw_key,
+                          const std::string& logical_key,
+                          const std::string& tenant_id,
                           const std::string& domain_id) {
         ReplicateConfig config;
         config.replica_num = 1;
         config.tenant_id = tenant_id;
         config.domain_id = domain_id;
         config.object_set = "set-a";
-        ASSERT_TRUE(service_->PutStart(client_id, key, 1024, config).has_value());
-        ASSERT_TRUE(service_->PutEnd(client_id, key, ReplicaType::MEMORY)
+        config.logical_key = logical_key;
+        ASSERT_TRUE(
+            service_->PutStart(client_id, raw_key, 1024, config).has_value());
+        ASSERT_TRUE(service_->PutEnd(client_id, raw_key, ReplicaType::MEMORY)
                         .has_value());
     };
 
-    put_object("scope_a_foo", "tenant-a", "domain-a");
-    put_object("scope_a_bar", "tenant-a", "domain-a");
-    put_object("scope_b_foo", "tenant-a", "domain-b");
-    put_object("scope_c_foo", "tenant-b", "domain-a");
+    put_object("alias_scope_a_foo", "scope_a_foo", "tenant-a", "domain-a");
+    put_object("alias_scope_a_bar", "scope_a_bar", "tenant-a", "domain-a");
+    put_object("alias_scope_b_foo", "scope_b_foo", "tenant-a", "domain-b");
+    put_object("alias_scope_c_foo", "scope_c_foo", "tenant-b", "domain-a");
 
     auto scoped_keys = service_->GetAllKeysByScope("tenant-a", "domain-a");
     ASSERT_TRUE(scoped_keys.has_value());
@@ -5027,11 +5074,48 @@ TEST_F(MasterServiceTest, ScopedMetadataQueriesStayWithinTenantDomain) {
         service_->RemoveByRegexInScope("foo$", "tenant-a", "domain-a", true);
     ASSERT_TRUE(remove_result.has_value());
     EXPECT_EQ(1, remove_result.value());
-    ASSERT_TRUE(service_->ExistKey("scope_a_foo").has_value());
-    EXPECT_FALSE(service_->ExistKey("scope_a_foo").value());
-    EXPECT_TRUE(service_->ExistKey("scope_a_bar").value());
-    EXPECT_TRUE(service_->ExistKey("scope_b_foo").value());
-    EXPECT_TRUE(service_->ExistKey("scope_c_foo").value());
+    ASSERT_TRUE(service_->ExistKey("alias_scope_a_foo").has_value());
+    EXPECT_FALSE(service_->ExistKey("alias_scope_a_foo").value());
+    EXPECT_TRUE(service_->ExistKey("alias_scope_a_bar").value());
+    EXPECT_TRUE(service_->ExistKey("alias_scope_b_foo").value());
+    EXPECT_TRUE(service_->ExistKey("alias_scope_c_foo").value());
+}
+
+TEST_F(MasterServiceTest, GlobalMetadataQueriesUseLogicalKeyView) {
+    auto service_config = MasterServiceConfig::builder().build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.tenant_id = "tenant-a";
+    config.domain_id = "domain-a";
+    config.object_set = "set-a";
+    config.logical_key = "logical-visible-key";
+
+    ASSERT_TRUE(
+        service_->PutStart(client_id, "legacy-alias-key", 1024, config)
+            .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, "legacy-alias-key",
+                                 ReplicaType::MEMORY)
+                    .has_value());
+
+    auto all_keys = service_->GetAllKeys();
+    ASSERT_TRUE(all_keys.has_value());
+    EXPECT_EQ(1u, all_keys->size());
+    EXPECT_EQ("logical-visible-key", all_keys->front());
+
+    auto regex_result = service_->GetReplicaListByRegex("visible");
+    ASSERT_TRUE(regex_result.has_value());
+    EXPECT_TRUE(regex_result->contains("logical-visible-key"));
+    EXPECT_FALSE(regex_result->contains("legacy-alias-key"));
+
+    auto remove_result = service_->RemoveByRegex("visible", true);
+    ASSERT_TRUE(remove_result.has_value());
+    EXPECT_EQ(1, *remove_result);
+    ASSERT_TRUE(service_->ExistKey("legacy-alias-key").has_value());
+    EXPECT_FALSE(service_->ExistKey("legacy-alias-key").value());
 }
 
 TEST_F(MasterServiceTest, UpsertConflictReplicationTask) {

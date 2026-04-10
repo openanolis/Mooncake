@@ -511,6 +511,8 @@ sequenceDiagram
 - standby metadata 导出已经切换为 identity-native 的 `(LogicalObjectId, StandbyObjectMetadata)` 结果，便于 promotion / recovery 直接消费
 - oplog apply 在 standby 侧落库时会保留 `legacy_raw_key`
 - namespace-native 的 RPC / client 入口已经补齐 `ExistObject`、`GetReplicaListByObject`、`PutObjectStart/PutObjectEnd/PutObjectRevoke` 和 `RemoveObject`
+- admin/list/regex/remove 等 metadata 视图已经切到按 `logical_key` 匹配；legacy raw-key alias lookup 继续保留兼容
+- `processing_keys`、`replication_tasks`、`offloading_tasks` 等后台维护状态也已经切到按 `LogicalObjectId` 跟踪，避免后台清理、复制和 offload 生命周期继续把 raw key 当成主身份
 
 ## 11.2 TENT runtime 侧
 
@@ -529,8 +531,7 @@ sequenceDiagram
 还未完整补齐的是：
 
 - 继续把 namespace-native RPC / client 覆盖到剩余对象生命周期路径
-- 管理与查询接口里剩余的 raw-key-primary 语义
-- regex / list / remove 从 legacy raw-key 视图迁移到 logical identity 视图
+- 清理 admin 与后台维护路径里剩余的 raw-key-primary 假设
 
 ---
 
