@@ -351,6 +351,9 @@ class Client {
      */
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const LogicalObjectId& object_id,
+        const std::vector<std::string>& targets);
 
     /**
      * @brief Create a move task to move an object's replica from source segment
@@ -362,6 +365,9 @@ class Client {
      * failure
      */
     tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& source,
+                                                 const std::string& target);
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const LogicalObjectId& object_id,
                                                  const std::string& source,
                                                  const std::string& target);
 
@@ -718,6 +724,9 @@ class Client {
     tl::expected<void, ErrorCode> Copy(const std::string& key,
                                        const std::string& source,
                                        const std::vector<std::string>& targets);
+    tl::expected<void, ErrorCode> Copy(const LogicalObjectId& object_id,
+                                       const std::string& source,
+                                       const std::vector<std::string>& targets);
 
     /**
      * @brief Move an object's replica from source segment to target segment
@@ -727,6 +736,9 @@ class Client {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     tl::expected<void, ErrorCode> Move(const std::string& key,
+                                       const std::string& source,
+                                       const std::string& target);
+    tl::expected<void, ErrorCode> Move(const LogicalObjectId& object_id,
                                        const std::string& source,
                                        const std::string& target);
 

@@ -510,7 +510,7 @@ sequenceDiagram
 - hot-standby 的 snapshot 加载已经恢复为以 `LogicalObjectId` 为主键的 metadata，并保留 legacy raw-key alias
 - standby metadata 导出已经切换为 identity-native 的 `(LogicalObjectId, StandbyObjectMetadata)` 结果，便于 promotion / recovery 直接消费
 - oplog apply 在 standby 侧落库时会保留 `legacy_raw_key`
-- namespace-native 的 RPC / client 入口已经补齐 `ExistObject`、`GetReplicaListByObject`、`PutObjectStart/PutObjectEnd/PutObjectRevoke` 和 `RemoveObject`
+- namespace-native 的 RPC / client 入口已经补齐 `ExistObject`、`GetReplicaListByObject`、`PutObjectStart/PutObjectEnd/PutObjectRevoke`、`CopyObjectStart/CopyObjectEnd/CopyObjectRevoke`、`MoveObjectStart/MoveObjectEnd/MoveObjectRevoke` 和 `RemoveObject`
 - admin/list/regex/remove 等 metadata 视图已经切到按 `logical_key` 匹配；legacy raw-key alias lookup 继续保留兼容
 - `processing_keys`、`replication_tasks`、`offloading_tasks` 等后台维护状态也已经切到按 `LogicalObjectId` 跟踪，避免后台清理、复制和 offload 生命周期继续把 raw key 当成主身份
 
@@ -530,7 +530,7 @@ sequenceDiagram
 
 还未完整补齐的是：
 
-- 继续把 namespace-native RPC / client 覆盖到剩余对象生命周期路径
+- 继续把 namespace-native 能力覆盖到仍以 legacy raw key 暴露的 task/admin 入口
 - 清理 admin 与后台维护路径里剩余的 raw-key-primary 假设
 
 ---

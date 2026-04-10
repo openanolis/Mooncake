@@ -247,6 +247,18 @@ class MasterClient {
                                                        bool force = false);
     [[nodiscard]] tl::expected<void, ErrorCode> RemoveObject(
         const RemoveObjectRequest& request);
+    [[nodiscard]] tl::expected<CopyStartResponse, ErrorCode> CopyObjectStart(
+        const CopyObjectRequest& request);
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyObjectEnd(
+        const LogicalObjectId& object_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyObjectRevoke(
+        const LogicalObjectId& object_id);
+    [[nodiscard]] tl::expected<MoveStartResponse, ErrorCode> MoveObjectStart(
+        const MoveObjectRequest& request);
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveObjectEnd(
+        const LogicalObjectId& object_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveObjectRevoke(
+        const LogicalObjectId& object_id);
 
     /**
      * @brief Removes objects from the master whose keys match a regex pattern.

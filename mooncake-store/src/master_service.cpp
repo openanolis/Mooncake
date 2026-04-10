@@ -1977,6 +1977,15 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     return response;
 }
 
+tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyObjectStart(
+    const UUID& client_id, const CopyObjectRequest& request) {
+    auto key = FindLegacyKeyByObjectId(request.object_id);
+    if (!key.has_value()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    return CopyStart(client_id, *key, request.src_segment, request.tgt_segments);
+}
+
 tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
                                                      const std::string& key) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -2048,6 +2057,15 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
                         : tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
 }
 
+tl::expected<void, ErrorCode> MasterService::CopyObjectEnd(
+    const UUID& client_id, const LogicalObjectId& object_id) {
+    auto key = FindLegacyKeyByObjectId(object_id);
+    if (!key.has_value()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    return CopyEnd(client_id, *key);
+}
+
 tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     const UUID& client_id, const std::string& key) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -2099,6 +2117,15 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     }
 
     return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::CopyObjectRevoke(
+    const UUID& client_id, const LogicalObjectId& object_id) {
+    auto key = FindLegacyKeyByObjectId(object_id);
+    if (!key.has_value()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    return CopyRevoke(client_id, *key);
 }
 
 tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
@@ -2179,6 +2206,15 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     metadata.AddReplicas(std::move(replicas));
 
     return response;
+}
+
+tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveObjectStart(
+    const UUID& client_id, const MoveObjectRequest& request) {
+    auto key = FindLegacyKeyByObjectId(request.object_id);
+    if (!key.has_value()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    return MoveStart(client_id, *key, request.src_segment, request.tgt_segment);
 }
 
 tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
@@ -2267,6 +2303,15 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
     return {};
 }
 
+tl::expected<void, ErrorCode> MasterService::MoveObjectEnd(
+    const UUID& client_id, const LogicalObjectId& object_id) {
+    auto key = FindLegacyKeyByObjectId(object_id);
+    if (!key.has_value()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    return MoveEnd(client_id, *key);
+}
+
 tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     const UUID& client_id, const std::string& key) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -2318,6 +2363,15 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     }
 
     return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::MoveObjectRevoke(
+    const UUID& client_id, const LogicalObjectId& object_id) {
+    auto key = FindLegacyKeyByObjectId(object_id);
+    if (!key.has_value()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    return MoveRevoke(client_id, *key);
 }
 
 auto MasterService::Remove(const std::string& key, bool force)

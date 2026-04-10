@@ -117,6 +117,18 @@ class WrappedMasterService {
                                          bool force = false);
     tl::expected<void, ErrorCode> RemoveObject(
         const RemoveObjectRequest& request);
+    tl::expected<CopyStartResponse, ErrorCode> CopyObjectStart(
+        const UUID& client_id, const CopyObjectRequest& request);
+    tl::expected<void, ErrorCode> CopyObjectEnd(
+        const UUID& client_id, const LogicalObjectId& object_id);
+    tl::expected<void, ErrorCode> CopyObjectRevoke(
+        const UUID& client_id, const LogicalObjectId& object_id);
+    tl::expected<MoveStartResponse, ErrorCode> MoveObjectStart(
+        const UUID& client_id, const MoveObjectRequest& request);
+    tl::expected<void, ErrorCode> MoveObjectEnd(
+        const UUID& client_id, const LogicalObjectId& object_id);
+    tl::expected<void, ErrorCode> MoveObjectRevoke(
+        const UUID& client_id, const LogicalObjectId& object_id);
 
     tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str,
                                                 bool force = false);

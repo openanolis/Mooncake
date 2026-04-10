@@ -228,8 +228,18 @@ struct RpcNameTraits<&WrappedMasterService::CopyStart> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::CopyObjectStart> {
+    static constexpr const char* value = "CopyObjectStart";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::CopyEnd> {
     static constexpr const char* value = "CopyEnd";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CopyObjectEnd> {
+    static constexpr const char* value = "CopyObjectEnd";
 };
 
 template <>
@@ -238,8 +248,18 @@ struct RpcNameTraits<&WrappedMasterService::CopyRevoke> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::CopyObjectRevoke> {
+    static constexpr const char* value = "CopyObjectRevoke";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::MoveStart> {
     static constexpr const char* value = "MoveStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::MoveObjectStart> {
+    static constexpr const char* value = "MoveObjectStart";
 };
 
 template <>
@@ -248,8 +268,18 @@ struct RpcNameTraits<&WrappedMasterService::MoveEnd> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::MoveObjectEnd> {
+    static constexpr const char* value = "MoveObjectEnd";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::MoveRevoke> {
     static constexpr const char* value = "MoveRevoke";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::MoveObjectRevoke> {
+    static constexpr const char* value = "MoveObjectRevoke";
 };
 
 template <>
@@ -760,6 +790,75 @@ tl::expected<void, ErrorCode> MasterClient::RemoveObject(
 
     auto result =
         invoke_rpc<&WrappedMasterService::RemoveObject, void>(request);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<CopyStartResponse, ErrorCode> MasterClient::CopyObjectStart(
+    const CopyObjectRequest& request) {
+    ScopedVLogTimer timer(1, "MasterClient::CopyObjectStart");
+    timer.LogRequest("object_id=", request.object_id, ", src_segment=",
+                     request.src_segment, ", tgt_segments_count=",
+                     request.tgt_segments.size());
+
+    auto result = invoke_rpc<&WrappedMasterService::CopyObjectStart,
+                             CopyStartResponse>(client_id_, request);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::CopyObjectEnd(
+    const LogicalObjectId& object_id) {
+    ScopedVLogTimer timer(1, "MasterClient::CopyObjectEnd");
+    timer.LogRequest("object_id=", object_id);
+
+    auto result = invoke_rpc<&WrappedMasterService::CopyObjectEnd, void>(
+        client_id_, object_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::CopyObjectRevoke(
+    const LogicalObjectId& object_id) {
+    ScopedVLogTimer timer(1, "MasterClient::CopyObjectRevoke");
+    timer.LogRequest("object_id=", object_id);
+
+    auto result = invoke_rpc<&WrappedMasterService::CopyObjectRevoke, void>(
+        client_id_, object_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<MoveStartResponse, ErrorCode> MasterClient::MoveObjectStart(
+    const MoveObjectRequest& request) {
+    ScopedVLogTimer timer(1, "MasterClient::MoveObjectStart");
+    timer.LogRequest("object_id=", request.object_id, ", src_segment=",
+                     request.src_segment, ", tgt_segment=", request.tgt_segment);
+
+    auto result = invoke_rpc<&WrappedMasterService::MoveObjectStart,
+                             MoveStartResponse>(client_id_, request);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::MoveObjectEnd(
+    const LogicalObjectId& object_id) {
+    ScopedVLogTimer timer(1, "MasterClient::MoveObjectEnd");
+    timer.LogRequest("object_id=", object_id);
+
+    auto result = invoke_rpc<&WrappedMasterService::MoveObjectEnd, void>(
+        client_id_, object_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::MoveObjectRevoke(
+    const LogicalObjectId& object_id) {
+    ScopedVLogTimer timer(1, "MasterClient::MoveObjectRevoke");
+    timer.LogRequest("object_id=", object_id);
+
+    auto result = invoke_rpc<&WrappedMasterService::MoveObjectRevoke, void>(
+        client_id_, object_id);
     timer.LogResponseExpected(result);
     return result;
 }

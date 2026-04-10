@@ -2403,10 +2403,22 @@ tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
     return master_client_.CreateCopyTask(key, targets);
 }
 
+tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
+    const LogicalObjectId& object_id,
+    const std::vector<std::string>& targets) {
+    return master_client_.CreateCopyTask(object_id.logical_key, targets);
+}
+
 tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
     const std::string& key, const std::string& source,
     const std::string& target) {
     return master_client_.CreateMoveTask(key, source, target);
+}
+
+tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
+    const LogicalObjectId& object_id, const std::string& source,
+    const std::string& target) {
+    return master_client_.CreateMoveTask(object_id.logical_key, source, target);
 }
 
 tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
@@ -2510,6 +2522,52 @@ tl::expected<void, ErrorCode> Client::Copy(
     return result;
 }
 
+tl::expected<void, ErrorCode> Client::Copy(
+    const LogicalObjectId& object_id, const std::string& source,
+    const std::vector<std::string>& targets) {
+    LOG(INFO) << "action=replica_copy_start" << ", object_id=" << object_id
+              << ", targets_count=" << targets.size();
+
+    auto start_result = master_client_.CopyObjectStart(
+        CopyObjectRequest{object_id, source, targets});
+    if (!start_result.has_value()) {
+        ErrorCode error = start_result.error();
+        LOG(ERROR) << "action=replica_copy_failed" << ", object_id="
+                   << object_id << ", source=" << source
+                   << ", error=copy_start_failed"
+                   << ", error_code=" << error;
+        return tl::unexpected(error);
+    }
+
+    const auto& response = start_result.value();
+    if (response.targets.empty()) {
+        LOG(INFO) << "action=replica_copy_skipped" << ", object_id="
+                  << object_id << ", info=target_replicas_already_exist";
+        auto copy_end_result = master_client_.CopyObjectEnd(object_id);
+        if (!copy_end_result.has_value()) {
+            ErrorCode error = copy_end_result.error();
+            LOG(ERROR) << "action=replica_copy_failed" << ", object_id="
+                       << object_id << ", error=copy_end_failed"
+                       << ", error_code=" << error;
+            return tl::unexpected(error);
+        }
+        return {};
+    }
+
+    auto result = ExecuteReplicaTransfer(
+        object_id.logical_key, "copy",
+        [&]() { return master_client_.CopyObjectEnd(object_id); },
+        [&]() { return master_client_.CopyObjectRevoke(object_id); },
+        response.source, response.targets);
+
+    if (result.has_value()) {
+        LOG(INFO) << "action=replica_copy_success" << ", object_id="
+                  << object_id << ", target_count=" << response.targets.size();
+    }
+
+    return result;
+}
+
 tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& source,
                                            const std::string& target) {
@@ -2552,6 +2610,55 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     if (result.has_value()) {
         LOG(INFO) << "action=replica_move_success" << ", key=" << key
                   << ", source_segment=" << source
+                  << ", target_segment=" << target;
+    }
+
+    return result;
+}
+
+tl::expected<void, ErrorCode> Client::Move(
+    const LogicalObjectId& object_id, const std::string& source,
+    const std::string& target) {
+    LOG(INFO) << "action=replica_move_start" << ", object_id=" << object_id
+              << ", source_segment=" << source
+              << ", target_segment=" << target;
+
+    auto move_start_result = master_client_.MoveObjectStart(
+        MoveObjectRequest{object_id, source, target});
+    if (!move_start_result.has_value()) {
+        ErrorCode error = move_start_result.error();
+        LOG(ERROR) << "action=replica_move_failed" << ", object_id="
+                   << object_id << ", error=move_start_failed"
+                   << ", error_code=" << error;
+        return tl::unexpected(error);
+    }
+
+    const auto& response = move_start_result.value();
+    if (!response.target.has_value()) {
+        LOG(INFO) << "action=replica_move_skipped" << ", object_id="
+                  << object_id << ", info=target_replica_already_exists";
+        auto move_end_result = master_client_.MoveObjectEnd(object_id);
+        if (!move_end_result.has_value()) {
+            ErrorCode error = move_end_result.error();
+            LOG(ERROR) << "action=replica_move_failed" << ", object_id="
+                       << object_id << ", error=move_end_failed"
+                       << ", error_code=" << error;
+            return tl::unexpected(error);
+        }
+        return {};
+    }
+
+    std::vector<Replica::Descriptor> targets = {response.target.value()};
+
+    auto result = ExecuteReplicaTransfer(
+        object_id.logical_key, "move",
+        [&]() { return master_client_.MoveObjectEnd(object_id); },
+        [&]() { return master_client_.MoveObjectRevoke(object_id); },
+        response.source, targets);
+
+    if (result.has_value()) {
+        LOG(INFO) << "action=replica_move_success" << ", object_id="
+                  << object_id << ", source_segment=" << source
                   << ", target_segment=" << target;
     }
 

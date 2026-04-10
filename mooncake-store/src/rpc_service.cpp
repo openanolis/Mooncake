@@ -1258,6 +1258,84 @@ tl::expected<void, ErrorCode> WrappedMasterService::MoveEnd(
         [] { MasterMetricManager::instance().inc_move_end_failures(); });
 }
 
+tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyObjectStart(
+    const UUID& client_id, const CopyObjectRequest& request) {
+    return execute_rpc(
+        "CopyObjectStart",
+        [&] { return master_service_.CopyObjectStart(client_id, request); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", object_id=",
+                             request.object_id, ", src_segment=",
+                             request.src_segment, ", tgt_segments_count=",
+                             request.tgt_segments.size());
+        },
+        [] { MasterMetricManager::instance().inc_copy_start_requests(); },
+        [] { MasterMetricManager::instance().inc_copy_start_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::CopyObjectEnd(
+    const UUID& client_id, const LogicalObjectId& object_id) {
+    return execute_rpc(
+        "CopyObjectEnd",
+        [&] { return master_service_.CopyObjectEnd(client_id, object_id); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", object_id=", object_id);
+        },
+        [] { MasterMetricManager::instance().inc_copy_end_requests(); },
+        [] { MasterMetricManager::instance().inc_copy_end_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::CopyObjectRevoke(
+    const UUID& client_id, const LogicalObjectId& object_id) {
+    return execute_rpc(
+        "CopyObjectRevoke",
+        [&] { return master_service_.CopyObjectRevoke(client_id, object_id); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", object_id=", object_id);
+        },
+        [] { MasterMetricManager::instance().inc_copy_revoke_requests(); },
+        [] { MasterMetricManager::instance().inc_copy_revoke_failures(); });
+}
+
+tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveObjectStart(
+    const UUID& client_id, const MoveObjectRequest& request) {
+    return execute_rpc(
+        "MoveObjectStart",
+        [&] { return master_service_.MoveObjectStart(client_id, request); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", object_id=",
+                             request.object_id, ", src_segment=",
+                             request.src_segment, ", tgt_segment=",
+                             request.tgt_segment);
+        },
+        [] { MasterMetricManager::instance().inc_move_start_requests(); },
+        [] { MasterMetricManager::instance().inc_move_start_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::MoveObjectEnd(
+    const UUID& client_id, const LogicalObjectId& object_id) {
+    return execute_rpc(
+        "MoveObjectEnd",
+        [&] { return master_service_.MoveObjectEnd(client_id, object_id); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", object_id=", object_id);
+        },
+        [] { MasterMetricManager::instance().inc_move_end_requests(); },
+        [] { MasterMetricManager::instance().inc_move_end_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::MoveObjectRevoke(
+    const UUID& client_id, const LogicalObjectId& object_id) {
+    return execute_rpc(
+        "MoveObjectRevoke",
+        [&] { return master_service_.MoveObjectRevoke(client_id, object_id); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", object_id=", object_id);
+        },
+        [] { MasterMetricManager::instance().inc_move_revoke_requests(); },
+        [] { MasterMetricManager::instance().inc_move_revoke_failures(); });
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::MoveRevoke(
     const UUID& client_id, const std::string& key) {
     return execute_rpc(

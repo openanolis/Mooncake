@@ -352,12 +352,18 @@ class MasterService {
         const UUID& client_id, const std::string& key,
         const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
+    tl::expected<CopyStartResponse, ErrorCode> CopyObjectStart(
+        const UUID& client_id, const CopyObjectRequest& request);
 
     tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
                                           const std::string& key);
+    tl::expected<void, ErrorCode> CopyObjectEnd(
+        const UUID& client_id, const LogicalObjectId& object_id);
 
     tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
                                              const std::string& key);
+    tl::expected<void, ErrorCode> CopyObjectRevoke(
+        const UUID& client_id, const LogicalObjectId& object_id);
 
     /**
      * @brief Start a move operation
@@ -375,12 +381,18 @@ class MasterService {
     tl::expected<MoveStartResponse, ErrorCode> MoveStart(
         const UUID& client_id, const std::string& key,
         const std::string& src_segment, const std::string& tgt_segment);
+    tl::expected<MoveStartResponse, ErrorCode> MoveObjectStart(
+        const UUID& client_id, const MoveObjectRequest& request);
 
     tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
                                           const std::string& key);
+    tl::expected<void, ErrorCode> MoveObjectEnd(
+        const UUID& client_id, const LogicalObjectId& object_id);
 
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
                                              const std::string& key);
+    tl::expected<void, ErrorCode> MoveObjectRevoke(
+        const UUID& client_id, const LogicalObjectId& object_id);
 
     /**
      * @brief Remove an object and its replicas

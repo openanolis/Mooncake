@@ -877,6 +877,52 @@ TEST_F(MasterServiceTest, RemoveObjectBlocksIdentityWhenReplicationTaskExists) {
     EXPECT_TRUE(remove_result.has_value());
 }
 
+TEST_F(MasterServiceTest, ObjectIdentityCopyAndMoveApis) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context1 =
+        PrepareSimpleSegment(*service_, "segment_1");
+    [[maybe_unused]] const auto context2 =
+        PrepareSimpleSegment(*service_, "segment_2");
+    [[maybe_unused]] const auto context3 =
+        PrepareSimpleSegment(*service_, "segment_3");
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_1";
+    config.tenant_id = "tenant-a";
+    config.domain_id = "domain-a";
+    config.object_set = "set-a";
+    config.logical_key = "logical-route-key";
+    const LogicalObjectId object_id{"tenant-a", "domain-a", "set-a",
+                                    "logical-route-key"};
+
+    ASSERT_TRUE(service_->PutStart(client_id, "legacy-route-key", 1024, config)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, "legacy-route-key", ReplicaType::MEMORY)
+                    .has_value());
+
+    auto copy_start = service_->CopyObjectStart(
+        client_id, CopyObjectRequest{object_id, "segment_1", {"segment_2"}});
+    ASSERT_TRUE(copy_start.has_value());
+    ASSERT_EQ(1u, copy_start->targets.size());
+    ASSERT_TRUE(service_->CopyObjectEnd(client_id, object_id).has_value());
+
+    auto after_copy = service_->GetReplicaListByObject(object_id);
+    ASSERT_TRUE(after_copy.has_value());
+    EXPECT_EQ(2u, after_copy->replicas.size());
+
+    auto move_start = service_->MoveObjectStart(
+        client_id, MoveObjectRequest{object_id, "segment_2", "segment_3"});
+    ASSERT_TRUE(move_start.has_value());
+    ASSERT_TRUE(move_start->target.has_value());
+    ASSERT_TRUE(service_->MoveObjectEnd(client_id, object_id).has_value());
+
+    auto after_move = service_->GetReplicaListByObject(object_id);
+    ASSERT_TRUE(after_move.has_value());
+    EXPECT_EQ(2u, after_move->replicas.size());
+}
+
 TEST_F(MasterServiceTest, RemoveObject) {
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);

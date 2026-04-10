@@ -60,6 +60,20 @@ struct RemoveObjectRequest {
 };
 YLT_REFL(RemoveObjectRequest, object_id, force);
 
+struct CopyObjectRequest {
+    LogicalObjectId object_id;
+    std::string src_segment;
+    std::vector<std::string> tgt_segments;
+};
+YLT_REFL(CopyObjectRequest, object_id, src_segment, tgt_segments);
+
+struct MoveObjectRequest {
+    LogicalObjectId object_id;
+    std::string src_segment;
+    std::string tgt_segment;
+};
+YLT_REFL(MoveObjectRequest, object_id, src_segment, tgt_segment);
+
 /**
  * @brief Response structure for GetStorageConfig operation
  */
