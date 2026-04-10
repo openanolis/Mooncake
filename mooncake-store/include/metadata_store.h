@@ -63,14 +63,13 @@ struct MetadataPayload {
     std::vector<Replica::Descriptor> replicas;
     // NOTE: Lease information removed - not needed by Standby
 
-    YLT_REFL(MetadataPayload, client_id, size, tenant_id, domain_id,
-             object_set, sharing_scope, qos_tier, logical_key, canonical_key,
-             replicas);
+    YLT_REFL(MetadataPayload, client_id, size, tenant_id, domain_id, object_set,
+             sharing_scope, qos_tier, logical_key, canonical_key, replicas);
 
     // Convert to StandbyObjectMetadata
-    StandbyObjectMetadata ToStandbyMetadata(uint64_t sequence_id,
-                                            const std::string& legacy_raw_key =
-                                                std::string()) const {
+    StandbyObjectMetadata ToStandbyMetadata(
+        uint64_t sequence_id,
+        const std::string& legacy_raw_key = std::string()) const {
         StandbyObjectMetadata meta;
         meta.client_id = client_id;
         meta.size = size;

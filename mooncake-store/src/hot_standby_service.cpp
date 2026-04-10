@@ -56,12 +56,9 @@ bool HotStandbyService::StandbyMetadataStore::PutMetadata(
     const std::string& key, const StandbyObjectMetadata& metadata) {
     StandbyObjectMetadata materialized = metadata;
     materialized.legacy_raw_key = key;
-    LogicalObjectId object_id{materialized.tenant_id,
-                              materialized.domain_id,
-                              materialized.object_set,
-                              materialized.logical_key.empty()
-                                  ? key
-                                  : materialized.logical_key};
+    LogicalObjectId object_id{
+        materialized.tenant_id, materialized.domain_id, materialized.object_set,
+        materialized.logical_key.empty() ? key : materialized.logical_key};
     return PutMetadata(object_id, materialized);
 }
 

@@ -94,8 +94,7 @@ std::unique_ptr<HotStandbyService> CreateSnapshotOnlyReadyStandby(
     metadata.logical_key = "key-1";
     metadata.legacy_raw_key = "key-1";
     snapshot.metadata.emplace_back(
-        LogicalObjectId{"default", "default", "default", "key-1"},
-        metadata);
+        LogicalObjectId{"default", "default", "default", "key-1"}, metadata);
 
     service->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
         std::optional<LoadedSnapshot>(snapshot)));
