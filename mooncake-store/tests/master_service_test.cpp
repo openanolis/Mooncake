@@ -4937,6 +4937,58 @@ TEST_F(MasterServiceTest, QuotaAdmissionPrivateScopeStillChargesDuplicateBytes) 
     EXPECT_EQ(ErrorCode::QUOTA_EXCEEDED, put_second.error());
 }
 
+TEST_F(MasterServiceTest, ScopedMetadataQueriesStayWithinTenantDomain) {
+    auto service_config = MasterServiceConfig::builder().build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    auto put_object = [&](const std::string& key, const std::string& tenant_id,
+                          const std::string& domain_id) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = tenant_id;
+        config.domain_id = domain_id;
+        config.object_set = "set-a";
+        ASSERT_TRUE(service_->PutStart(client_id, key, 1024, config).has_value());
+        ASSERT_TRUE(service_->PutEnd(client_id, key, ReplicaType::MEMORY)
+                        .has_value());
+    };
+
+    put_object("scope_a_foo", "tenant-a", "domain-a");
+    put_object("scope_a_bar", "tenant-a", "domain-a");
+    put_object("scope_b_foo", "tenant-a", "domain-b");
+    put_object("scope_c_foo", "tenant-b", "domain-a");
+
+    auto scoped_keys = service_->GetAllKeysByScope("tenant-a", "domain-a");
+    ASSERT_TRUE(scoped_keys.has_value());
+    std::unordered_set<std::string> key_set(scoped_keys->begin(),
+                                            scoped_keys->end());
+    EXPECT_EQ(2u, key_set.size());
+    EXPECT_TRUE(key_set.contains("scope_a_foo"));
+    EXPECT_TRUE(key_set.contains("scope_a_bar"));
+    EXPECT_FALSE(key_set.contains("scope_b_foo"));
+    EXPECT_FALSE(key_set.contains("scope_c_foo"));
+
+    auto scoped_regex = service_->GetReplicaListByRegexInScope(
+        "foo$", "tenant-a", "domain-a");
+    ASSERT_TRUE(scoped_regex.has_value());
+    EXPECT_EQ(1u, scoped_regex->size());
+    EXPECT_TRUE(scoped_regex->contains("scope_a_foo"));
+    EXPECT_FALSE(scoped_regex->contains("scope_b_foo"));
+    EXPECT_FALSE(scoped_regex->contains("scope_c_foo"));
+
+    auto remove_result =
+        service_->RemoveByRegexInScope("foo$", "tenant-a", "domain-a", true);
+    ASSERT_TRUE(remove_result.has_value());
+    EXPECT_EQ(1, remove_result.value());
+    ASSERT_TRUE(service_->ExistKey("scope_a_foo").has_value());
+    EXPECT_FALSE(service_->ExistKey("scope_a_foo").value());
+    EXPECT_TRUE(service_->ExistKey("scope_a_bar").value());
+    EXPECT_TRUE(service_->ExistKey("scope_b_foo").value());
+    EXPECT_TRUE(service_->ExistKey("scope_c_foo").value());
+}
+
 TEST_F(MasterServiceTest, UpsertConflictReplicationTask) {
     // Upsert should fail if Copy is in progress
     const uint64_t kv_lease_ttl = 50;
@@ -5239,7 +5291,7 @@ TEST_F(MasterServiceTest, ResolvePreferredSegmentsUsesDomainAndObjectSetHints) {
 
     ReplicateConfig hinted;
     hinted.replica_num = 1;
-    hinted.tenant_id = "tenant-c";
+    hinted.tenant_id = "tenant-b";
     hinted.domain_id = "domain-b";
     hinted.object_set = "set-b";
     hinted.prefer_domain_locality = true;
@@ -5254,6 +5306,62 @@ TEST_F(MasterServiceTest, ResolvePreferredSegmentsUsesDomainAndObjectSetHints) {
     ASSERT_TRUE(
         service_->PutEnd(client_id, "domain_object_c", ReplicaType::MEMORY)
             .has_value());
+}
+
+TEST_F(MasterServiceTest,
+       DomainObjectSetLocalityHintsIgnoreOtherTenantsInSameDomain) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context0 =
+        PrepareSimpleSegment(*service_, "segment_0", kDefaultSegmentBase,
+                             kDefaultSegmentSize);
+    [[maybe_unused]] const auto context1 =
+        PrepareSimpleSegment(*service_, "segment_1",
+                             kDefaultSegmentBase + kDefaultSegmentSize,
+                             kDefaultSegmentSize);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig tenant_a;
+    tenant_a.replica_num = 1;
+    tenant_a.preferred_segment = "segment_0";
+    tenant_a.tenant_id = "tenant-a";
+    tenant_a.domain_id = "shared-domain";
+    tenant_a.object_set = "shared-set";
+    ASSERT_TRUE(
+        service_->PutStart(client_id, "tenant_a_locality_seed", 1024, tenant_a)
+            .has_value());
+    ASSERT_TRUE(service_
+                    ->PutEnd(client_id, "tenant_a_locality_seed",
+                             ReplicaType::MEMORY)
+                    .has_value());
+
+    ReplicateConfig tenant_b;
+    tenant_b.replica_num = 1;
+    tenant_b.preferred_segment = "segment_1";
+    tenant_b.tenant_id = "tenant-b";
+    tenant_b.domain_id = "shared-domain";
+    tenant_b.object_set = "shared-set";
+    ASSERT_TRUE(
+        service_->PutStart(client_id, "tenant_b_locality_seed", 1024, tenant_b)
+            .has_value());
+    ASSERT_TRUE(service_
+                    ->PutEnd(client_id, "tenant_b_locality_seed",
+                             ReplicaType::MEMORY)
+                    .has_value());
+
+    ReplicateConfig hinted;
+    hinted.replica_num = 1;
+    hinted.tenant_id = "tenant-a";
+    hinted.domain_id = "shared-domain";
+    hinted.object_set = "shared-set";
+    hinted.prefer_domain_locality = true;
+    hinted.prefer_object_set_locality = true;
+    auto hinted_put =
+        service_->PutStart(client_id, "tenant_a_locality_target", 1024, hinted);
+    ASSERT_TRUE(hinted_put.has_value());
+    EXPECT_EQ("segment_0",
+              hinted_put.value()[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_);
 }
 
 TEST_F(MasterServiceTest, DomainObjectSetPressureDrivesEvictionWithinTenantTier) {

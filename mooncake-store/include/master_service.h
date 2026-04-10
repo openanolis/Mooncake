@@ -115,6 +115,9 @@ class MasterService {
      * @return ErrorCode::OK if exists
      */
     auto GetAllKeys() -> tl::expected<std::vector<std::string>, ErrorCode>;
+    auto GetAllKeysByScope(const std::string& tenant_id,
+                           const std::string& domain_id)
+        -> tl::expected<std::vector<std::string>, ErrorCode>;
 
     /**
      * @brief Fetch all segments, each node has a unique real client with fixed
@@ -178,6 +181,12 @@ class MasterService {
      * replica descriptors on success, or an ErrorCode on failure.
      */
     auto GetReplicaListByRegex(const std::string& regex_pattern)
+        -> tl::expected<
+            std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+            ErrorCode>;
+    auto GetReplicaListByRegexInScope(const std::string& regex_pattern,
+                                      const std::string& tenant_id,
+                                      const std::string& domain_id)
         -> tl::expected<
             std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
             ErrorCode>;
@@ -378,6 +387,11 @@ class MasterService {
      * success, or an ErrorCode on failure.
      */
     auto RemoveByRegex(const std::string& str, bool force = false)
+        -> tl::expected<long, ErrorCode>;
+    auto RemoveByRegexInScope(const std::string& str,
+                              const std::string& tenant_id,
+                              const std::string& domain_id,
+                              bool force = false)
         -> tl::expected<long, ErrorCode>;
 
     /**
@@ -621,6 +635,7 @@ class MasterService {
         std::string qos_tier;
         std::string logical_key;
         std::string canonical_key;
+        std::string legacy_raw_key;
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
@@ -852,11 +867,78 @@ class MasterService {
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
+    struct TenantDomainKey {
+        std::string tenant_id;
+        std::string domain_id;
+
+        bool operator==(const TenantDomainKey& other) const {
+            return tenant_id == other.tenant_id &&
+                   domain_id == other.domain_id;
+        }
+    };
+
+    struct ReuseKey {
+        std::string tenant_id;
+        std::string domain_id;
+        std::string sharing_scope;
+        std::string canonical_key;
+
+        bool operator==(const ReuseKey& other) const {
+            return tenant_id == other.tenant_id &&
+                   domain_id == other.domain_id &&
+                   sharing_scope == other.sharing_scope &&
+                   canonical_key == other.canonical_key;
+        }
+    };
+
+    struct LogicalObjectIdHash {
+        size_t operator()(const LogicalObjectId& id) const {
+            size_t seed = 0;
+            boost::hash_combine(seed, id.tenant_id);
+            boost::hash_combine(seed, id.domain_id);
+            boost::hash_combine(seed, id.object_set);
+            boost::hash_combine(seed, id.logical_key);
+            return seed;
+        }
+    };
+
+    struct TenantDomainKeyHash {
+        size_t operator()(const TenantDomainKey& key) const {
+            size_t seed = 0;
+            boost::hash_combine(seed, key.tenant_id);
+            boost::hash_combine(seed, key.domain_id);
+            return seed;
+        }
+    };
+
+    struct ReuseKeyHash {
+        size_t operator()(const ReuseKey& key) const {
+            size_t seed = 0;
+            boost::hash_combine(seed, key.tenant_id);
+            boost::hash_combine(seed, key.domain_id);
+            boost::hash_combine(seed, key.sharing_scope);
+            boost::hash_combine(seed, key.canonical_key);
+            return seed;
+        }
+    };
+
     // Sharded metadata maps and their mutexes
     struct MetadataShard {
         mutable SharedMutex mutex;
-        std::unordered_map<std::string, ObjectMetadata> metadata
+        std::unordered_map<LogicalObjectId, ObjectMetadata, LogicalObjectIdHash>
+            metadata GUARDED_BY(mutex);
+        std::unordered_map<std::string, LogicalObjectId> raw_key_to_id
             GUARDED_BY(mutex);
+        std::unordered_map<TenantDomainKey,
+                           std::unordered_set<LogicalObjectId,
+                                              LogicalObjectIdHash>,
+                           TenantDomainKeyHash>
+            tenant_domain_keys GUARDED_BY(mutex);
+        std::unordered_map<ReuseKey,
+                           std::unordered_set<LogicalObjectId,
+                                              LogicalObjectIdHash>,
+                           ReuseKeyHash>
+            reuse_candidates GUARDED_BY(mutex);
         std::unordered_set<std::string> processing_keys GUARDED_BY(mutex);
         std::unordered_map<std::string, const ReplicationTask> replication_tasks
             GUARDED_BY(mutex);
@@ -904,6 +986,20 @@ class MasterService {
 
     // Helper to clean up stale handles pointing to unmounted segments
     bool CleanupStaleHandles(ObjectMetadata& metadata);
+    TenantDomainKey BuildTenantDomainKey(const ObjectMetadata& metadata) const;
+    TenantDomainKey BuildTenantDomainKey(const ReplicateConfig& config) const;
+    std::optional<ReuseKey> MaybeBuildReuseKey(
+        const ObjectMetadata& metadata) const;
+    std::optional<ReuseKey> MaybeBuildReuseKey(
+        const AdmissionRequestContext& context) const;
+    void IndexMetadata(MetadataShard& shard, const LogicalObjectId& object_id,
+                       const ObjectMetadata& metadata) const;
+    void UnindexMetadata(MetadataShard& shard, const LogicalObjectId& object_id,
+                         const ObjectMetadata& metadata) const;
+    void RebuildShardIndexes(MetadataShard& shard) const;
+    const std::unordered_set<LogicalObjectId, LogicalObjectIdHash>* FindScopedKeys(
+        const MetadataShard& shard, const std::string& tenant_id,
+        const std::string& domain_id) const;
 
     AdmissionRequestContext BuildAdmissionRequestContext(
         AdmissionRequestContext::Operation operation, const std::string& key,
@@ -915,8 +1011,8 @@ class MasterService {
         size_t current_shard_index) const;
 
     std::vector<std::string> ResolvePreferredSegments(
-        const MetadataShardAccessorRW& shard,
-        const ReplicateConfig& config) const;
+        const MetadataShardAccessorRW& current_shard,
+        size_t current_shard_index, const ReplicateConfig& config) const;
 
     tl::expected<void, ErrorCode> AdmitWrite(
         AdmissionRequestContext::Operation operation, const std::string& key,
@@ -991,10 +1087,12 @@ class MasterService {
               key_(key),
               shard_idx_(service_->getShardIndex(key)),
               shard_guard_(service_, shard_idx_),
-              it_(shard_guard_->metadata.find(key)),
+              alias_it_(shard_guard_->raw_key_to_id.find(key)),
+              it_(alias_it_ != shard_guard_->raw_key_to_id.end()
+                      ? shard_guard_->metadata.find(alias_it_->second)
+                      : shard_guard_->metadata.end()),
               processing_it_(shard_guard_->processing_keys.find(key)),
               replication_task_it_(shard_guard_->replication_tasks.find(key)) {
-            // Automatically clean up invalid handles
             if (it_ != shard_guard_->metadata.end()) {
                 if (service_->CleanupStaleHandles(it_->second)) {
                     this->Erase();
@@ -1033,7 +1131,11 @@ class MasterService {
 
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
+            service_->UnindexMetadata(*shard_guard_.operator->(), it_->first,
+                                      it_->second);
+            shard_guard_->raw_key_to_id.erase(key_);
             shard_guard_->metadata.erase(it_);
+            alias_it_ = shard_guard_->raw_key_to_id.end();
             it_ = shard_guard_->metadata.end();
         }
 
@@ -1061,14 +1163,22 @@ class MasterService {
                 throw std::logic_error("Already exists");
             }
             const auto now = std::chrono::system_clock::now();
+            LogicalObjectId object_id{tenant_id, domain_id, object_set,
+                                      logical_key.empty() ? key_ : logical_key};
             auto result = shard_guard_->metadata.emplace(
-                std::piecewise_construct, std::forward_as_tuple(key_),
+                std::piecewise_construct, std::forward_as_tuple(object_id),
                 std::forward_as_tuple(client_id, now, total_length,
                                       std::move(replicas), enable_soft_pin,
                                       enable_hard_pin, tenant_id, domain_id,
                                       object_set, sharing_scope, qos_tier,
-                                      logical_key, canonical_key));
+                                      logical_key.empty() ? key_ : logical_key,
+                                      canonical_key));
             it_ = result.first;
+            it_->second.legacy_raw_key = key_;
+            alias_it_ =
+                shard_guard_->raw_key_to_id.emplace(key_, it_->first).first;
+            service_->IndexMetadata(*shard_guard_.operator->(), it_->first,
+                                    it_->second);
         }
 
        private:
@@ -1076,7 +1186,9 @@ class MasterService {
         std::string key_;
         size_t shard_idx_;
         MetadataShardAccessorRW shard_guard_;
-        std::unordered_map<std::string, ObjectMetadata>::iterator it_;
+        std::unordered_map<std::string, LogicalObjectId>::iterator alias_it_;
+        std::unordered_map<LogicalObjectId, ObjectMetadata,
+                           LogicalObjectIdHash>::iterator it_;
         std::unordered_set<std::string>::iterator processing_it_;
         std::unordered_map<std::string, const ReplicationTask>::iterator
             replication_task_it_;
@@ -1132,7 +1244,10 @@ class MasterService {
               key_(key),
               shard_idx_(service_->getShardIndex(key)),
               shard_guard_(service_, shard_idx_),
-              it_(shard_guard_->metadata.find(key)),
+              alias_it_(shard_guard_->raw_key_to_id.find(key)),
+              it_(alias_it_ != shard_guard_->raw_key_to_id.end()
+                      ? shard_guard_->metadata.find(alias_it_->second)
+                      : shard_guard_->metadata.end()),
               processing_it_(shard_guard_->processing_keys.find(key)) {}
 
         // Check if metadata exists
@@ -1158,7 +1273,9 @@ class MasterService {
         const std::string key_;
         const size_t shard_idx_;
         MetadataShardAccessorRO shard_guard_;
-        std::unordered_map<std::string, ObjectMetadata>::const_iterator it_;
+        std::unordered_map<std::string, LogicalObjectId>::const_iterator alias_it_;
+        std::unordered_map<LogicalObjectId, ObjectMetadata,
+                           LogicalObjectIdHash>::const_iterator it_;
         std::unordered_set<std::string>::const_iterator processing_it_;
     };
 

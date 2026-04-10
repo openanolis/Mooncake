@@ -505,6 +505,8 @@ sequenceDiagram
 - placement 感知 tenant/domain/object_set 语义
 - tier-aware eviction
 - domain/object_set locality 参与 preferred-segment 决策
+- master 内存 metadata 主表已经切换为以 `LogicalObjectId` 为主键
+- 旧 raw key 通过 alias 映射继续兼容，因此现有 key-based API 在迁移期仍可工作
 
 ## 11.2 TENT runtime 侧
 
