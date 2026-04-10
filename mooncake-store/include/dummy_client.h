@@ -146,10 +146,16 @@ class DummyClient : public PyClient {
 
     tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets);
+    tl::expected<UUID, ErrorCode> create_copy_task(
+        const LogicalObjectId &object_id,
+        const std::vector<std::string> &targets);
 
     tl::expected<UUID, ErrorCode> create_move_task(const std::string &key,
                                                    const std::string &source,
                                                    const std::string &target);
+    tl::expected<UUID, ErrorCode> create_move_task(
+        const LogicalObjectId &object_id, const std::string &source,
+        const std::string &target);
 
     tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
 

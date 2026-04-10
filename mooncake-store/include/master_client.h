@@ -421,6 +421,9 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const LogicalObjectId& object_id,
+        const std::vector<std::string>& targets);
 
     /**
      * @brief Create a task to move an object's replica from source segment to
@@ -433,6 +436,9 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<UUID, ErrorCode> CreateMoveTask(
         const std::string& key, const std::string& source,
+        const std::string& target);
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateMoveTask(
+        const LogicalObjectId& object_id, const std::string& source,
         const std::string& target);
 
     /**

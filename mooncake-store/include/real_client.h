@@ -303,6 +303,9 @@ class RealClient : public PyClient {
      */
     tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets);
+    tl::expected<UUID, ErrorCode> create_copy_task(
+        const LogicalObjectId &object_id,
+        const std::vector<std::string> &targets);
 
     /**
      * @brief Create a move task to move an object's replica from source segment
@@ -316,6 +319,9 @@ class RealClient : public PyClient {
     tl::expected<UUID, ErrorCode> create_move_task(const std::string &key,
                                                    const std::string &source,
                                                    const std::string &target);
+    tl::expected<UUID, ErrorCode> create_move_task(
+        const LogicalObjectId &object_id, const std::string &source,
+        const std::string &target);
 
     /**
      * @brief Query a task by task id

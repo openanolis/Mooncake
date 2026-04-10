@@ -885,13 +885,41 @@ std::vector<Replica::Descriptor> DummyClient::get_replica_desc(
 
 tl::expected<UUID, ErrorCode> DummyClient::create_copy_task(
     const std::string& key, const std::vector<std::string>& targets) {
-    return invoke_rpc<&RealClient::create_copy_task, UUID>(key, targets);
+    return invoke_rpc<
+        static_cast<tl::expected<UUID, ErrorCode> (RealClient::*)(
+            const std::string&, const std::vector<std::string>&)>(
+            &RealClient::create_copy_task),
+        UUID>(key, targets);
+}
+
+tl::expected<UUID, ErrorCode> DummyClient::create_copy_task(
+    const LogicalObjectId& object_id,
+    const std::vector<std::string>& targets) {
+    return invoke_rpc<
+        static_cast<tl::expected<UUID, ErrorCode> (RealClient::*)(
+            const LogicalObjectId&, const std::vector<std::string>&)>(
+            &RealClient::create_copy_task),
+        UUID>(object_id, targets);
 }
 
 tl::expected<UUID, ErrorCode> DummyClient::create_move_task(
     const std::string& key, const std::string& source,
     const std::string& target) {
-    return invoke_rpc<&RealClient::create_move_task, UUID>(key, source, target);
+    return invoke_rpc<
+        static_cast<tl::expected<UUID, ErrorCode> (RealClient::*)(
+            const std::string&, const std::string&, const std::string&)>(
+            &RealClient::create_move_task),
+        UUID>(key, source, target);
+}
+
+tl::expected<UUID, ErrorCode> DummyClient::create_move_task(
+    const LogicalObjectId& object_id, const std::string& source,
+    const std::string& target) {
+    return invoke_rpc<
+        static_cast<tl::expected<UUID, ErrorCode> (RealClient::*)(
+            const LogicalObjectId&, const std::string&, const std::string&)>(
+            &RealClient::create_move_task),
+        UUID>(object_id, source, target);
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> DummyClient::query_task(

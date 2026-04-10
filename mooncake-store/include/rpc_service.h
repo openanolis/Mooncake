@@ -156,6 +156,7 @@ class WrappedMasterService {
     tl::expected<std::string, ErrorCode> ServiceReady();
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
+    tl::expected<std::vector<LogicalObjectId>, ErrorCode> GetAllObjectsForAdmin();
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllSegmentsForAdmin();
 
@@ -173,8 +174,14 @@ class WrappedMasterService {
         const std::vector<StorageObjectMetadata>& metadatas);
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const LogicalObjectId& object_id,
+        const std::vector<std::string>& targets);
 
     tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& source,
+                                                 const std::string& target);
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const LogicalObjectId& object_id,
                                                  const std::string& source,
                                                  const std::string& target);
 

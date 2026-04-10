@@ -283,12 +283,38 @@ struct RpcNameTraits<&WrappedMasterService::MoveObjectRevoke> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::CreateCopyTask> {
+struct RpcNameTraits<static_cast<tl::expected<UUID, ErrorCode> (
+                         WrappedMasterService::*)(
+                             const std::string&,
+                             const std::vector<std::string>&)>(
+                         &WrappedMasterService::CreateCopyTask)> {
     static constexpr const char* value = "CreateCopyTask";
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::CreateMoveTask> {
+struct RpcNameTraits<static_cast<tl::expected<UUID, ErrorCode> (
+                         WrappedMasterService::*)(
+                             const LogicalObjectId&,
+                             const std::vector<std::string>&)>(
+                         &WrappedMasterService::CreateCopyTask)> {
+    static constexpr const char* value = "CreateCopyTask";
+};
+
+template <>
+struct RpcNameTraits<static_cast<tl::expected<UUID, ErrorCode> (
+                         WrappedMasterService::*)(const std::string&,
+                                                  const std::string&,
+                                                  const std::string&)>(
+                         &WrappedMasterService::CreateMoveTask)> {
+    static constexpr const char* value = "CreateMoveTask";
+};
+
+template <>
+struct RpcNameTraits<static_cast<tl::expected<UUID, ErrorCode> (
+                         WrappedMasterService::*)(const LogicalObjectId&,
+                                                  const std::string&,
+                                                  const std::string&)>(
+                         &WrappedMasterService::CreateMoveTask)> {
     static constexpr const char* value = "CreateMoveTask";
 };
 
@@ -978,8 +1004,29 @@ tl::expected<UUID, ErrorCode> MasterClient::CreateCopyTask(
     ScopedVLogTimer timer(1, "MasterClient::CreateCopyTask");
     timer.LogRequest("key=", key, ", targets_size=", targets.size());
 
-    auto result =
-        invoke_rpc<&WrappedMasterService::CreateCopyTask, UUID>(key, targets);
+    auto result = invoke_rpc<
+        static_cast<tl::expected<UUID, ErrorCode> (
+            WrappedMasterService::*)(const std::string&,
+                                     const std::vector<std::string>&)>(
+            &WrappedMasterService::CreateCopyTask),
+        UUID>(key, targets);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<UUID, ErrorCode> MasterClient::CreateCopyTask(
+    const LogicalObjectId& object_id,
+    const std::vector<std::string>& targets) {
+    ScopedVLogTimer timer(1, "MasterClient::CreateCopyTask");
+    timer.LogRequest("object_id=", object_id,
+                     ", targets_size=", targets.size());
+
+    auto result = invoke_rpc<
+        static_cast<tl::expected<UUID, ErrorCode> (
+            WrappedMasterService::*)(const LogicalObjectId&,
+                                     const std::vector<std::string>&)>(
+            &WrappedMasterService::CreateCopyTask),
+        UUID>(object_id, targets);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -990,8 +1037,30 @@ tl::expected<UUID, ErrorCode> MasterClient::CreateMoveTask(
     ScopedVLogTimer timer(1, "MasterClient::CreateMoveTask");
     timer.LogRequest("key=", key, ", source=", source, ", target=", target);
 
-    auto result = invoke_rpc<&WrappedMasterService::CreateMoveTask, UUID>(
-        key, source, target);
+    auto result = invoke_rpc<
+        static_cast<tl::expected<UUID, ErrorCode> (
+            WrappedMasterService::*)(const std::string&, const std::string&,
+                                     const std::string&)>(
+            &WrappedMasterService::CreateMoveTask),
+        UUID>(key, source, target);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<UUID, ErrorCode> MasterClient::CreateMoveTask(
+    const LogicalObjectId& object_id, const std::string& source,
+    const std::string& target) {
+    ScopedVLogTimer timer(1, "MasterClient::CreateMoveTask");
+    timer.LogRequest("object_id=", object_id, ", source=", source,
+                     ", target=", target);
+
+    auto result = invoke_rpc<
+        static_cast<tl::expected<UUID, ErrorCode> (
+            WrappedMasterService::*)(const LogicalObjectId&,
+                                     const std::string&,
+                                     const std::string&)>(
+            &WrappedMasterService::CreateMoveTask),
+        UUID>(object_id, source, target);
     timer.LogResponseExpected(result);
     return result;
 }

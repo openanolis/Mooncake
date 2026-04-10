@@ -351,8 +351,10 @@ sequenceDiagram
 - hot-standby snapshot loading now restores `LogicalObjectId`-keyed metadata and preserves legacy raw-key aliases for compatibility
 - standby metadata export now returns identity-native `(LogicalObjectId, StandbyObjectMetadata)` pairs for promotion/recovery flows
 - oplog apply now preserves `legacy_raw_key` when materializing standby metadata
-- namespace-native RPC and client entrypoints now expose `ExistObject`, `GetReplicaListByObject`, `PutObjectStart/PutObjectEnd/PutObjectRevoke`, `CopyObjectStart/CopyObjectEnd/CopyObjectRevoke`, `MoveObjectStart/MoveObjectEnd/MoveObjectRevoke`, and `RemoveObject`
+- namespace-native RPC and client entrypoints now expose `ExistObject`, `GetReplicaListByObject`, `PutObjectStart/PutObjectEnd/PutObjectRevoke`, `CopyObjectStart/CopyObjectEnd/CopyObjectRevoke`, `MoveObjectStart/MoveObjectEnd/MoveObjectRevoke`, `RemoveObject`, and object-identity `CreateCopyTask/CreateMoveTask`
 - admin/list/regex/remove metadata views now match on `logical_key`, while legacy raw-key alias lookup remains available for compatibility
+- admin HTTP surfaces now expose `/query_object` and `/get_all_objects` for namespace-first inspection
+- task execution now prefers `LogicalObjectId` from replicated task payloads and only falls back to legacy raw keys for backward compatibility
 - `processing_keys`, `replication_tasks`, and `offloading_tasks` now track `LogicalObjectId` instead of raw keys, so cleanup, replication, and offload lifecycle paths no longer depend on raw-key-primary bookkeeping
 
 #### TENT runtime side
@@ -364,10 +366,10 @@ sequenceDiagram
 - hierarchical shaping by `tenant/domain/object_set`
 - RDMA endpoint pacing via runtime pacing hints
 
-### Planned next extension
+### Compatibility boundary
 
-- extending namespace-native coverage to task/admin surfaces that still accept legacy raw-key forms
-- retiring the remaining raw-key-primary assumptions from admin and background-maintenance paths
+- legacy raw-key task/admin entrypoints are still retained as compatibility aliases during migration
+- admin and task flows now have namespace-first entrypoints, so new callers no longer need raw-key-primary routing
 
 ## File Scope
 

@@ -510,8 +510,10 @@ sequenceDiagram
 - hot-standby 的 snapshot 加载已经恢复为以 `LogicalObjectId` 为主键的 metadata，并保留 legacy raw-key alias
 - standby metadata 导出已经切换为 identity-native 的 `(LogicalObjectId, StandbyObjectMetadata)` 结果，便于 promotion / recovery 直接消费
 - oplog apply 在 standby 侧落库时会保留 `legacy_raw_key`
-- namespace-native 的 RPC / client 入口已经补齐 `ExistObject`、`GetReplicaListByObject`、`PutObjectStart/PutObjectEnd/PutObjectRevoke`、`CopyObjectStart/CopyObjectEnd/CopyObjectRevoke`、`MoveObjectStart/MoveObjectEnd/MoveObjectRevoke` 和 `RemoveObject`
+- namespace-native 的 RPC / client 入口已经补齐 `ExistObject`、`GetReplicaListByObject`、`PutObjectStart/PutObjectEnd/PutObjectRevoke`、`CopyObjectStart/CopyObjectEnd/CopyObjectRevoke`、`MoveObjectStart/MoveObjectEnd/MoveObjectRevoke`、`RemoveObject` 以及 object-identity 版本的 `CreateCopyTask/CreateMoveTask`
 - admin/list/regex/remove 等 metadata 视图已经切到按 `logical_key` 匹配；legacy raw-key alias lookup 继续保留兼容
+- admin HTTP 入口新增 `/query_object` 和 `/get_all_objects`，namespace-first 巡检不再依赖 raw-key 列表
+- 任务执行路径现在会优先使用 task payload 里的 `LogicalObjectId`，只在兼容旧任务时才回退到 legacy raw key
 - `processing_keys`、`replication_tasks`、`offloading_tasks` 等后台维护状态也已经切到按 `LogicalObjectId` 跟踪，避免后台清理、复制和 offload 生命周期继续把 raw key 当成主身份
 
 ## 11.2 TENT runtime 侧
@@ -526,12 +528,12 @@ sequenceDiagram
 - hierarchical shaping（`tenant/domain/object_set`）
 - runtime pacing hint 与 RDMA endpoint 限流
 
-## 11.3 还未完整实现的部分
+## 11.3 兼容边界
 
-还未完整补齐的是：
+当前仍保留：
 
-- 继续把 namespace-native 能力覆盖到仍以 legacy raw key 暴露的 task/admin 入口
-- 清理 admin 与后台维护路径里剩余的 raw-key-primary 假设
+- legacy raw-key 的 task/admin 入口，作为迁移期兼容 alias
+- 旧任务 payload 的 raw key 回退路径，用于兼容已下发但未执行完成的历史任务
 
 ---
 

@@ -2406,7 +2406,7 @@ tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
 tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
     const LogicalObjectId& object_id,
     const std::vector<std::string>& targets) {
-    return master_client_.CreateCopyTask(object_id.logical_key, targets);
+    return master_client_.CreateCopyTask(object_id, targets);
 }
 
 tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
@@ -2418,7 +2418,7 @@ tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
 tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
     const LogicalObjectId& object_id, const std::string& source,
     const std::string& target) {
-    return master_client_.CreateMoveTask(object_id.logical_key, source, target);
+    return master_client_.CreateMoveTask(object_id, source, target);
 }
 
 tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
@@ -2868,8 +2868,11 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_COPY: {
                 ReplicaCopyPayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto copy_result =
-                    Copy(payload.key, payload.source, payload.targets);
+                auto copy_result = payload.object_id.logical_key.empty()
+                                       ? Copy(payload.key, payload.source,
+                                              payload.targets)
+                                       : Copy(payload.object_id, payload.source,
+                                              payload.targets);
                 if (copy_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
@@ -2880,8 +2883,11 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_MOVE: {
                 ReplicaMovePayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto move_result =
-                    Move(payload.key, payload.source, payload.target);
+                auto move_result = payload.object_id.logical_key.empty()
+                                       ? Move(payload.key, payload.source,
+                                              payload.target)
+                                       : Move(payload.object_id, payload.source,
+                                              payload.target);
                 if (move_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {

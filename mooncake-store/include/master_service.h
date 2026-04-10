@@ -117,6 +117,8 @@ class MasterService {
      * @return ErrorCode::OK if exists
      */
     auto GetAllKeys() -> tl::expected<std::vector<std::string>, ErrorCode>;
+    auto GetAllObjects()
+        -> tl::expected<std::vector<LogicalObjectId>, ErrorCode>;
     auto GetAllKeysByScope(const std::string& tenant_id,
                            const std::string& domain_id)
         -> tl::expected<std::vector<std::string>, ErrorCode>;
@@ -501,6 +503,9 @@ class MasterService {
      */
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const LogicalObjectId& object_id,
+        const std::vector<std::string>& targets);
 
     /**
      * @brief Create a move task to move an object's replica from source segment
@@ -508,6 +513,9 @@ class MasterService {
      * @return Move task ID on success, ErrorCode on failure
      */
     tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& source,
+                                                 const std::string& target);
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const LogicalObjectId& object_id,
                                                  const std::string& source,
                                                  const std::string& target);
 

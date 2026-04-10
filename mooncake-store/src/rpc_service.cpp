@@ -304,6 +304,44 @@ void MasterAdminServer::InitHttpServer() {
         });
 
     http_server_.set_http_handler<GET>(
+        "/query_object",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            LogicalObjectId object_id{
+                .tenant_id = std::string(req.get_query_value("tenant_id")),
+                .domain_id = std::string(req.get_query_value("domain_id")),
+                .object_set = std::string(req.get_query_value("object_set")),
+                .logical_key = std::string(req.get_query_value("logical_key")),
+            };
+            auto get_result = service->GetReplicaListByObject(object_id);
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            if (get_result) {
+                std::string ss;
+                const auto& replicas = get_result.value().replicas;
+                for (const auto& replica : replicas) {
+                    if (!replica.is_memory_replica()) {
+                        continue;
+                    }
+                    std::string tmp;
+                    struct_json::to_json(
+                        replica.get_memory_descriptor().buffer_descriptor, tmp);
+                    ss += tmp;
+                    ss += "\n";
+                }
+                resp.set_status_and_content(status_type::ok, std::move(ss));
+                return;
+            }
+
+            resp.set_status_and_content(status_type::not_found,
+                                        toString(get_result.error()));
+        });
+
+    http_server_.set_http_handler<GET>(
         "/get_all_keys", [this](coro_http_request&, coro_http_response& resp) {
             auto service = GetActiveService();
             if (!service) {
@@ -324,6 +362,28 @@ void MasterAdminServer::InitHttpServer() {
                 body += key;
                 body += "\n";
             }
+            resp.set_status_and_content(status_type::ok, std::move(body));
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/get_all_objects",
+        [this](coro_http_request&, coro_http_response& resp) {
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
+            auto result = service->GetAllObjectsForAdmin();
+            if (!result) {
+                resp.set_status_and_content(status_type::internal_server_error,
+                                            "{\"success\":false,\"error\":\"Failed to get all objects\"}");
+                return;
+            }
+
+            std::string body;
+            struct_json::to_json(result.value(), body);
             resp.set_status_and_content(status_type::ok, std::move(body));
         });
 
@@ -1414,6 +1474,22 @@ tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
         });
 }
 
+tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
+    const LogicalObjectId& object_id,
+    const std::vector<std::string>& targets) {
+    return execute_rpc(
+        "CreateCopyTask",
+        [&] { return master_service_.CreateCopyTask(object_id, targets); },
+        [&](auto& timer) {
+            timer.LogRequest("object_id=", object_id,
+                             ", targets_size=", targets.size());
+        },
+        [] { MasterMetricManager::instance().inc_create_copy_task_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_create_copy_task_failures();
+        });
+}
+
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateMoveTask(
     const std::string& key, const std::string& source,
     const std::string& target) {
@@ -1422,6 +1498,22 @@ tl::expected<UUID, ErrorCode> WrappedMasterService::CreateMoveTask(
         [&] { return master_service_.CreateMoveTask(key, source, target); },
         [&](auto& timer) {
             timer.LogRequest("key=", key, ", source=", source,
+                             ", target=", target);
+        },
+        [] { MasterMetricManager::instance().inc_create_move_task_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_create_move_task_failures();
+        });
+}
+
+tl::expected<UUID, ErrorCode> WrappedMasterService::CreateMoveTask(
+    const LogicalObjectId& object_id, const std::string& source,
+    const std::string& target) {
+    return execute_rpc(
+        "CreateMoveTask",
+        [&] { return master_service_.CreateMoveTask(object_id, source, target); },
+        [&](auto& timer) {
+            timer.LogRequest("object_id=", object_id, ", source=", source,
                              ", target=", target);
         },
         [] { MasterMetricManager::instance().inc_create_move_task_requests(); },
@@ -1505,6 +1597,11 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
 tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::GetAllKeysForAdmin() {
     return master_service_.GetAllKeys();
+}
+
+tl::expected<std::vector<LogicalObjectId>, ErrorCode>
+WrappedMasterService::GetAllObjectsForAdmin() {
+    return master_service_.GetAllObjects();
 }
 
 tl::expected<std::vector<std::string>, ErrorCode>
@@ -1642,24 +1739,58 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CopyStart>(
         &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CopyObjectStart>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CopyEnd>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CopyObjectEnd>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CopyRevoke>(
         &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CopyObjectRevoke>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MoveStart>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::MoveObjectStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MoveEnd>(
         &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::MoveObjectEnd>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MoveRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::MoveObjectRevoke>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::EvictDiskReplica>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::BatchEvictDiskReplica>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::CreateCopyTask>(
+    server.register_handler<
+        static_cast<tl::expected<UUID, ErrorCode> (
+            mooncake::WrappedMasterService::*)(
+                const std::string&, const std::vector<std::string>&)>(
+            &mooncake::WrappedMasterService::CreateCopyTask)>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::CreateMoveTask>(
+    server.register_handler<
+        static_cast<tl::expected<UUID, ErrorCode> (
+            mooncake::WrappedMasterService::*)(const LogicalObjectId&,
+                                               const std::vector<std::string>&)>(
+            &mooncake::WrappedMasterService::CreateCopyTask)>(
+        &wrapped_master_service);
+    server.register_handler<
+        static_cast<tl::expected<UUID, ErrorCode> (
+            mooncake::WrappedMasterService::*)(const std::string&,
+                                               const std::string&,
+                                               const std::string&)>(
+            &mooncake::WrappedMasterService::CreateMoveTask)>(
+        &wrapped_master_service);
+    server.register_handler<
+        static_cast<tl::expected<UUID, ErrorCode> (
+            mooncake::WrappedMasterService::*)(const LogicalObjectId&,
+                                               const std::string&,
+                                               const std::string&)>(
+            &mooncake::WrappedMasterService::CreateMoveTask)>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::QueryTask>(
         &wrapped_master_service);

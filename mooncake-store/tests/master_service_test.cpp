@@ -4269,6 +4269,56 @@ TEST_F(MasterServiceTest, CreateCopyTaskTest) {
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, copy_result3.error());
 }
 
+TEST_F(MasterServiceTest, CreateCopyTaskObjectIdentityTest) {
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
+
+    std::unique_ptr<MasterService> service_(new MasterService());
+    constexpr size_t kReplicaCnt = 3;
+    constexpr size_t kBaseAddr = 0x310000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;
+    std::vector<MountedSegmentContext> contexts;
+    contexts.reserve(kReplicaCnt);
+    for (size_t i = 0; i < kReplicaCnt; ++i) {
+        const auto context = PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
+        contexts.push_back(context);
+    }
+
+    const UUID client_id = generate_uuid();
+    const LogicalObjectId object_id{"tenant-a", "domain-a", "set-a",
+                                    "logical-task-key"};
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+    config.tenant_id = object_id.tenant_id;
+    config.domain_id = object_id.domain_id;
+    config.object_set = object_id.object_set;
+    config.logical_key = object_id.logical_key;
+
+    ASSERT_TRUE(service_->PutStart(client_id, "legacy-task-key", 6 * 1024 * 1024,
+                                   config)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, "legacy-task-key", ReplicaType::MEMORY)
+                    .has_value());
+
+    auto copy_result =
+        service_->CreateCopyTask(object_id, {"segment_1", "segment_2"});
+    ASSERT_TRUE(copy_result.has_value());
+
+    auto task = service_->QueryTask(copy_result.value());
+    ASSERT_TRUE(task.has_value());
+    EXPECT_EQ(TaskType::REPLICA_COPY, task->type);
+    EXPECT_EQ(contexts[0].client_id, task->assigned_client);
+
+    auto copy_result2 = service_->CreateCopyTask(
+        LogicalObjectId{"tenant-a", "domain-a", "set-a", "missing-key"},
+        {"segment_1"});
+    ASSERT_FALSE(copy_result2.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, copy_result2.error());
+}
+
 TEST_F(MasterServiceTest, CreateMoveTaskTest) {
     // Reset storage space metrics.
     MasterMetricManager::instance().reset_allocated_mem_size();
@@ -4345,6 +4395,56 @@ TEST_F(MasterServiceTest, CreateMoveTaskTest) {
         service_->CreateMoveTask(key1, "not_mounted_segment", "segment_1");
     EXPECT_FALSE(move_result4.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result4.error());
+}
+
+TEST_F(MasterServiceTest, CreateMoveTaskObjectIdentityTest) {
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
+
+    std::unique_ptr<MasterService> service_(new MasterService());
+    constexpr size_t kReplicaCnt = 3;
+    constexpr size_t kBaseAddr = 0x320000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;
+    std::vector<MountedSegmentContext> contexts;
+    contexts.reserve(kReplicaCnt);
+    for (size_t i = 0; i < kReplicaCnt; ++i) {
+        const auto context = PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
+        contexts.push_back(context);
+    }
+
+    const UUID client_id = generate_uuid();
+    const LogicalObjectId object_id{"tenant-a", "domain-a", "set-a",
+                                    "logical-move-task-key"};
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+    config.tenant_id = object_id.tenant_id;
+    config.domain_id = object_id.domain_id;
+    config.object_set = object_id.object_set;
+    config.logical_key = object_id.logical_key;
+
+    ASSERT_TRUE(service_->PutStart(client_id, "legacy-move-task-key", 6 * 1024 * 1024,
+                                   config)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, "legacy-move-task-key", ReplicaType::MEMORY)
+                    .has_value());
+
+    auto move_result =
+        service_->CreateMoveTask(object_id, "segment_0", "segment_1");
+    ASSERT_TRUE(move_result.has_value());
+
+    auto task = service_->QueryTask(move_result.value());
+    ASSERT_TRUE(task.has_value());
+    EXPECT_EQ(TaskType::REPLICA_MOVE, task->type);
+    EXPECT_EQ(contexts[0].client_id, task->assigned_client);
+
+    auto move_result2 = service_->CreateMoveTask(
+        LogicalObjectId{"tenant-a", "domain-a", "set-a", "missing-key"},
+        "segment_0", "segment_1");
+    ASSERT_FALSE(move_result2.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, move_result2.error());
 }
 
 TEST_F(MasterServiceTest, QueryTaskTest) {
@@ -5162,6 +5262,42 @@ TEST_F(MasterServiceTest, GlobalMetadataQueriesUseLogicalKeyView) {
     EXPECT_EQ(1, *remove_result);
     ASSERT_TRUE(service_->ExistKey("legacy-alias-key").has_value());
     EXPECT_FALSE(service_->ExistKey("legacy-alias-key").value());
+}
+
+TEST_F(MasterServiceTest, GlobalObjectAdminViewUsesIdentityModel) {
+    auto service_config = MasterServiceConfig::builder().build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    auto put_object = [&](const std::string& raw_key,
+                          const LogicalObjectId& object_id) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = object_id.tenant_id;
+        config.domain_id = object_id.domain_id;
+        config.object_set = object_id.object_set;
+        config.logical_key = object_id.logical_key;
+        ASSERT_TRUE(service_->PutStart(client_id, raw_key, 1024, config)
+                        .has_value());
+        ASSERT_TRUE(service_->PutEnd(client_id, raw_key, ReplicaType::MEMORY)
+                        .has_value());
+    };
+
+    put_object("alias-1", {"tenant-a", "domain-a", "set-a", "logical-1"});
+    put_object("alias-2", {"tenant-b", "domain-b", "set-b", "logical-2"});
+
+    auto all_objects = service_->GetAllObjects();
+    ASSERT_TRUE(all_objects.has_value());
+    std::unordered_set<std::string> object_keys;
+    for (const auto& object_id : *all_objects) {
+        object_keys.insert(object_id.tenant_id + "/" + object_id.domain_id +
+                           "/" + object_id.object_set + "/" +
+                           object_id.logical_key);
+    }
+    EXPECT_EQ(2u, object_keys.size());
+    EXPECT_TRUE(object_keys.contains("tenant-a/domain-a/set-a/logical-1"));
+    EXPECT_TRUE(object_keys.contains("tenant-b/domain-b/set-b/logical-2"));
 }
 
 TEST_F(MasterServiceTest, UpsertConflictReplicationTask) {

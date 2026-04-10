@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <ostream>
 #include "types.h"
+#include "replica.h"
 #include "mutex.h"
 #include "master_config.h"
 
@@ -93,17 +94,19 @@ struct Task {
 
 struct ReplicaCopyPayload {
     std::string key;
+    LogicalObjectId object_id;
     std::string source;
     std::vector<std::string> targets;
 };
-YLT_REFL(ReplicaCopyPayload, key, source, targets);
+YLT_REFL(ReplicaCopyPayload, key, object_id, source, targets);
 
 struct ReplicaMovePayload {
     std::string key;
+    LogicalObjectId object_id;
     std::string source;
     std::string target;
 };
-YLT_REFL(ReplicaMovePayload, key, source, target);
+YLT_REFL(ReplicaMovePayload, key, object_id, source, target);
 
 template <TaskType T>
 struct TaskPayloadTraits;

@@ -693,6 +693,18 @@ auto MasterService::GetAllKeys()
     return all_keys;
 }
 
+auto MasterService::GetAllObjects()
+    -> tl::expected<std::vector<LogicalObjectId>, ErrorCode> {
+    std::vector<LogicalObjectId> all_objects;
+    for (size_t i = 0; i < kNumShards; i++) {
+        MetadataShardAccessorRO shard(this, i);
+        for (const auto& item : shard->metadata) {
+            all_objects.push_back(item.first);
+        }
+    }
+    return all_objects;
+}
+
 auto MasterService::GetAllKeysByScope(const std::string& tenant_id,
                                       const std::string& domain_id)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
@@ -5056,6 +5068,61 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
                             .targets = targets});
 }
 
+tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
+    const LogicalObjectId& object_id,
+    const std::vector<std::string>& targets) {
+    auto key = FindLegacyKeyByObjectId(object_id);
+    if (!key.has_value()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    if (targets.empty()) {
+        LOG(ERROR) << "object_id=" << object_id << ", error=empty_targets";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    MetadataAccessorRO accessor(this, *key);
+    if (!accessor.Exists()) {
+        VLOG(1) << "object_id=" << object_id << ", info=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    ScopedSegmentAccess segment_accessor = segment_manager_.getSegmentAccess();
+    for (const auto& target : targets) {
+        if (!segment_accessor.ExistsSegmentName(target)) {
+            LOG(ERROR) << "object_id=" << object_id << ", target_segment="
+                       << target << ", error=target_segment_not_mounted";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    const auto& metadata = accessor.Get();
+    const auto& segment_names = metadata.GetReplicaSegmentNames();
+    if (segment_names.empty()) {
+        LOG(ERROR) << "object_id=" << object_id
+                   << ", error=no_valid_source_replicas";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    static thread_local std::mt19937 gen(std::random_device{}());
+    std::uniform_int_distribution<size_t> dis(0, segment_names.size() - 1);
+    std::string selected_source_segment = segment_names[dis(gen)];
+    UUID select_client;
+    ErrorCode error = segment_accessor.GetClientIdBySegmentName(
+        selected_source_segment, select_client);
+    if (error != ErrorCode::OK) {
+        LOG(ERROR) << "object_id=" << object_id
+                   << ", segment_name=" << selected_source_segment
+                   << ", error=client_id_not_found";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return task_manager_.get_write_access()
+        .submit_task_typed<TaskType::REPLICA_COPY>(
+            select_client, {.key = *key,
+                            .object_id = object_id,
+                            .source = selected_source_segment,
+                            .targets = targets});
+}
+
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     const std::string& key, const std::string& source,
     const std::string& target) {
@@ -5102,6 +5169,60 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     return task_manager_.get_write_access()
         .submit_task_typed<TaskType::REPLICA_MOVE>(
             select_client, {.key = key, .source = source, .target = target});
+}
+
+tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
+    const LogicalObjectId& object_id, const std::string& source,
+    const std::string& target) {
+    auto key = FindLegacyKeyByObjectId(object_id);
+    if (!key.has_value()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataAccessorRO accessor(this, *key);
+    if (!accessor.Exists()) {
+        VLOG(1) << "object_id=" << object_id << ", info=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    if (source == target) {
+        LOG(ERROR) << "object_id=" << object_id << ", source_segment="
+                   << source << ", target_segment=" << target
+                   << ", error=source_target_segments_are_same";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    ScopedSegmentAccess segment_accessor = segment_manager_.getSegmentAccess();
+    if (!segment_accessor.ExistsSegmentName(target)) {
+        LOG(ERROR) << "object_id=" << object_id << ", target_segment="
+                   << target << ", error=target_segment_not_mounted";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const auto& metadata = accessor.Get();
+    const auto& segment_names = metadata.GetReplicaSegmentNames();
+    if (std::find(segment_names.begin(), segment_names.end(), source) ==
+        segment_names.end()) {
+        LOG(ERROR) << "object_id=" << object_id << ", source_segment="
+                   << source << ", error=source_segment_not_found";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    UUID select_client;
+    ErrorCode error =
+        segment_accessor.GetClientIdBySegmentName(source, select_client);
+    if (error != ErrorCode::OK) {
+        LOG(ERROR) << "object_id=" << object_id << ", segment_name="
+                   << source << ", error=client_id_not_found";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    return task_manager_.get_write_access()
+        .submit_task_typed<TaskType::REPLICA_MOVE>(
+            select_client, {.key = *key,
+                            .object_id = object_id,
+                            .source = source,
+                            .target = target});
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
