@@ -221,6 +221,7 @@ enum class ErrorCode : int32_t {
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE =
         -200,  ///< Memory allocation failed due to insufficient space.
+    QUOTA_EXCEEDED = -201,  ///< Admission rejected due to configured quota.
 
     // Version errors (Range: -300 to -399)
     INVALID_VERSION = -300,  ///< Invalid version.
@@ -357,6 +358,14 @@ enum class AllocationStrategyType {
     RANDOM = 0,        // Pure random allocation
     FREE_RATIO_FIRST,  // Free-ratio-first allocation
     CXL,               // CXL-specific allocation
+};
+
+/**
+ * @brief Admission strategy type for write admission
+ */
+enum class AdmissionStrategyType {
+    NOOP = 0,
+    QUOTA,
 };
 
 /**

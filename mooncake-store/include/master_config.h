@@ -24,6 +24,7 @@ struct MasterConfig {
     uint64_t default_kv_lease_ttl;
     uint64_t default_kv_soft_pin_ttl;
     bool allow_evict_soft_pinned_objects;
+    bool enable_tenant_fair_eviction;
     double eviction_ratio;
     double eviction_high_watermark_ratio;
     int64_t client_live_ttl_sec;
@@ -39,6 +40,8 @@ struct MasterConfig {
     int64_t global_file_segment_size;
     std::string memory_allocator;
     std::string allocation_strategy;
+    std::string admission_strategy;
+    uint64_t admission_quota_bytes;
 
     // HTTP metadata server configuration
     bool enable_http_metadata_server;
@@ -105,6 +108,7 @@ class MasterServiceSupervisorConfig {
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
+    bool enable_tenant_fair_eviction = true;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
@@ -113,6 +117,8 @@ class MasterServiceSupervisorConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    std::string admission_strategy = "noop";
+    uint64_t admission_quota_bytes = 0;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -151,6 +157,7 @@ class MasterServiceSupervisorConfig {
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
+        enable_tenant_fair_eviction = config.enable_tenant_fair_eviction;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         client_live_ttl_sec = config.client_live_ttl_sec;
@@ -180,6 +187,9 @@ class MasterServiceSupervisorConfig {
         } else {
             memory_allocator = BufferAllocatorType::OFFSET;
         }
+
+        admission_strategy = config.admission_strategy;
+        admission_quota_bytes = config.admission_quota_bytes;
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
@@ -258,6 +268,7 @@ class WrappedMasterServiceConfig {
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
+    bool enable_tenant_fair_eviction = true;
     bool enable_metric_reporting = true;
     uint16_t http_port = 9003;
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
@@ -275,6 +286,9 @@ class WrappedMasterServiceConfig {
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type =
         AllocationStrategyType::RANDOM;
+    AdmissionStrategyType admission_strategy_type =
+        AdmissionStrategyType::NOOP;
+    uint64_t admission_quota_bytes = 0;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -356,6 +370,20 @@ class WrappedMasterServiceConfig {
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 
+        if (config.admission_strategy == "quota") {
+            admission_strategy_type = AdmissionStrategyType::QUOTA;
+        } else if (config.admission_strategy.empty() ||
+                   config.admission_strategy == "noop") {
+            admission_strategy_type = AdmissionStrategyType::NOOP;
+        } else {
+            LOG(WARNING) << "Unrecognized admission_strategy value: '"
+                         << config.admission_strategy
+                         << "'. Defaulting to 'noop'. "
+                         << "Valid options are: noop, quota (case-sensitive)";
+            admission_strategy_type = AdmissionStrategyType::NOOP;
+        }
+        admission_quota_bytes = config.admission_quota_bytes;
+
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
@@ -391,6 +419,7 @@ class WrappedMasterServiceConfig {
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
+        enable_tenant_fair_eviction = config.enable_tenant_fair_eviction;
         enable_metric_reporting = config.enable_metric_reporting;
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
@@ -409,6 +438,19 @@ class WrappedMasterServiceConfig {
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
+        if (config.admission_strategy == "quota") {
+            admission_strategy_type = AdmissionStrategyType::QUOTA;
+        } else if (config.admission_strategy.empty() ||
+                   config.admission_strategy == "noop") {
+            admission_strategy_type = AdmissionStrategyType::NOOP;
+        } else {
+            LOG(WARNING) << "Unrecognized admission_strategy value: '"
+                         << config.admission_strategy
+                         << "'. Defaulting to 'noop'. "
+                         << "Valid options are: noop, quota (case-sensitive)";
+            admission_strategy_type = AdmissionStrategyType::NOOP;
+        }
+        admission_quota_bytes = config.admission_quota_bytes;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -447,6 +489,7 @@ class MasterServiceConfigBuilder {
     uint64_t default_kv_soft_pin_ttl_ = DEFAULT_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects_ =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
+    bool enable_tenant_fair_eviction_ = true;
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio_ =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
@@ -462,6 +505,9 @@ class MasterServiceConfigBuilder {
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type_ =
         AllocationStrategyType::RANDOM;
+    AdmissionStrategyType admission_strategy_type_ =
+        AdmissionStrategyType::NOOP;
+    uint64_t admission_quota_bytes_ = 0;
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
@@ -503,6 +549,11 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_allow_evict_soft_pinned_objects(
         bool allow) {
         allow_evict_soft_pinned_objects_ = allow;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_tenant_fair_eviction(bool enable) {
+        enable_tenant_fair_eviction_ = enable;
         return *this;
     }
 
@@ -574,6 +625,17 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_allocation_strategy_type(
         AllocationStrategyType type) {
         allocation_strategy_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_admission_strategy_type(
+        AdmissionStrategyType type) {
+        admission_strategy_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_admission_quota_bytes(uint64_t bytes) {
+        admission_quota_bytes_ = bytes;
         return *this;
     }
 
@@ -729,6 +791,7 @@ class MasterServiceConfig {
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
+    bool enable_tenant_fair_eviction = true;
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
@@ -744,6 +807,9 @@ class MasterServiceConfig {
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type =
         AllocationStrategyType::RANDOM;
+    AdmissionStrategyType admission_strategy_type =
+        AdmissionStrategyType::NOOP;
+    uint64_t admission_quota_bytes = 0;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -781,6 +847,7 @@ class MasterServiceConfig {
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
+        enable_tenant_fair_eviction = config.enable_tenant_fair_eviction;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         view_version = config.view_version;
@@ -795,6 +862,8 @@ class MasterServiceConfig {
         memory_allocator =
             config.enable_cxl ? cxl_allocator_type : config.memory_allocator;
         allocation_strategy_type = config.allocation_strategy_type;
+        admission_strategy_type = config.admission_strategy_type;
+        admission_quota_bytes = config.admission_quota_bytes;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -837,6 +906,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
     config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl_;
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
+    config.enable_tenant_fair_eviction = enable_tenant_fair_eviction_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
     config.view_version = view_version_;
@@ -850,6 +920,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.global_file_segment_size = global_file_segment_size_;
     config.memory_allocator = memory_allocator_;
     config.allocation_strategy_type = allocation_strategy_type_;
+    config.admission_strategy_type = admission_strategy_type_;
+    config.admission_quota_bytes = admission_quota_bytes_;
     config.put_start_discard_timeout_sec = put_start_discard_timeout_sec_;
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;

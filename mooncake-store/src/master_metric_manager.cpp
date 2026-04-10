@@ -38,9 +38,17 @@ MasterMetricManager::MasterMetricManager()
                            "Total capacity for file storage in 3fs/nfs"),
       key_count_("master_key_count",
                  "Total number of keys managed by the master"),
+      labeled_key_count_(
+          "master_labeled_key_count",
+          "Total number of live keys grouped by tenant, domain, and object set",
+          {"tenant_id", "domain_id", "object_set"}),
       soft_pin_key_count_(
           "master_soft_pin_key_count",
           "Total number of soft-pinned keys managed by the master"),
+      labeled_live_bytes_(
+          "master_labeled_live_bytes",
+          "Total live bytes grouped by tenant, domain, and object set",
+          {"tenant_id", "domain_id", "object_set"}),
       // Initialize Histogram (4KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB)
       value_size_distribution_(
           "master_value_size_bytes", "Distribution of object value sizes",
@@ -451,9 +459,10 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     value_size_distribution_.observe(0);
 
     // Note: dynamic_gauge_1t (mem_allocated_size_per_segment_ and
-    // mem_total_capacity_per_segment_) are not initialized here because they
-    // require label values. They will be initialized when first used with
-    // actual segment names.
+    // mem_total_capacity_per_segment_) and dynamic_gauge_3t
+    // (labeled_key_count_ and labeled_live_bytes_) are not initialized here
+    // because they require label values. They will be initialized when first
+    // used with actual labels.
 }
 
 // Memory Storage Metrics
@@ -572,11 +581,56 @@ double MasterMetricManager::get_global_file_used_ratio(void) {
 void MasterMetricManager::inc_key_count(int64_t val) { key_count_.inc(val); }
 void MasterMetricManager::dec_key_count(int64_t val) { key_count_.dec(val); }
 
+void MasterMetricManager::inc_labeled_key_count(const std::string& tenant_id,
+                                                const std::string& domain_id,
+                                                const std::string& object_set,
+                                                int64_t val) {
+    labeled_key_count_.inc({tenant_id, domain_id, object_set}, val);
+}
+
+void MasterMetricManager::dec_labeled_key_count(const std::string& tenant_id,
+                                                const std::string& domain_id,
+                                                const std::string& object_set,
+                                                int64_t val) {
+    labeled_key_count_.dec({tenant_id, domain_id, object_set}, val);
+}
+
 void MasterMetricManager::inc_soft_pin_key_count(int64_t val) {
     soft_pin_key_count_.inc(val);
 }
 void MasterMetricManager::dec_soft_pin_key_count(int64_t val) {
     soft_pin_key_count_.dec(val);
+}
+
+void MasterMetricManager::inc_labeled_live_bytes(const std::string& tenant_id,
+                                                 const std::string& domain_id,
+                                                 const std::string& object_set,
+                                                 int64_t val) {
+    labeled_live_bytes_.inc({tenant_id, domain_id, object_set}, val);
+}
+
+void MasterMetricManager::dec_labeled_live_bytes(const std::string& tenant_id,
+                                                 const std::string& domain_id,
+                                                 const std::string& object_set,
+                                                 int64_t val) {
+    labeled_live_bytes_.dec({tenant_id, domain_id, object_set}, val);
+}
+
+void MasterMetricManager::reset_labeled_key_count(const std::string& tenant_id,
+                                                  const std::string& domain_id,
+                                                  const std::string& object_set) {
+    labeled_key_count_.update({tenant_id, domain_id, object_set}, 0);
+}
+
+void MasterMetricManager::reset_labeled_live_bytes(const std::string& tenant_id,
+                                                   const std::string& domain_id,
+                                                   const std::string& object_set) {
+    labeled_live_bytes_.update({tenant_id, domain_id, object_set}, 0);
+}
+
+void MasterMetricManager::reset_all_labeled_inventory_metrics() {
+    // dynamic_gauge_3t does not expose a registry-wide reset API; callers that
+    // need a full rebuild should repopulate metrics from current metadata.
 }
 
 void MasterMetricManager::observe_value_size(int64_t size) {
@@ -585,8 +639,20 @@ void MasterMetricManager::observe_value_size(int64_t size) {
 
 int64_t MasterMetricManager::get_key_count() { return key_count_.value(); }
 
+int64_t MasterMetricManager::get_labeled_key_count(
+    const std::string& tenant_id, const std::string& domain_id,
+    const std::string& object_set) {
+    return labeled_key_count_.value({tenant_id, domain_id, object_set});
+}
+
 int64_t MasterMetricManager::get_soft_pin_key_count() {
     return soft_pin_key_count_.value();
+}
+
+int64_t MasterMetricManager::get_labeled_live_bytes(
+    const std::string& tenant_id, const std::string& domain_id,
+    const std::string& object_set) {
+    return labeled_live_bytes_.value({tenant_id, domain_id, object_set});
 }
 
 // Cluster Metrics

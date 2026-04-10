@@ -18,6 +18,8 @@
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include "admission_controller.h"
+#include "metadata_store.h"
 #include "allocation_strategy.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
@@ -113,6 +115,8 @@ class MasterService {
      * @return ErrorCode::OK if exists
      */
     auto GetAllKeys() -> tl::expected<std::vector<std::string>, ErrorCode>;
+    auto GetAllObjects()
+        -> tl::expected<std::vector<LogicalObjectId>, ErrorCode>;
     auto GetAllKeysByScope(const std::string& tenant_id,
                            const std::string& domain_id)
         -> tl::expected<std::vector<std::string>, ErrorCode>;
@@ -565,18 +569,23 @@ class MasterService {
     void HandleChildTimeout(pid_t pid, const std::string& snapshot_id);
     void HandleChildExit(pid_t pid, int status, const std::string& snapshot_id);
 
-    // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
-    // object with smaller lease timeout. It has two passes. The first pass only
-    // evicts objects without soft pin. The second pass prioritizes objects
-    // without soft pin, but also allows to evict soft pinned objects if
-    // allow_evict_soft_pinned_objects_ is true. The first pass tries fulfill
-    // evict ratio target. If the actual evicted ratio is less than
-    // evict_ratio_lowerbound, the second pass will be triggered and try to
-    // fulfill evict ratio lowerbound.
+    // BatchEvict evicts objects in a near-LRU way. When
+    // enable_tenant_fair_eviction_ is on, it first groups eligible candidates
+    // by tenant and prefers the tenant with larger live bytes; within each
+    // tenant it still prioritizes smaller lease timeout. It has two passes.
+    // The first pass only evicts objects without soft pin. The second pass
+    // prioritizes objects without soft pin, but also allows to evict soft
+    // pinned objects if allow_evict_soft_pinned_objects_ is true. The first
+    // pass tries fulfill evict ratio target. If the actual evicted ratio is
+    // less than evict_ratio_lowerbound, the second pass will be triggered and
+    // try to fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
 
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
+    struct ObjectMetadata;
+    void AccountLiveBytes(ObjectMetadata& metadata);
+    void ReleaseLiveBytes(ObjectMetadata& metadata);
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -601,11 +610,10 @@ class MasterService {
             const UUID& client_id_,
             const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
-            bool enable_soft_pin, bool enable_hard_pin,
-            std::string tenant_id_, std::string domain_id_,
-            std::string object_set_, std::string sharing_scope_,
-            std::string qos_tier_, std::string logical_key_,
-            std::string canonical_key_)
+            bool enable_soft_pin, bool enable_hard_pin, std::string tenant_id_,
+            std::string domain_id_, std::string object_set_,
+            std::string sharing_scope_, std::string qos_tier_,
+            std::string logical_key_, std::string canonical_key_)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
@@ -619,13 +627,16 @@ class MasterService {
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
+              bytes_accounted(false),
               replicas_(std::move(reps)) {
-            MasterMetricManager::instance().inc_key_count(1);
+            auto& metrics = MasterMetricManager::instance();
+            metrics.inc_key_count(1);
+            metrics.inc_labeled_key_count(tenant_id, domain_id, object_set, 1);
             if (enable_soft_pin) {
                 soft_pin_timeout.emplace();
-                MasterMetricManager::instance().inc_soft_pin_key_count(1);
+                metrics.inc_soft_pin_key_count(1);
             }
-            MasterMetricManager::instance().observe_value_size(value_length);
+            metrics.observe_value_size(value_length);
         }
 
         ObjectMetadata(const ObjectMetadata&) = delete;
@@ -656,6 +667,7 @@ class MasterService {
             soft_pin_timeout GUARDED_BY(lock);  // optional soft pin, only
                                                 // set for vip objects
         const bool hard_pinned{false};          // immutable, set at creation
+        bool bytes_accounted{false};
 
         void AddReplicas(std::vector<Replica>&& replicas) {
             replicas_.insert(replicas_.end(),
@@ -835,6 +847,10 @@ class MasterService {
                               !replica.has_invalid_mem_handle();
                    });
         }
+
+        void MarkBytesAccounted() { bytes_accounted = true; }
+        void ClearBytesAccounted() { bytes_accounted = false; }
+        bool AreBytesAccounted() const { return bytes_accounted; }
 
         std::vector<std::string> GetReplicaSegmentNames() const {
             std::vector<std::string> segment_names;
@@ -1051,6 +1067,7 @@ class MasterService {
     // Eviction related members
     std::atomic<bool> need_eviction_{
         false};  // Set to trigger eviction when not enough space left
+    const bool enable_tenant_fair_eviction_;
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
@@ -1084,10 +1101,10 @@ class MasterService {
               it_(alias_it_ != shard_guard_->raw_key_to_id.end()
                       ? shard_guard_->metadata.find(alias_it_->second)
                       : shard_guard_->metadata.end()),
-              processing_it_(alias_it_ != shard_guard_->raw_key_to_id.end()
-                                 ? shard_guard_->processing_keys.find(
-                                       alias_it_->second)
-                                 : shard_guard_->processing_keys.end()),
+              processing_it_(
+                  alias_it_ != shard_guard_->raw_key_to_id.end()
+                      ? shard_guard_->processing_keys.find(alias_it_->second)
+                      : shard_guard_->processing_keys.end()),
               replication_task_it_(
                   alias_it_ != shard_guard_->raw_key_to_id.end()
                       ? shard_guard_->replication_tasks.find(alias_it_->second)
@@ -1126,6 +1143,10 @@ class MasterService {
 
         const ReplicationTask& GetReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
             return replication_task_it_->second;
+        }
+
+        const LogicalObjectId& GetObjectId() const NO_THREAD_SAFETY_ANALYSIS {
+            return it_->first;
         }
 
         // Delete current metadata (for PutRevoke or Remove operations)
@@ -1247,10 +1268,10 @@ class MasterService {
               it_(alias_it_ != shard_guard_->raw_key_to_id.end()
                       ? shard_guard_->metadata.find(alias_it_->second)
                       : shard_guard_->metadata.end()),
-              processing_it_(alias_it_ != shard_guard_->raw_key_to_id.end()
-                                 ? shard_guard_->processing_keys.find(
-                                       alias_it_->second)
-                                 : shard_guard_->processing_keys.end()) {}
+              processing_it_(
+                  alias_it_ != shard_guard_->raw_key_to_id.end()
+                      ? shard_guard_->processing_keys.find(alias_it_->second)
+                      : shard_guard_->processing_keys.end()) {}
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
@@ -1332,6 +1353,7 @@ class MasterService {
     SegmentManager segment_manager_;
     BufferAllocatorType memory_allocator_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    std::shared_ptr<AdmissionController> admission_controller_;
 
     bool enable_snapshot_restore_ = false;
 
