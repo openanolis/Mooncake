@@ -44,6 +44,21 @@ if (STORE_USE_REDIS)
   add_compile_definitions(STORE_USE_REDIS)
 endif()
 
+option(USE_CXL "Enable CXL memory tier support (requires CXL-capable hardware or device simulation)" OFF)
+if (USE_CXL)
+  add_compile_definitions(USE_CXL)
+  message(STATUS "CXL memory tier support: Enabled")
+endif()
+
+option(ENABLE_MULTI_PROTOCOL "Enable multi-protocol client support for tiered storage (e.g. CXL+TCP or CXL+RDMA). Requires USE_CXL=ON." OFF)
+if (ENABLE_MULTI_PROTOCOL)
+  if (NOT USE_CXL)
+    message(WARNING "ENABLE_MULTI_PROTOCOL=ON but USE_CXL=OFF. Multi-protocol mode requires CXL support.")
+  endif()
+  add_compile_definitions(ENABLE_MULTI_PROTOCOL)
+  message(STATUS "Multi-protocol tiered storage: Enabled")
+endif()
+
 option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
 
 # Define ASIO macros before adding mooncake-asio subdirectory
