@@ -637,11 +637,6 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         return std::nullopt;
     }
 
-    if (batch_id == INVALID_BATCH_ID) {  // INVALID_BATCH_ID
-        LOG(ERROR) << "Invalid batch ID for transfer engine operation";
-        return std::nullopt;
-    }
-
     // Create state with transfer engine context - no polling thread
     // needed
     auto state = std::make_shared<TransferEngineOperationState>(
@@ -666,20 +661,11 @@ std::optional<TransferFuture> TransferSubmitter::mp_submitTransfer(
     if (!s.ok()) {
         LOG(ERROR) << "Failed to submit all transfers, error code is "
                    << s.code();
-        // Note: batch_id will be freed by TransferEngineOperationState
-        // destructor if we create the state object, otherwise we need to free
-        // it here
         engine_.freeBatchID(batch_id);
         return std::nullopt;
     }
 
-    if (batch_id == INVALID_BATCH_ID) {  // INVALID_BATCH_ID
-        LOG(ERROR) << "Invalid batch ID for transfer engine operation";
-        return std::nullopt;
-    }
-
-    // Create state with transfer engine context - no polling thread
-    // needed
+    // Create state with transfer engine context - no polling thread needed
     auto state = std::make_shared<TransferEngineOperationState>(
         engine_, batch_id, batch_size);
 
