@@ -231,6 +231,11 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
             segment_name, metrics_dec_capacity);
         MasterMetricManager::instance().dec_total_dram_capacity(
             segment_name, metrics_dec_capacity);
+    } else {
+        MasterMetricManager::instance().dec_total_mem_capacity(
+            segment_name, metrics_dec_capacity);
+        MasterMetricManager::instance().dec_total_cxl_capacity(
+            segment_name, metrics_dec_capacity);
     }
 
     return ErrorCode::OK;
