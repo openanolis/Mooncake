@@ -14,6 +14,155 @@ int write_manifest_impl(const std::string &key,
     return ret;
 }
 
+int put_tensor_info_impl(const std::string &key, const PyTensorInfo &info,
+                         const ReplicateConfig &config) {
+    if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
+
+    std::vector<std::span<const char>> values;
+    values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
+                        info.metadata.header.data_offset);
+    values.emplace_back(reinterpret_cast<const char *>(info.data_ptr),
+                        info.tensor_size);
+
+    py::gil_scoped_release release_gil;
+    int ret = store_->put_parts(key, values, config);
+    if (ret != 0)
+        LOG(ERROR) << "put_parts failed for key " << key << " with code "
+                   << ret;
+    return ret;
+}
+
+int put_manifest_impl(const std::string &key,
+                      const WriterShardManifest &manifest,
+                      const ReplicateConfig &config) {
+    return write_manifest_impl(
+        key, manifest, "put",
+        [this, &key, &config](std::span<const char> bytes) {
+            return store_->put(key, bytes, config);
+        });
+}
+
+int upsert_manifest_impl(const std::string &key,
+                         const WriterShardManifest &manifest,
+                         const ReplicateConfig &config) {
+    return write_manifest_impl(
+        key, manifest, "upsert",
+        [this, &key, &config](std::span<const char> bytes) {
+            return store_->upsert(key, bytes, config);
+        });
+}
+
+int upsert_tensor_info_impl(const std::string &key, const PyTensorInfo &info,
+                            const ReplicateConfig &config) {
+    if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
+
+    std::vector<std::span<const char>> values;
+    values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
+                        info.metadata.header.data_offset);
+    values.emplace_back(reinterpret_cast<const char *>(info.data_ptr),
+                        info.tensor_size);
+
+    py::gil_scoped_release release_gil;
+    int ret = store_->upsert_parts(key, values, config);
+    if (ret != 0)
+        LOG(ERROR) << "upsert_parts failed for key " << key << " with code "
+                   << ret;
+    return ret;
+}
+
+int validate_replicate_config(
+    const ReplicateConfig &config = ReplicateConfig{}) {
+    if (!config.preferred_segments.empty() &&
+        config.preferred_segments.size() != config.replica_num) {
+        LOG(ERROR) << "Preferred segments size ("
+                   << config.preferred_segments.size()
+                   << ") must match replica_num (" << config.replica_num << ")";
+        return to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+    return 0;
+}
+
+int upsert_tensor_impl(const std::string &key, pybind11::object tensor,
+                       const ReplicateConfig &config) {
+    auto info = extract_tensor_info(tensor, key);
+    if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
+
+    std::vector<std::span<const char>> values;
+    values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
+                        sizeof(TensorMetadata));
+    values.emplace_back(reinterpret_cast<const char *>(info.data_ptr),
+                        info.tensor_size);
+
+    py::gil_scoped_release release_gil;
+    int ret = store_->upsert_parts(key, values, config);
+    if (ret != 0)
+        LOG(ERROR) << "upsert_parts failed for key " << key << " with code "
+                   << ret;
+    return ret;
+}
+
+std::vector<int> batch_upsert_tensor_impl(
+    const std::vector<std::string> &keys, const pybind11::list &tensors_list,
+    const ReplicateConfig &config = ReplicateConfig{}) {
+    std::vector<PyTensorInfo> infos(keys.size());
+    std::vector<int> results(keys.size(), 0);
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        infos[i] = extract_tensor_info(tensors_list[i], keys[i]);
+        if (!infos[i].valid())
+            results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+
+    {
+        py::gil_scoped_release release_gil;
+
+        std::vector<std::string> valid_keys;
+        std::vector<void *> buffer_ptrs;
+        std::vector<size_t> buffer_sizes;
+        std::vector<size_t> original_indices;
+
+        std::vector<std::unique_ptr<BufferHandle>> temp_allocations;
+
+        for (size_t i = 0; i < infos.size(); ++i) {
+            if (!infos[i].valid()) continue;
+
+            size_t total_size = sizeof(TensorMetadata) + infos[i].tensor_size;
+            auto alloc_result =
+                store_->client_buffer_allocator_->allocate(total_size);
+
+            if (!alloc_result) {
+                LOG(ERROR) << "Failed to allocate buffer for key: " << keys[i];
+                results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+
+            char *dst = static_cast<char *>(alloc_result->ptr());
+            memcpy(dst, &infos[i].metadata, sizeof(TensorMetadata));
+            memcpy(dst + sizeof(TensorMetadata),
+                   reinterpret_cast<void *>(infos[i].data_ptr),
+                   infos[i].tensor_size);
+
+            valid_keys.push_back(keys[i]);
+            buffer_ptrs.push_back(alloc_result->ptr());
+            buffer_sizes.push_back(total_size);
+            original_indices.push_back(i);
+
+            temp_allocations.push_back(
+                std::make_unique<BufferHandle>(std::move(*alloc_result)));
+        }
+
+        if (!valid_keys.empty()) {
+            std::vector<int> op_results = store_->batch_upsert_from(
+                valid_keys, buffer_ptrs, buffer_sizes, config);
+            for (size_t i = 0; i < op_results.size(); ++i) {
+                results[original_indices[i]] = op_results[i];
+            }
+        }
+    }
+
+    return results;
+}
+
 template <typename BatchWriteFromFn>
 std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
                                          const std::vector<PyTensorInfo> &infos,
