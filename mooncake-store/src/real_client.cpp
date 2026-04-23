@@ -447,7 +447,7 @@ tl::expected<void, ErrorCode> RealClient::mp_setup_internal(
                 if (end != env && *end == '\0')
                     cxl_dev_size = static_cast<size_t>(val);
             } else {
-                LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
+                LOG(ERROR) << "MC_CXL_DEV_SIZE not set";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
 
@@ -753,7 +753,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (end != env && *end == '\0')
                 cxl_dev_size = static_cast<size_t>(val);
         } else {
-            LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
+            LOG(ERROR) << "MC_CXL_DEV_SIZE not set";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
