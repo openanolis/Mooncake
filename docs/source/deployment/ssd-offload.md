@@ -94,6 +94,39 @@ store.setup(
 | `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` | `10` | Interval for offload heartbeat to master (seconds) |
 | `MOONCAKE_OFFLOAD_USE_URING` | `false` | Enable io_uring for async file I/O |
 
+### NVMe KV backend settings
+
+Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=nvme_kv_storage_backend`.
+
+The NVMe KV backend submits commands through the Linux NVMe passthrough ioctl interface and requires a configured NVMe KV-capable device path. Command behavior follows the NVM Express Key Value Command Set specification: https://nvmexpress.org/specification/key-value-command-set-specification/.
+
+| Environment Variable | Default | Description |
+|---|---|---|
+| `MOONCAKE_NVME_KV_DEVICE_PATH` | unset | Default NVMe character device path, for example `/dev/ng0n1`. |
+| `MOONCAKE_NVME_KV_DEVICE_PATH_<device_id>` | unset | Per-device path override. Device IDs may contain only letters, digits, `_`, `-`, or `.` and may not be `.` or `..`. |
+| `MOONCAKE_NVME_KV_DEVICE_IDS` | `default` | Comma-separated logical device IDs used for placement. |
+| `MOONCAKE_NVME_KV_NSID` | `1` | NVMe namespace identifier used in ioctl commands. |
+| `MOONCAKE_NVME_KV_TRACE_COMMANDS` | unset | Set to a non-zero value to log NVMe KV ioctl command fields and completion results. |
+
+During initialization, the ioctl executor probes the namespace's NVMe KV format with Identify and uses the reported value-size capability. If probing is unavailable, it uses a conservative 128 KiB value-size fallback.
+
+Single-device example:
+
+```bash
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=nvme_kv_storage_backend
+export MOONCAKE_NVME_KV_DEVICE_PATH=/dev/ng0n1
+export MOONCAKE_NVME_KV_NSID=1
+```
+
+Multi-device example:
+
+```bash
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=nvme_kv_storage_backend
+export MOONCAKE_NVME_KV_DEVICE_IDS=dev0,dev1
+export MOONCAKE_NVME_KV_DEVICE_PATH_dev0=/dev/ng0n1
+export MOONCAKE_NVME_KV_DEVICE_PATH_dev1=/dev/ng1n1
+```
+
 ### Bucket backend settings
 
 Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend`.
