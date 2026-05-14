@@ -130,6 +130,38 @@ store.close()
 
 </details>
 
+## Bundle Transfer Helper
+
+`MooncakeBundleTransfer` stores one metadata byte payload plus a set of named byte buffers as a single logical bundle.
+It is intended for higher-level libraries that already own their schema and only need Mooncake to move generic binary frames.
+
+```python
+from mooncake.bundle_transfer import MooncakeBundleTransfer
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+transfer = MooncakeBundleTransfer(store, key_prefix="bundle")
+
+ref = transfer.put_bundle(
+    b'{"format":"example"}',
+    {"tokens": b"token-bytes", "scores": b"score-bytes"},
+    partition="worker-0",
+    chunk_bytes=64 * 1024 * 1024,
+    max_inflight_put=4,
+)
+
+meta, buffers = transfer.get_bundle(ref, max_inflight_get=4)
+transfer.remove_bundle(ref)
+```
+
+The helper writes data chunks first and a JSON manifest last. If a put fails before the manifest is written, already-written chunks are cleaned up best-effort. `remove_bundle()` removes all payload chunks and the manifest, using `batch_remove()` when the store provides it.
+
+Large metadata or buffer payloads are split into chunks. `max_inflight_put` controls concurrent chunk writes, and `max_inflight_get` controls concurrent fallback reads when the store does not provide batch zero-copy reads.
+
+On reads, the helper prefers `batch_get_into()` when the store also provides `register_buffer()` and `unregister_buffer()`. In that path, the helper allocates the destination byte buffer, registers it once, reads all chunks into offsets inside that buffer, and unregisters it before returning. Caller-owned reusable registered buffers and buffer-pool policies remain outside this helper.
+
+The manifest is validated before reads and removals: bundle version/layout, object namespace, duplicate chunk keys, and chunk byte totals must match. This keeps the helper generic and prevents a caller-provided manifest from reading or deleting keys outside the bundle namespace.
+
 ## Zero-Copy API (Advanced Performance)
 
 For maximum performance, especially with RDMA networks, use the zero-copy API. This allows direct memory access without intermediate copies.
