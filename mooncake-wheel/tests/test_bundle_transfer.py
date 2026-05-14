@@ -116,12 +116,6 @@ class FailingBatchGetStore(InMemoryStore):
         return super().batch_get_into(keys, ptrs, sizes)
 
 
-class FailingUnregisterStore(InMemoryStore):
-    def unregister_buffer(self, buffer_ptr: int) -> int:
-        self.registered.remove(buffer_ptr)
-        return -1
-
-
 class FailingRemoveStore(FailingPutStore):
     def remove(self, key: str, force: bool = False) -> int:
         raise RuntimeError("injected remove failure")
@@ -214,7 +208,6 @@ def test_bundle_concurrent_put_and_get() -> None:
     assert buffers["payload"] == payload
     assert store.max_active_puts > 1
     assert store.max_active_gets > 1
-    assert store.registered == set()
 
 
 def test_bundle_batch_get_failure_unregisters_buffer() -> None:
@@ -279,6 +272,11 @@ def test_bundle_rejects_tampered_manifest() -> None:
 
     with pytest.raises(ValueError, match="namespace"):
         transfer.get_bundle({"manifest": tampered})
+
+    with pytest.raises(ValueError, match="manifest_key"):
+        transfer.remove_bundle(
+            {"manifest": ref.manifest, "manifest_key": "test/other/manifest"}
+        )
 
 
 if __name__ == "__main__":

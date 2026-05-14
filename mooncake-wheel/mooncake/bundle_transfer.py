@@ -35,7 +35,6 @@ class RemoteBundleRef:
 
     manifest_key: str
     manifest: dict[str, Any]
-    total_bytes: int
 
 
 class MooncakeBundleTransfer:
@@ -67,27 +66,24 @@ class MooncakeBundleTransfer:
         manifest_key = f"{base_key}/manifest"
         written_keys: list[str] = []
         buffer_specs: dict[str, Any] = {}
-        total_bytes = 0
         try:
-            meta_spec, meta_bytes, meta_keys = self._put_payload(
+            meta_spec, meta_keys = self._put_payload(
                 f"{base_key}/meta",
                 meta_view,
                 target_chunk_bytes,
                 transfer_policy.max_inflight_put,
             )
             written_keys.extend(meta_keys)
-            total_bytes += meta_bytes
 
             for name, value in buffers.items():
                 _validate_key_segment(name, "buffer name")
-                spec, buffer_bytes, buffer_keys = self._put_payload(
+                spec, buffer_keys = self._put_payload(
                     f"{base_key}/buffer/{name}",
                     _payload_to_view(value, name),
                     target_chunk_bytes,
                     transfer_policy.max_inflight_put,
                 )
                 buffer_specs[name] = spec
-                total_bytes += buffer_bytes
                 written_keys.extend(buffer_keys)
 
             manifest = {
@@ -107,9 +103,7 @@ class MooncakeBundleTransfer:
             _cleanup_keys(self.store, written_keys, strict=False)
             raise
 
-        return RemoteBundleRef(
-            manifest_key=manifest_key, manifest=manifest, total_bytes=total_bytes
-        )
+        return RemoteBundleRef(manifest_key=manifest_key, manifest=manifest)
 
     def get_bundle(
         self,
@@ -136,9 +130,7 @@ class MooncakeBundleTransfer:
         """Remove all Mooncake objects that belong to a stored bundle."""
         manifest = self._resolve_manifest(ref)
         keys = self._payload_keys(manifest)
-        manifest_key = self._manifest_key(ref, manifest)
-        if manifest_key is not None:
-            keys.append(manifest_key)
+        keys.append(self._manifest_key(ref, manifest))
         _cleanup_keys(self.store, keys, strict=True)
 
     def _put_payload(
@@ -147,7 +139,7 @@ class MooncakeBundleTransfer:
         value: memoryview,
         chunk_bytes: int,
         max_inflight_put: int,
-    ) -> tuple[dict[str, Any], int, list[str]]:
+    ) -> tuple[dict[str, Any], list[str]]:
         chunks = _split_view(value, chunk_bytes)
         chunk_keys = [
             key if len(chunks) == 1 else f"{key}/chunk/{index}"
@@ -162,7 +154,7 @@ class MooncakeBundleTransfer:
                 for chunk_key, chunk in zip(chunk_keys, chunks)
             ],
         }
-        return spec, len(value), written_keys
+        return spec, written_keys
 
     def _put_chunks(
         self,
@@ -376,6 +368,11 @@ class MooncakeBundleTransfer:
     def _validate_payload_spec(self, spec: Any, base_key: str) -> None:
         if not isinstance(spec, dict):
             raise ValueError("bundle payload spec must be a dict")
+        payload_key = spec.get("key")
+        if not isinstance(payload_key, str) or not payload_key.startswith(
+            f"{base_key}/"
+        ):
+            raise ValueError("bundle payload key is outside the bundle namespace")
         expected_bytes = int(spec.get("bytes", -1))
         if expected_bytes < 0:
             raise ValueError("bundle payload bytes must be non-negative")
@@ -389,8 +386,10 @@ class MooncakeBundleTransfer:
                 raise ValueError("bundle chunk must be a dict")
             key = chunk.get("key")
             chunk_bytes = int(chunk.get("bytes", -1))
-            if not isinstance(key, str) or not key.startswith(f"{base_key}/"):
-                raise ValueError("bundle chunk key is outside the bundle namespace")
+            if not isinstance(key, str) or (
+                key != payload_key and not key.startswith(f"{payload_key}/")
+            ):
+                raise ValueError("bundle chunk key is outside the payload namespace")
             if key in seen_keys:
                 raise ValueError("bundle chunk keys must be unique")
             if chunk_bytes < 0:
@@ -404,13 +403,18 @@ class MooncakeBundleTransfer:
 
     def _manifest_key(
         self, ref: RemoteBundleRef | Mapping[str, Any], manifest: Mapping[str, Any]
-    ) -> Optional[str]:
-        if isinstance(ref, RemoteBundleRef):
-            return ref.manifest_key
-        manifest_key = ref.get("manifest_key")
-        if isinstance(manifest_key, str):
-            return manifest_key
-        return f"{self.key_prefix}/{manifest['object_id']}/manifest"
+    ) -> str:
+        expected = f"{self.key_prefix}/{manifest['object_id']}/manifest"
+        manifest_key = (
+            ref.manifest_key
+            if isinstance(ref, RemoteBundleRef)
+            else ref.get("manifest_key")
+        )
+        if manifest_key is None:
+            return expected
+        if manifest_key != expected:
+            raise ValueError("bundle manifest_key does not match manifest object_id")
+        return manifest_key
 
     def _payload_keys(self, manifest: Mapping[str, Any]) -> list[str]:
         keys = self._spec_keys(manifest["meta"])
@@ -502,27 +506,32 @@ def _cleanup_keys(store: BundleStore, keys: Sequence[str], strict: bool) -> None
     if callable(batch_remove) and unique_keys:
         try:
             results = batch_remove(unique_keys)
+            if len(results) != len(unique_keys):
+                raise RuntimeError(
+                    f"batch_remove returned {len(results)} results for {len(unique_keys)} keys"
+                )
+            errors = [
+                (key, status)
+                for key, status in zip(unique_keys, results)
+                if status not in (None, 0, MISSING_OBJECT_ERROR)
+            ]
+            if not errors:
+                return
         except Exception:
             if strict:
                 raise
-            return
-        errors = [
-            (key, status)
-            for key, status in zip(unique_keys, results)
-            if status not in (None, 0, MISSING_OBJECT_ERROR)
-        ]
-    else:
-        for key in unique_keys:
-            try:
-                status = store.remove(key, True)
-            except KeyError:
-                continue
-            except Exception:
-                if strict:
-                    raise
-                continue
-            if status not in (None, 0, MISSING_OBJECT_ERROR):
-                errors.append((key, status))
+
+    for key in unique_keys:
+        try:
+            status = store.remove(key, True)
+        except KeyError:
+            continue
+        except Exception:
+            if strict:
+                raise
+            continue
+        if status not in (None, 0, MISSING_OBJECT_ERROR):
+            errors.append((key, status))
     if errors and strict:
         raise RuntimeError(
             f"failed to remove {len(errors)} Mooncake keys: {errors[:3]}"
