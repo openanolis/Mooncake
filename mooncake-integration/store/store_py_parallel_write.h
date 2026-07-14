@@ -25,6 +25,11 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
     if (!group_ids_error.empty()) {
         return group_ids_error;
     }
+    if (keys.size() != infos.size()) {
+        LOG(ERROR) << operation_name << ": keys and tensor infos size mismatch";
+        return std::vector<int>(keys.size(),
+                                to_py_ret(ErrorCode::INVALID_PARAMS));
+    }
 
     std::vector<int> results(keys.size(), 0);
 

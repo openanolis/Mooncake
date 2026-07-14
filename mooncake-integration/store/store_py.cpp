@@ -394,8 +394,8 @@ class MooncakeStorePyWrapper {
 
         const size_t metadata_size = info.metadata.header.data_offset;
         if (metadata_size < sizeof(TensorMetadata) ||
-            metadata_size > std::numeric_limits<size_t>::max() -
-                                info.tensor_size) {
+            metadata_size >
+                std::numeric_limits<size_t>::max() - info.tensor_size) {
             LOG(ERROR) << operation_name
                        << ": invalid tensor metadata size for key " << key;
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -818,13 +818,11 @@ class MooncakeStorePyWrapper {
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
 
         py::gil_scoped_release release_gil;
-        auto prepared =
-            prepare_tensor_object_buffer(info, "put_tensor", key);
+        auto prepared = prepare_tensor_object_buffer(info, "put_tensor", key);
         if (!prepared) return to_py_ret(prepared.error());
 
-        int ret =
-            store_->put_from(key, prepared->handle->ptr(), prepared->size,
-                             config);
+        int ret = store_->put_from(key, prepared->handle->ptr(), prepared->size,
+                                   config);
         if (ret != 0)
             LOG(ERROR) << "put_from failed for key " << key << " with code "
                        << ret;
@@ -1158,9 +1156,8 @@ class MooncakeStorePyWrapper {
             prepare_tensor_object_buffer(info, "put_tensor_info", key);
         if (!prepared) return to_py_ret(prepared.error());
 
-        int ret =
-            store_->put_from(key, prepared->handle->ptr(), prepared->size,
-                             config);
+        int ret = store_->put_from(key, prepared->handle->ptr(), prepared->size,
+                                   config);
         if (ret != 0)
             LOG(ERROR) << "put_from failed for key " << key << " with code "
                        << ret;
@@ -1371,9 +1368,8 @@ class MooncakeStorePyWrapper {
             prepare_tensor_object_buffer(info, "upsert_tensor_info", key);
         if (!prepared) return to_py_ret(prepared.error());
 
-        int ret =
-            store_->upsert_from(key, prepared->handle->ptr(), prepared->size,
-                                config);
+        int ret = store_->upsert_from(key, prepared->handle->ptr(),
+                                      prepared->size, config);
         if (ret != 0)
             LOG(ERROR) << "upsert_from failed for key " << key << " with code "
                        << ret;
@@ -1390,9 +1386,8 @@ class MooncakeStorePyWrapper {
             prepare_tensor_object_buffer(info, "upsert_tensor", key);
         if (!prepared) return to_py_ret(prepared.error());
 
-        int ret =
-            store_->upsert_from(key, prepared->handle->ptr(), prepared->size,
-                                config);
+        int ret = store_->upsert_from(key, prepared->handle->ptr(),
+                                      prepared->size, config);
         if (ret != 0)
             LOG(ERROR) << "upsert_from failed for key " << key << " with code "
                        << ret;

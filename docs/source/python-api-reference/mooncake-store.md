@@ -1077,8 +1077,9 @@ def setup(
 When the store is built with CUDA support, real-client local buffers are pinned
 on a best-effort basis for faster GPU-to-CPU and CPU-to-GPU copies. Set
 `MC_STORE_PIN_MEMORY=0` or `false` to disable this behavior. Set
-`MC_STORE_PIN_MEMORY_MAX_BYTES` to cap Store-managed pinned memory per process.
-If the variable is unset or set to `0`, no per-process cap is applied. If
+`MC_STORE_PIN_MEMORY_MAX_BYTES` to cap Store CUDA host-registration pinned
+memory for real-client local buffers in this process. If the variable is unset
+or set to `0`, no cap is applied for those Store-managed pinned regions. If
 pinning fails or the quota is exhausted, operations continue with pageable host
 memory.
 

@@ -279,6 +279,17 @@ inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     return {};
 }
 
+inline tl::expected<void, ErrorCode> copy_maybe_device_to_host(
+    void *dst, const void *src, size_t size, const std::string &context) {
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    if (!runtime_accelerator.CopyToHost(dst, src, size)) {
+        LOG(ERROR) << "D2H copy failed: " << context;
+        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+    }
+    return {};
+}
+
 // Select the best replica from a list: prefer local MEMORY, then any
 // MEMORY, then LOCAL_DISK, then DISK.  Master may return replicas in any
 // order, so we always scan.
@@ -3231,6 +3242,63 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
     return std::nullopt;
 }
 
+bool RealClient::is_writable_store_buffer_range(void *buffer,
+                                                size_t size) const {
+    if (size == 0) return true;
+    auto region = resolve_writable_buffer_region(buffer);
+    if (!region.has_value()) return false;
+    return region->offset <= region->size &&
+           size <= region->size - region->offset;
+}
+
+bool RealClient::is_accelerator_buffer(const void *buffer) const {
+    if (!buffer) return false;
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    return runtime_accelerator.FindDeviceForPointer(buffer, nullptr) != nullptr;
+}
+
+tl::expected<BufferHandle, ErrorCode>
+RealClient::stage_write_buffer_to_local_buffer(const void *buffer, size_t size,
+                                               const std::string &context) {
+    if (!client_buffer_allocator_) {
+        LOG(ERROR) << context << ": client buffer allocator is not available";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto alloc_result = client_buffer_allocator_->allocate(size);
+    if (!alloc_result) {
+        LOG(ERROR) << context
+                   << ": failed to allocate local buffer, size=" << size;
+        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    auto copy_result =
+        copy_maybe_device_to_host(alloc_result->ptr(), buffer, size, context);
+    if (!copy_result) {
+        return tl::unexpected(copy_result.error());
+    }
+
+    return BufferHandle(std::move(*alloc_result));
+}
+
+tl::expected<std::vector<Slice>, ErrorCode> RealClient::prepare_write_slices(
+    void *buffer, size_t size, const std::string &context,
+    std::unique_ptr<BufferHandle> &staged_handle) {
+    if (!is_accelerator_buffer(buffer) &&
+        is_writable_store_buffer_range(buffer, size)) {
+        return split_into_slices(buffer, size);
+    }
+
+    auto staged = stage_write_buffer_to_local_buffer(buffer, size, context);
+    if (!staged) {
+        return tl::unexpected(staged.error());
+    }
+
+    staged_handle = std::make_unique<BufferHandle>(std::move(*staged));
+    return split_into_slices(*staged_handle);
+}
+
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(const std::string &key) {
     if (!client_) {
@@ -3261,6 +3329,35 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         LOG(ERROR) << "Range overflow: src_offset=" << src_offset
                    << " + size=" << size << " > total=" << total_size;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    void *dst = static_cast<char *>(buffer) + dst_offset;
+    if (size > 0 && is_accelerator_buffer(dst)) {
+        if (!client_buffer_allocator_) {
+            LOG(ERROR) << "Client buffer allocator is not available for "
+                          "accelerator get, key: "
+                       << key;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        auto alloc_result = client_buffer_allocator_->allocate(size);
+        if (!alloc_result) {
+            LOG(ERROR) << "Failed to allocate temp buffer for accelerator get, "
+                       << "key: " << key << ", size: " << size;
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        BufferHandle tmp_handle(std::move(*alloc_result));
+        auto read_result = execute_ranged_read(key, tmp_handle.ptr(), 0,
+                                               src_offset, size, metadata);
+        if (!read_result) {
+            return tl::unexpected(read_result.error());
+        }
+        if (auto r = scatter_host_to_maybe_device(
+                dst, tmp_handle.ptr(), size, "accelerator get, key: " + key);
+            !r) {
+            return tl::unexpected(r.error());
+        }
+        return read_result;
     }
 
     if (src_offset == 0 && size == total_size) {
@@ -3485,6 +3582,11 @@ RealClient::get_into_ranges_internal(
     } else {
         resolved_buffer_capacities.resize(buffer_count, 0);
         for (size_t i = 0; i < buffer_count; ++i) {
+            if (is_accelerator_buffer(buffers[i])) {
+                resolved_buffer_capacities[i] =
+                    prepared.required_buffer_sizes[i];
+                continue;
+            }
             auto region = resolve_writable_buffer_region(buffers[i]);
             if (!region.has_value()) {
                 LOG(ERROR)
@@ -3737,14 +3839,28 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     }
 
     std::unordered_map<std::string, std::vector<mooncake::Slice>> all_slices;
+    std::vector<std::unique_ptr<BufferHandle>> staged_handles;
+    staged_handles.reserve(keys.size());
 
-    // Create slices from user buffers
+    // Create slices from user buffers. Store-managed buffers keep the direct
+    // path; other buffers are staged through the pinned local buffer when
+    // available.
     for (size_t i = 0; i < keys.size(); ++i) {
         const std::string &key = keys[i];
         void *buffer = buffers[i];
         size_t size = sizes[i];
 
-        all_slices[key] = split_into_slices(buffer, size);
+        std::unique_ptr<BufferHandle> staged_handle;
+        auto slices_result = prepare_write_slices(
+            buffer, size, "batch_put_from:" + key, staged_handle);
+        if (!slices_result) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(slices_result.error()));
+        }
+        all_slices[key] = std::move(*slices_result);
+        if (staged_handle) {
+            staged_handles.push_back(std::move(staged_handle));
+        }
     }
 
     std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
@@ -3783,8 +3899,13 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
         return {};
     }
 
-    // Create slices directly from the user buffer
-    std::vector<mooncake::Slice> slices = split_into_slices(buffer, size);
+    std::unique_ptr<BufferHandle> staged_handle;
+    auto slices_result =
+        prepare_write_slices(buffer, size, "put_from:" + key, staged_handle);
+    if (!slices_result) {
+        return tl::unexpected(slices_result.error());
+    }
+    auto slices = std::move(*slices_result);
 
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
@@ -3891,7 +4012,13 @@ tl::expected<void, ErrorCode> RealClient::upsert_from_internal(
         return {};
     }
 
-    std::vector<mooncake::Slice> slices = split_into_slices(buffer, size);
+    std::unique_ptr<BufferHandle> staged_handle;
+    auto slices_result =
+        prepare_write_slices(buffer, size, "upsert_from:" + key, staged_handle);
+    if (!slices_result) {
+        return tl::unexpected(slices_result.error());
+    }
+    auto slices = std::move(*slices_result);
 
     auto result = client_->Upsert(key, slices, config);
     if (!result) {
@@ -3935,10 +4062,22 @@ RealClient::batch_upsert_from_internal(const std::vector<std::string> &keys,
 
     std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
     ordered_batched_slices.reserve(keys.size());
+    std::vector<std::unique_ptr<BufferHandle>> staged_handles;
+    staged_handles.reserve(keys.size());
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        ordered_batched_slices.emplace_back(
-            split_into_slices(buffers[i], sizes[i]));
+        std::unique_ptr<BufferHandle> staged_handle;
+        auto slices_result =
+            prepare_write_slices(buffers[i], sizes[i],
+                                 "batch_upsert_from:" + keys[i], staged_handle);
+        if (!slices_result) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(slices_result.error()));
+        }
+        ordered_batched_slices.emplace_back(std::move(*slices_result));
+        if (staged_handle) {
+            staged_handles.push_back(std::move(staged_handle));
+        }
     }
 
     return client_->BatchUpsert(keys, ordered_batched_slices, config);
@@ -4507,6 +4646,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         QueryResult query_result;
         std::vector<Slice> slices;
         uint64_t total_size;
+        void *dst_buffer = nullptr;
+        std::unique_ptr<BufferHandle> staging_buffer;
     };
     struct DiskKeyInfo {
         std::string key;
@@ -4568,16 +4709,41 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             continue;
         }
 
+        std::unique_ptr<BufferHandle> staging_buffer;
+        void *transfer_buffer = buffers[i];
+        if (total_size > 0 && is_accelerator_buffer(buffers[i])) {
+            if (!client_buffer_allocator_) {
+                LOG(ERROR) << "Client buffer allocator is not available for "
+                              "accelerator batch get, key: "
+                           << key;
+                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            auto alloc_result = client_buffer_allocator_->allocate(total_size);
+            if (!alloc_result) {
+                LOG(ERROR)
+                    << "Failed to allocate temp buffer for accelerator batch "
+                       "get, key: "
+                    << key << ", size: " << total_size;
+                results[i] = tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                continue;
+            }
+            staging_buffer =
+                std::make_unique<BufferHandle>(std::move(*alloc_result));
+            transfer_buffer = staging_buffer->ptr();
+        }
+
         if (replica.is_local_disk_replica()) {
             std::vector<Slice> key_slices;
-            allocateSlices(key_slices, replica, buffers[i]);
-            valid_local_disk_operations.emplace(
-                key,
-                ValidKeyInfo{.key = key,
-                             .original_index = i,
-                             .query_result = std::move(query_result_values),
-                             .slices = std::move(key_slices),
-                             .total_size = total_size});
+            allocateSlices(key_slices, replica, transfer_buffer);
+            ValidKeyInfo op{.key = key,
+                            .original_index = i,
+                            .query_result = std::move(query_result_values),
+                            .slices = std::move(key_slices),
+                            .total_size = total_size,
+                            .dst_buffer = buffers[i],
+                            .staging_buffer = std::move(staging_buffer)};
+            valid_local_disk_operations.emplace(key, std::move(op));
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
@@ -4595,13 +4761,16 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         }
         // MEMORY: RDMA directly to user buffer.
         std::vector<Slice> key_slices;
-        allocateSlices(key_slices, replica, buffers[i]);
-        valid_operations.push_back(
-            {.key = key,
-             .original_index = i,
-             .query_result = FilterQueryResult(query_result_values, replica),
-             .slices = std::move(key_slices),
-             .total_size = total_size});
+        allocateSlices(key_slices, replica, transfer_buffer);
+        ValidKeyInfo op{
+            .key = key,
+            .original_index = i,
+            .query_result = FilterQueryResult(query_result_values, replica),
+            .slices = std::move(key_slices),
+            .total_size = total_size,
+            .dst_buffer = buffers[i],
+            .staging_buffer = std::move(staging_buffer)};
+        valid_operations.push_back(std::move(op));
 
         // Set success result (actual bytes transferred)
         results[i] = static_cast<int64_t>(total_size);
@@ -4640,6 +4809,15 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 LOG(ERROR) << "BatchGet failed for key '" << op.key
                            << "': " << toString(error);
                 results[op.original_index] = tl::unexpected(error);
+                continue;
+            }
+            if (op.staging_buffer) {
+                if (auto r = scatter_host_to_maybe_device(
+                        op.dst_buffer, op.staging_buffer->ptr(), op.total_size,
+                        "batch_get_into:" + op.key);
+                    !r) {
+                    results[op.original_index] = tl::make_unexpected(r.error());
+                }
             }
         }
     }
@@ -4758,6 +4936,20 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                             .original_index] =
                     tl::make_unexpected(batch_get_offload_result.error());
             }
+        } else {
+            for (const auto &offload_object_it : offload_objects_it.second) {
+                auto &op =
+                    valid_local_disk_operations.at(offload_object_it.first);
+                if (op.staging_buffer) {
+                    if (auto r = scatter_host_to_maybe_device(
+                            op.dst_buffer, op.staging_buffer->ptr(),
+                            op.total_size, "batch_get_into:" + op.key);
+                        !r) {
+                        results[op.original_index] =
+                            tl::make_unexpected(r.error());
+                    }
+                }
+            }
         }
     }
 
@@ -4816,10 +5008,22 @@ int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
         return 0;
     }
 
-    // Create slices directly from the user buffer
-    std::vector<mooncake::Slice> slices =
-        split_into_slices(metadata_buffer, metadata_size);
-    auto data_slices = split_into_slices(buffer, size);
+    std::unique_ptr<BufferHandle> staged_metadata_handle;
+    std::unique_ptr<BufferHandle> staged_data_handle;
+    auto metadata_slices_result = prepare_write_slices(
+        metadata_buffer, metadata_size, "put_from_with_metadata:" + key,
+        staged_metadata_handle);
+    if (!metadata_slices_result) {
+        return -toInt(metadata_slices_result.error());
+    }
+    auto data_slices_result = prepare_write_slices(
+        buffer, size, "put_from_with_metadata:" + key, staged_data_handle);
+    if (!data_slices_result) {
+        return -toInt(data_slices_result.error());
+    }
+
+    std::vector<mooncake::Slice> slices = std::move(*metadata_slices_result);
+    auto data_slices = std::move(*data_slices_result);
     slices.insert(slices.end(), data_slices.begin(), data_slices.end());
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
@@ -4887,6 +5091,7 @@ RealClient::batch_put_from_multi_buffers_internal(
     }
 
     std::vector<std::vector<mooncake::Slice>> batched_slices(keys.size());
+    std::vector<std::unique_ptr<BufferHandle>> staged_handles;
     for (size_t i = 0; i < all_buffers.size(); ++i) {
         const auto &buffers = all_buffers[i];
         const auto &sizes = all_sizes[i];
@@ -4897,7 +5102,20 @@ RealClient::batch_put_from_multi_buffers_internal(
         }
         batched_slices[i].reserve(buffers.size());
         for (size_t j = 0; j < buffers.size(); ++j) {
-            batched_slices[i].emplace_back(Slice{buffers[j], sizes[j]});
+            std::unique_ptr<BufferHandle> staged_handle;
+            auto slices_result = prepare_write_slices(
+                buffers[j], sizes[j], "batch_put_from_multi_buffers:" + keys[i],
+                staged_handle);
+            if (!slices_result) {
+                return std::vector<tl::expected<void, ErrorCode>>(
+                    keys.size(), tl::unexpected(slices_result.error()));
+            }
+            auto slices = std::move(*slices_result);
+            batched_slices[i].insert(batched_slices[i].end(), slices.begin(),
+                                     slices.end());
+            if (staged_handle) {
+                staged_handles.push_back(std::move(staged_handle));
+            }
         }
     }
     // Call client BatchPut and return the vector<expected> directly
@@ -4972,6 +5190,9 @@ RealClient::batch_get_into_multi_buffers_internal(
         QueryResult query_result;
         std::vector<Slice> slices;
         uint64_t total_size;
+        std::vector<void *> dst_buffers;
+        std::vector<size_t> dst_sizes;
+        std::unique_ptr<BufferHandle> staging_buffer;
     };
 
     struct DiskKeyInfo {
@@ -4981,6 +5202,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         std::vector<void *> buffers;
         std::vector<size_t> sizes;
         uint64_t total_size;
+        std::unique_ptr<BufferHandle> staging_buffer;
         bool is_local_disk;  // true=LOCAL_DISK (offload RPC), false=DISK
                              // (BatchGet)
     };
@@ -5034,18 +5256,85 @@ RealClient::batch_get_into_multi_buffers_internal(
         }
         // Create slices for this key's buffer
         const auto &buffers = all_buffers[i];
+        bool needs_accelerator_staging = false;
+        for (void *buffer : buffers) {
+            if (is_accelerator_buffer(buffer)) {
+                needs_accelerator_staging = true;
+                break;
+            }
+        }
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
         if (replica.is_memory_replica()) {
-            // MEMORY: RDMA from remote memory directly to GPU (GPUDirect).
-            for (size_t j = 0; j < buffers.size(); ++j) {
-                key_slices.emplace_back(Slice{buffers[j], sizes[j]});
+            std::unique_ptr<BufferHandle> staging_buffer;
+            if (needs_accelerator_staging) {
+                if (!client_buffer_allocator_) {
+                    LOG(ERROR)
+                        << "Client buffer allocator is not available for "
+                           "accelerator multi-buffer batch get, key: "
+                        << key;
+                    results.emplace_back(
+                        tl::unexpected(ErrorCode::INVALID_PARAMS));
+                    continue;
+                }
+                auto alloc_result =
+                    client_buffer_allocator_->allocate(total_size);
+                if (!alloc_result) {
+                    LOG(ERROR)
+                        << "Failed to allocate temp buffer for accelerator "
+                           "multi-buffer batch get, key: "
+                        << key << ", size: " << total_size;
+                    results.emplace_back(
+                        tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
+                    continue;
+                }
+                staging_buffer =
+                    std::make_unique<BufferHandle>(std::move(*alloc_result));
+                key_slices.emplace_back(Slice{staging_buffer->ptr(),
+                                              static_cast<size_t>(total_size)});
+            } else {
+                for (size_t j = 0; j < buffers.size(); ++j) {
+                    key_slices.emplace_back(Slice{buffers[j], sizes[j]});
+                }
             }
+            ValidKeyInfo op{
+                .key = key,
+                .original_index = i,
+                .query_result = FilterQueryResult(query_result_values, replica),
+                .slices = std::move(key_slices),
+                .total_size = total_size,
+                .dst_buffers = all_buffers[i],
+                .dst_sizes = all_sizes[i],
+                .staging_buffer = std::move(staging_buffer)};
+            valid_operations.push_back(std::move(op));
         } else if (replica.is_local_disk_replica() ||
                    replica.is_disk_replica()) {
-            // LOCAL_DISK: GPU buffers passed directly as scatter-gather slices
-            // (zero-copy). DISK: file I/O cannot write to GPU memory; temp CPU
-            // buffer used at read time.
+            std::unique_ptr<BufferHandle> staging_buffer;
+            if (replica.is_local_disk_replica() && needs_accelerator_staging) {
+                if (!client_buffer_allocator_) {
+                    LOG(ERROR)
+                        << "Client buffer allocator is not available for "
+                           "accelerator local-disk multi-buffer batch get, "
+                           "key: "
+                        << key;
+                    results.emplace_back(
+                        tl::unexpected(ErrorCode::INVALID_PARAMS));
+                    continue;
+                }
+                auto alloc_result =
+                    client_buffer_allocator_->allocate(total_size);
+                if (!alloc_result) {
+                    LOG(ERROR)
+                        << "Failed to allocate temp buffer for accelerator "
+                           "local-disk multi-buffer batch get, key: "
+                        << key << ", size: " << total_size;
+                    results.emplace_back(
+                        tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
+                    continue;
+                }
+                staging_buffer =
+                    std::make_unique<BufferHandle>(std::move(*alloc_result));
+            }
             valid_local_disk_ops.emplace(
                 key,
                 DiskKeyInfo{.key = key,
@@ -5054,6 +5343,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                             .buffers = all_buffers[i],
                             .sizes = all_sizes[i],
                             .total_size = total_size,
+                            .staging_buffer = std::move(staging_buffer),
                             .is_local_disk = replica.is_local_disk_replica()});
             results.emplace_back(static_cast<int64_t>(total_size));
             continue;
@@ -5063,12 +5353,6 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
 
-        valid_operations.push_back(
-            {.key = key,
-             .original_index = i,
-             .query_result = FilterQueryResult(query_result_values, replica),
-             .slices = std::move(key_slices),
-             .total_size = total_size});
         // Set success result (actual bytes transferred)
         results.emplace_back(static_cast<int64_t>(total_size));
     }
@@ -5076,6 +5360,28 @@ RealClient::batch_get_into_multi_buffers_internal(
     if (valid_operations.empty() && valid_local_disk_ops.empty()) {
         return results;
     }
+
+    auto scatter_to_buffers = [&](const std::string &key, const char *src,
+                                  const std::vector<void *> &buffers,
+                                  const std::vector<size_t> &sizes,
+                                  uint64_t total_size,
+                                  size_t original_index) -> bool {
+        size_t offset = 0;
+        for (size_t j = 0; j < buffers.size(); ++j) {
+            if (offset >= total_size) break;
+            size_t sz =
+                std::min(sizes[j], static_cast<size_t>(total_size - offset));
+            if (auto r = scatter_host_to_maybe_device(
+                    buffers[j], src + offset, sz,
+                    "batch_get_into_multi_buffers:" + key);
+                !r) {
+                results[original_index] = tl::make_unexpected(r.error());
+                return false;
+            }
+            offset += sz;
+        }
+        return true;
+    };
 
     // ---- Memory/Disk replica: existing BatchGet path ----
     if (!valid_operations.empty()) {
@@ -5101,6 +5407,13 @@ RealClient::batch_get_into_multi_buffers_internal(
                 LOG(ERROR) << "BatchGet failed for key '" << op.key
                            << "': " << toString(error);
                 results[op.original_index] = tl::unexpected(error);
+                continue;
+            }
+            if (op.staging_buffer) {
+                scatter_to_buffers(
+                    op.key, static_cast<const char *>(op.staging_buffer->ptr()),
+                    op.dst_buffers, op.dst_sizes, op.total_size,
+                    op.original_index);
             }
         }
     }
@@ -5138,19 +5451,26 @@ RealClient::batch_get_into_multi_buffers_internal(
                 }
                 const auto &replica = *replica_ptr;
                 std::vector<Slice> user_slices;
-                user_slices.reserve(op.buffers.size());
-                size_t slice_total = 0;
-                for (size_t j = 0; j < op.buffers.size(); ++j) {
-                    user_slices.push_back(Slice{op.buffers[j], op.sizes[j]});
-                    slice_total += op.sizes[j];
-                }
-                if (slice_total < op.total_size) {
-                    LOG(ERROR) << "Slice size too small for key " << key
-                               << ": slices=" << slice_total
-                               << ", total=" << op.total_size;
-                    results[op.original_index] =
-                        tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                    continue;
+                if (op.staging_buffer) {
+                    user_slices.push_back(
+                        Slice{op.staging_buffer->ptr(),
+                              static_cast<size_t>(op.total_size)});
+                } else {
+                    user_slices.reserve(op.buffers.size());
+                    size_t slice_total = 0;
+                    for (size_t j = 0; j < op.buffers.size(); ++j) {
+                        user_slices.push_back(
+                            Slice{op.buffers[j], op.sizes[j]});
+                        slice_total += op.sizes[j];
+                    }
+                    if (slice_total < op.total_size) {
+                        LOG(ERROR) << "Slice size too small for key " << key
+                                   << ": slices=" << slice_total
+                                   << ", total=" << op.total_size;
+                        results[op.original_index] =
+                            tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                        continue;
+                    }
                 }
                 offload_objects[replica.get_local_disk_descriptor()
                                     .transport_endpoint]
@@ -5173,6 +5493,18 @@ RealClient::batch_get_into_multi_buffers_internal(
                         results[disk_it->second.original_index] =
                             tl::make_unexpected(read_result.error());
                     }
+                } else {
+                    for (auto &[key, slices] : objects) {
+                        auto disk_it = valid_local_disk_ops.find(key);
+                        if (disk_it == valid_local_disk_ops.end()) continue;
+                        auto &op = disk_it->second;
+                        if (!op.staging_buffer) continue;
+                        scatter_to_buffers(
+                            key,
+                            static_cast<const char *>(op.staging_buffer->ptr()),
+                            op.buffers, op.sizes, op.total_size,
+                            op.original_index);
+                    }
                 }
             }
         }
@@ -5180,29 +5512,6 @@ RealClient::batch_get_into_multi_buffers_internal(
         // DISK: one batched BatchGet into CPU temp buffers, then scatter.
         // (storage_backend::vector_read cannot write directly to GPU memory)
         {
-            // Scatter temp CPU buffer -> user multi_buffers (GPU or host).
-            // Returns false and sets results[original_index] on error.
-            auto scatter_to_buffers = [&](const std::string &key, char *src,
-                                          const DiskKeyInfo &op) -> bool {
-                size_t offset = 0;
-                for (size_t j = 0; j < op.buffers.size(); ++j) {
-                    if (offset >= op.total_size) break;
-                    size_t sz =
-                        std::min(op.sizes[j],
-                                 static_cast<size_t>(op.total_size - offset));
-                    void *dst = op.buffers[j];
-                    if (auto r = scatter_host_to_maybe_device(
-                            dst, src + offset, sz, "DISK scatter, key: " + key);
-                        !r) {
-                        results[op.original_index] =
-                            tl::make_unexpected(r.error());
-                        return false;
-                    }
-                    offset += sz;
-                }
-                return true;
-            };
-
             std::vector<std::string> disk_batch_keys;
             std::vector<QueryResult> disk_batch_qrs;
             std::unordered_map<std::string, std::vector<Slice>>
@@ -5269,8 +5578,10 @@ RealClient::batch_get_into_multi_buffers_internal(
                         continue;
                     }
                     if (!scatter_to_buffers(
-                            key, static_cast<char *>(handle_it->second->ptr()),
-                            op))
+                            key,
+                            static_cast<const char *>(handle_it->second->ptr()),
+                            op.buffers, op.sizes, op.total_size,
+                            op.original_index))
                         continue;
                 }
             }

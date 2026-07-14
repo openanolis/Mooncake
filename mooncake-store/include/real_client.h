@@ -122,6 +122,8 @@ class RealClient : public PyClient {
     std::optional<WritableBufferRegion> resolve_writable_buffer_region(
         void *buffer) const;
 
+    bool is_writable_store_buffer_range(void *buffer, size_t size) const;
+
     /**
      * @brief Get object data directly into a pre-allocated buffer
      * @param key Key of the object to get
@@ -558,6 +560,15 @@ class RealClient : public PyClient {
     tl::expected<int64_t, ErrorCode> get_into_range_internal(
         const std::string &key, void *buffer, size_t dst_offset,
         size_t src_offset, size_t size, bool size_is_buffer_capacity = false);
+
+    bool is_accelerator_buffer(const void *buffer) const;
+
+    tl::expected<BufferHandle, ErrorCode> stage_write_buffer_to_local_buffer(
+        const void *buffer, size_t size, const std::string &context);
+
+    tl::expected<std::vector<Slice>, ErrorCode> prepare_write_slices(
+        void *buffer, size_t size, const std::string &context,
+        std::unique_ptr<BufferHandle> &staged_handle);
 
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
     get_into_ranges_internal(

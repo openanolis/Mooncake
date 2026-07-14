@@ -161,7 +161,6 @@ void RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
     std::lock_guard<std::mutex> lock(mutex_);
     RegionKey key{region->addr_, region->size_};
     auto it = regions_.find(key);
-    if (it != regions_.end()) regions_.erase(it);
 
 #if defined(USE_CUDA)
     cudaError_t err = cudaHostUnregister(region->addr_);
@@ -174,6 +173,7 @@ void RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
     }
 #endif
 
+    if (it != regions_.end()) regions_.erase(it);
     if (pinned_bytes_ >= region->size_) {
         pinned_bytes_ -= region->size_;
     } else {
