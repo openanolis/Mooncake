@@ -3,6 +3,7 @@
 #include <numa.h>
 
 #include <functional>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <unordered_map>
@@ -153,12 +154,6 @@ py::tuple tensor_shape_tuple(const TensorMetadata &metadata) {
         shape_vec.push_back(metadata.layout.local_shape.dims[i]);
     }
     return py::cast(shape_vec);
-}
-
-void append_tensor_payload_span(std::vector<std::span<const char>> &values,
-                                uintptr_t data_ptr, size_t tensor_size) {
-    if (tensor_size == 0) return;
-    values.emplace_back(reinterpret_cast<const char *>(data_ptr), tensor_size);
 }
 
 pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
@@ -380,6 +375,70 @@ class MooncakeStorePyWrapper {
         // Check if the store and client are initialized
         // Dummy client does not use client_ instance
         return (store_ && (use_dummy_client_ || store_->client_));
+    }
+
+    struct TensorObjectBuffer {
+        std::unique_ptr<BufferHandle> handle;
+        size_t size = 0;
+    };
+
+    tl::expected<TensorObjectBuffer, ErrorCode> prepare_tensor_object_buffer(
+        const PyTensorInfo &info, const char *operation_name,
+        const std::string &key) const {
+        if (!store_ || !store_->client_buffer_allocator_) {
+            LOG(ERROR) << operation_name
+                       << ": client buffer allocator is not available for key "
+                       << key;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        const size_t metadata_size = info.metadata.header.data_offset;
+        if (metadata_size < sizeof(TensorMetadata) ||
+            metadata_size > std::numeric_limits<size_t>::max() -
+                                info.tensor_size) {
+            LOG(ERROR) << operation_name
+                       << ": invalid tensor metadata size for key " << key;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const size_t total_size = metadata_size + info.tensor_size;
+
+        auto alloc_result =
+            store_->client_buffer_allocator_->allocate(total_size);
+        if (!alloc_result) {
+            LOG(ERROR) << operation_name
+                       << ": failed to allocate local buffer for key " << key
+                       << ", size=" << total_size;
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        char *dst = static_cast<char *>(alloc_result->ptr());
+        std::memcpy(dst, &info.metadata, sizeof(TensorMetadata));
+        if (metadata_size > sizeof(TensorMetadata)) {
+            std::memset(dst + sizeof(TensorMetadata), 0,
+                        metadata_size - sizeof(TensorMetadata));
+        }
+
+        if (info.tensor_size > 0) {
+            auto runtime_accelerator =
+                mooncake::device::GetAcceleratorRegistry()
+                    .RuntimeAccelerators();
+            if (!runtime_accelerator.CopyToHost(
+                    dst + metadata_size,
+                    reinterpret_cast<const void *>(info.data_ptr),
+                    info.tensor_size)) {
+                LOG(ERROR) << operation_name
+                           << ": failed to copy tensor payload to local buffer "
+                              "for key "
+                           << key;
+                return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            }
+        }
+
+        TensorObjectBuffer prepared;
+        prepared.size = total_size;
+        prepared.handle =
+            std::make_unique<BufferHandle>(std::move(*alloc_result));
+        return prepared;
     }
 
     int health_check() {
@@ -758,17 +817,16 @@ class MooncakeStorePyWrapper {
         auto info = extract_tensor_info(tensor, key);
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
 
-        // Prepare spans
-        std::vector<std::span<const char>> values;
-        values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
-                            sizeof(TensorMetadata));
-        append_tensor_payload_span(values, info.data_ptr, info.tensor_size);
-
-        // Store (GIL Released)
         py::gil_scoped_release release_gil;
-        int ret = store_->put_parts(key, values, config);
+        auto prepared =
+            prepare_tensor_object_buffer(info, "put_tensor", key);
+        if (!prepared) return to_py_ret(prepared.error());
+
+        int ret =
+            store_->put_from(key, prepared->handle->ptr(), prepared->size,
+                             config);
         if (ret != 0)
-            LOG(ERROR) << "put_parts failed for key " << key << " with code "
+            LOG(ERROR) << "put_from failed for key " << key << " with code "
                        << ret;
         return ret;
     }
@@ -1095,15 +1153,16 @@ class MooncakeStorePyWrapper {
                              const ReplicateConfig &config) {
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
 
-        std::vector<std::span<const char>> values;
-        values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
-                            info.metadata.header.data_offset);
-        append_tensor_payload_span(values, info.data_ptr, info.tensor_size);
-
         py::gil_scoped_release release_gil;
-        int ret = store_->put_parts(key, values, config);
+        auto prepared =
+            prepare_tensor_object_buffer(info, "put_tensor_info", key);
+        if (!prepared) return to_py_ret(prepared.error());
+
+        int ret =
+            store_->put_from(key, prepared->handle->ptr(), prepared->size,
+                             config);
         if (ret != 0)
-            LOG(ERROR) << "put_parts failed for key " << key << " with code "
+            LOG(ERROR) << "put_from failed for key " << key << " with code "
                        << ret;
         return ret;
     }
@@ -1307,15 +1366,16 @@ class MooncakeStorePyWrapper {
                                 const ReplicateConfig &config) {
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
 
-        std::vector<std::span<const char>> values;
-        values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
-                            info.metadata.header.data_offset);
-        append_tensor_payload_span(values, info.data_ptr, info.tensor_size);
-
         py::gil_scoped_release release_gil;
-        int ret = store_->upsert_parts(key, values, config);
+        auto prepared =
+            prepare_tensor_object_buffer(info, "upsert_tensor_info", key);
+        if (!prepared) return to_py_ret(prepared.error());
+
+        int ret =
+            store_->upsert_from(key, prepared->handle->ptr(), prepared->size,
+                                config);
         if (ret != 0)
-            LOG(ERROR) << "upsert_parts failed for key " << key << " with code "
+            LOG(ERROR) << "upsert_from failed for key " << key << " with code "
                        << ret;
         return ret;
     }
@@ -1325,15 +1385,16 @@ class MooncakeStorePyWrapper {
         auto info = extract_tensor_info(tensor, key);
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
 
-        std::vector<std::span<const char>> values;
-        values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
-                            sizeof(TensorMetadata));
-        append_tensor_payload_span(values, info.data_ptr, info.tensor_size);
-
         py::gil_scoped_release release_gil;
-        int ret = store_->upsert_parts(key, values, config);
+        auto prepared =
+            prepare_tensor_object_buffer(info, "upsert_tensor", key);
+        if (!prepared) return to_py_ret(prepared.error());
+
+        int ret =
+            store_->upsert_from(key, prepared->handle->ptr(), prepared->size,
+                                config);
         if (ret != 0)
-            LOG(ERROR) << "upsert_parts failed for key " << key << " with code "
+            LOG(ERROR) << "upsert_from failed for key " << key << " with code "
                        << ret;
         return ret;
     }
@@ -1461,34 +1522,19 @@ class MooncakeStorePyWrapper {
             for (size_t i = 0; i < infos.size(); ++i) {
                 if (!infos[i].valid()) continue;
 
-                size_t total_size =
-                    sizeof(TensorMetadata) + infos[i].tensor_size;
-                auto alloc_result =
-                    store_->client_buffer_allocator_->allocate(total_size);
-
-                if (!alloc_result) {
-                    LOG(ERROR)
-                        << "Failed to allocate buffer for key: " << keys[i];
-                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                auto prepared = prepare_tensor_object_buffer(
+                    infos[i], "batch_upsert_tensor", keys[i]);
+                if (!prepared) {
+                    results[i] = to_py_ret(prepared.error());
                     continue;
                 }
 
-                // Copy Metadata & Data
-                char *dst = static_cast<char *>(alloc_result->ptr());
-                memcpy(dst, &infos[i].metadata, sizeof(TensorMetadata));
-                if (infos[i].tensor_size > 0) {
-                    memcpy(dst + sizeof(TensorMetadata),
-                           reinterpret_cast<void *>(infos[i].data_ptr),
-                           infos[i].tensor_size);
-                }
-
                 valid_keys.push_back(keys[i]);
-                buffer_ptrs.push_back(alloc_result->ptr());
-                buffer_sizes.push_back(total_size);
+                buffer_ptrs.push_back(prepared->handle->ptr());
+                buffer_sizes.push_back(prepared->size);
                 original_indices.push_back(i);
 
-                temp_allocations.push_back(
-                    std::make_unique<BufferHandle>(std::move(*alloc_result)));
+                temp_allocations.push_back(std::move(prepared->handle));
             }
 
             if (!valid_keys.empty()) {

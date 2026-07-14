@@ -32,6 +32,7 @@
 #include "uds_transport.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#include "registered_pinned_memory.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -764,6 +765,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 .size = local_buffer_size,
                 .offset = 0,
             };
+            local_buffer_pinned_region_ =
+                RegisteredPinnedMemoryManager::instance().try_pin(
+                    client_buffer_allocator_->getBase(), local_buffer_size,
+                    "real client local buffer");
         }
     } else {
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
@@ -1194,6 +1199,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
     if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
         protocol != "cxl") {
+        local_buffer_pinned_region_.reset();
         auto unregister_result = client_->unregisterLocalMemory(
             client_buffer_allocator_->getBase(), true);
         if (!unregister_result) {

@@ -105,6 +105,12 @@ REGISTER_CUDA_LIKE_ACCELERATOR_DEVICE(corex, AcceleratorVendor::kCorex);
 #undef REGISTER_CUDA_LIKE_ACCELERATOR_DEVICE
 
 }  // namespace
+
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+void LinkCudaLikeAcceleratorDevices() {}
+#endif
+
 }  // namespace device
 }  // namespace mooncake
 

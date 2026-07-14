@@ -43,33 +43,18 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
                 continue;
             }
 
-            size_t total_size =
-                infos[i].metadata.header.data_offset + infos[i].tensor_size;
-            auto alloc_result =
-                store_->client_buffer_allocator_->allocate(total_size);
-
-            if (!alloc_result) {
-                LOG(ERROR) << "Failed to allocate buffer for " << operation_name
-                           << " key: " << keys[i];
-                results[i] = to_py_ret(ErrorCode::NO_AVAILABLE_HANDLE);
+            auto prepared =
+                prepare_tensor_object_buffer(infos[i], operation_name, keys[i]);
+            if (!prepared) {
+                results[i] = to_py_ret(prepared.error());
                 continue;
             }
 
-            char *dst = static_cast<char *>(alloc_result->ptr());
-            std::memcpy(dst, &infos[i].metadata,
-                        infos[i].metadata.header.data_offset);
-            if (infos[i].tensor_size > 0) {
-                std::memcpy(dst + infos[i].metadata.header.data_offset,
-                            reinterpret_cast<void *>(infos[i].data_ptr),
-                            infos[i].tensor_size);
-            }
-
             valid_keys.push_back(keys[i]);
-            buffer_ptrs.push_back(alloc_result->ptr());
-            buffer_sizes.push_back(total_size);
+            buffer_ptrs.push_back(prepared->handle->ptr());
+            buffer_sizes.push_back(prepared->size);
             original_indices.push_back(i);
-            temp_allocations.push_back(
-                std::make_unique<BufferHandle>(std::move(*alloc_result)));
+            temp_allocations.push_back(std::move(prepared->handle));
         }
 
         if (!valid_keys.empty()) {

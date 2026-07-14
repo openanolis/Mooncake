@@ -1073,6 +1073,15 @@ def setup(
 - `metadata_server` (str): **Required**. Metadata connection string, e.g. `"P2PHANDSHAKE"` or `"http://localhost:8080/metadata"`.
 - `global_segment_size` (int): Memory segment size in bytes for mounting.
 - `local_buffer_size` (int): Local buffer size in bytes.
+
+When the store is built with CUDA support, real-client local buffers are pinned
+on a best-effort basis for faster GPU-to-CPU and CPU-to-GPU copies. Set
+`MC_STORE_PIN_MEMORY=0` or `false` to disable this behavior. Set
+`MC_STORE_PIN_MEMORY_MAX_BYTES` to cap Store-managed pinned memory per process.
+If the variable is unset or set to `0`, no per-process cap is applied. If
+pinning fails or the quota is exhausted, operations continue with pageable host
+memory.
+
 - `protocol` (str): Network protocol, usually `"tcp"`, `"rdma"`, `"efa"`, `"cxl"`, or `"ascend"` depending on the build.
 - `rdma_devices` (str): RDMA/EFA device name(s), e.g. `"mlx5_0"` or `"mlx5_0,mlx5_1"`. Leave empty to auto-discover NICs unless `MC_MS_AUTO_DISC=0`; always empty for TCP.
 - `master_server_addr` (str): **Required**. Master server address (e.g., "localhost:50051")

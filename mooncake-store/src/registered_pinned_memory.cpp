@@ -21,10 +21,9 @@ bool ParsePinnedMemoryEnabled() {
     if (!value) return true;
 
     std::string normalized(value);
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                   [](unsigned char ch) {
-                       return static_cast<char>(std::tolower(ch));
-                   });
+    std::transform(
+        normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     return !(normalized == "0" || normalized == "false" ||
              normalized == "off" || normalized == "no");
 }
@@ -80,9 +79,8 @@ RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager()
 #endif
 }
 
-std::shared_ptr<RegisteredPinnedRegion>
-RegisteredPinnedMemoryManager::try_pin(void* addr, size_t size,
-                                       const std::string& owner) {
+std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
+    void* addr, size_t size, const std::string& owner) {
     if (!addr || size == 0 || !enabled_) return nullptr;
 
 #if !defined(USE_CUDA)
@@ -151,9 +149,8 @@ RegisteredPinnedMemoryManager::try_pin(void* addr, size_t size,
         new RegisteredPinnedRegion(addr, size, owner));
     regions_[key] = region;
     pinned_bytes_ += size;
-    LOG(INFO) << "cudaHostRegister succeeded for " << owner
-              << ", size=" << size << ", pinned=" << pinned_bytes_
-              << ", limit=" << limit_bytes_;
+    LOG(INFO) << "cudaHostRegister succeeded for " << owner << ", size=" << size
+              << ", pinned=" << pinned_bytes_ << ", limit=" << limit_bytes_;
     return region;
 #endif
 }

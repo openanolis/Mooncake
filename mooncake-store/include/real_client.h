@@ -29,6 +29,7 @@
 namespace mooncake {
 
 class RealClient;
+class RegisteredPinnedRegion;
 class UdsAcceptor;
 class UdsConnection;
 
@@ -854,6 +855,7 @@ class RealClient : public PyClient {
     mutable std::shared_mutex registered_buffer_mutex_;
     std::unordered_map<void *, size_t> registered_buffer_sizes_;
     std::optional<WritableBufferRegion> local_buffer_region_;
+    std::shared_ptr<RegisteredPinnedRegion> local_buffer_pinned_region_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
