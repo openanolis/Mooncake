@@ -32,6 +32,7 @@
 #include "uds_transport.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#include "registered_pinned_memory.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -1233,9 +1234,12 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
             }
             if (seg.is_ascend) {
                 teardown_ascend_shm_buffer(seg);
-            } else if (munmap(seg.shm_buffer, seg.shm_size) != 0) {
-                LOG(ERROR) << "Failed to unmap shm: " << seg.shm_name
-                           << ", error: " << strerror(errno);
+            } else {
+                seg.pinned_region.reset();
+                if (munmap(seg.shm_buffer, seg.shm_size) != 0) {
+                    LOG(ERROR) << "Failed to unmap shm: " << seg.shm_name
+                               << ", error: " << strerror(errno);
+                }
             }
             seg.shm_buffer = nullptr;
         }
@@ -2194,24 +2198,31 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     std::string shm_name =
         std::string(MOONCAKE_SHM_NAME) + "_" + std::to_string(client_id.first) +
         "_" + std::to_string(client_id.second) + "_" + addr_stream.str();
-    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
-
-    // Check if this shm is already mapped
-    auto context_it = shm_contexts_.find(client_id);
-    if (context_it != shm_contexts_.end()) {
-        for (const auto &shm : context_it->second.mapped_shms) {
-            if (shm.dummy_base_addr ==
-                static_cast<uintptr_t>(dummy_base_addr)) {
-                LOG(INFO) << "Segment already mapped: " << shm_name;
-                if (fd >= 0) close(fd);
-                return {};
-            }
-        }
-    }
 
     if (fd < 0) {
         LOG(ERROR) << "Invalid file descriptor: " << fd;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const auto target_dummy_addr = static_cast<uintptr_t>(dummy_base_addr);
+    {
+        std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        auto context_it = shm_contexts_.find(client_id);
+        if (context_it != shm_contexts_.end()) {
+            for (const auto &shm : context_it->second.mapped_shms) {
+                if (shm.dummy_base_addr == target_dummy_addr) {
+                    LOG(INFO) << "Segment already mapped: " << shm_name;
+                    close(fd);
+                    return {};
+                }
+            }
+            if (is_local_buffer && context_it->second.client_buffer_allocator) {
+                LOG(ERROR) << "A local buffer is already mapped for this "
+                              "client shared memory.";
+                close(fd);
+                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+            }
+        }
     }
 
 #ifdef USE_ASCEND_DIRECT
@@ -2246,8 +2257,21 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
         false;  // memfd/POSIX path; teardown differs from Ascend VMM/IPC
     shm.device_id = physical_device_id;
 
-    auto &context = shm_contexts_[client_id];
-
+    bool memory_registered = false;
+    auto cleanup_shm = [&]() {
+        shm.pinned_region.reset();
+        if (memory_registered && client_) {
+            auto rc = client_->unregisterLocalMemory(shm.shm_buffer, true);
+            if (!rc) {
+                LOG(WARNING) << "Failed to unregister memory while cleaning "
+                                "mapped shared memory: "
+                             << shm.shm_name
+                             << ", error=" << toString(rc.error());
+            }
+            memory_registered = false;
+        }
+        munmap(shm_buffer, shm_size);
+    };
     if (shm_size > 0) {
         auto result = client_->RegisterLocalMemory(
             shm.shm_buffer, shm_size, kWildcardLocation, false, true);
@@ -2256,19 +2280,31 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
             munmap(shm_buffer, shm_size);
             return tl::unexpected(result.error());
         }
+        memory_registered = true;
+        shm.pinned_region = RegisteredPinnedMemoryManager::instance().try_pin(
+            shm.shm_buffer, shm.shm_size, "real client mapped dummy SHM");
+    }
+
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto &context = shm_contexts_[client_id];
+    for (const auto &mapped_shm : context.mapped_shms) {
+        if (mapped_shm.dummy_base_addr == target_dummy_addr) {
+            LOG(INFO) << "Segment already mapped: " << shm_name;
+            cleanup_shm();
+            return {};
+        }
+    }
+    if (is_local_buffer && context.client_buffer_allocator) {
+        LOG(ERROR) << "A local buffer is already mapped for this "
+                      "client shared memory.";
+        cleanup_shm();
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
 
     if (is_local_buffer) {
-        if (context.client_buffer_allocator) {
-            LOG(ERROR) << "A local buffer is already mapped for this "
-                          "client shared memory.";
-            munmap(shm_buffer, shm_size);
-            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-        }
         context.client_buffer_allocator =
             ClientBufferAllocator::create(shm_buffer, shm_size, this->protocol);
     }
-
     context.mapped_shms.push_back(std::move(shm));
 
     LOG(INFO) << "Mapped new shared memory: " << shm_name
@@ -2290,6 +2326,7 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
 
     for (auto &shm : context.mapped_shms) {
         if (shm.shm_buffer) {
+            shm.pinned_region.reset();
             auto rc = client_->unregisterLocalMemory(shm.shm_buffer, true);
             if (!rc) {
                 LOG(ERROR) << "Failed to unregister memory";
@@ -2525,6 +2562,7 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
         if (shm.is_ascend) {
             teardown_ascend_shm_buffer(shm);
         } else {
+            shm.pinned_region.reset();
 #ifdef USE_ASCEND_DIRECT
             auto context_result = set_context_if_needed(protocol, shm.device_id,
                                                         "POSIX shm cleanup");
@@ -2615,6 +2653,7 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
                 return context_result;
             }
 #endif
+            shm_it->pinned_region.reset();
             auto rc = client_->unregisterLocalMemory(shm_it->shm_buffer, true);
             if (!rc) {
                 LOG(ERROR) << "Failed to unregister memory: "

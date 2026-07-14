@@ -5,6 +5,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <vector>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "client_metric.h"
@@ -13,6 +14,8 @@
 #include <memory>
 
 namespace mooncake {
+
+class RegisteredPinnedRegion;
 
 class DummyClient : public PyClient {
    public:
@@ -292,6 +295,12 @@ class DummyClient : public PyClient {
     std::atomic<bool> last_ping_healthy_{false};
     void ping_thread_main();
     std::atomic<bool> connected_{false};
+
+    mutable std::mutex pinned_shms_mutex_;
+    std::vector<std::shared_ptr<RegisteredPinnedRegion>> pinned_shms_;
+    bool pin_host_shm(void *addr, size_t size, const char *purpose);
+    void unpin_host_shm(void *addr, size_t size);
+    void unpin_host_shms();
 
 #if defined(USE_ASCEND_DIRECT)
     mutable std::mutex registered_device_buffers_mutex_;

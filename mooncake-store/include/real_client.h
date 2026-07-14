@@ -29,6 +29,7 @@
 namespace mooncake {
 
 class RealClient;
+class RegisteredPinnedRegion;
 class UdsAcceptor;
 class UdsConnection;
 
@@ -837,6 +838,7 @@ class RealClient : public PyClient {
         int32_t device_id = kInvalidPhysicalDeviceId;
         uint64_t vmm_handle = 0;
         std::string ipc_key_data;
+        std::shared_ptr<RegisteredPinnedRegion> pinned_region;
     };
 
     struct ShmContext {

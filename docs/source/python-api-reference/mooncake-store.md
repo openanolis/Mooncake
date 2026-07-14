@@ -1115,6 +1115,14 @@ def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address
 - `local_buffer_size` (int): Local buffer size in bytes
 - `server_address` (str): Server address in format "hostname:port"
 
+When the store is built with CUDA support, Store-managed shared-memory buffers
+are pinned on a best-effort basis for faster GPU-to-CPU and CPU-to-GPU copies.
+Set `MC_STORE_PIN_MEMORY=0` or `false` to disable this behavior. Set
+`MC_STORE_PIN_MEMORY_MAX_BYTES` to cap the amount of Store-managed pinned memory
+per process. If the variable is unset or set to `0`, the Store does not apply a
+per-process cap. When pinning fails or the quota is exhausted, operations
+continue with pageable host memory.
+
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
 

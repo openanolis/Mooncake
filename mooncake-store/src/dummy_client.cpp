@@ -7,11 +7,14 @@
 #include <sys/stat.h>  // For S_IRUSR, S_IWUSR
 #include <fcntl.h>     // For O_CREAT, O_RDWR
 #include <unistd.h>    // For ftruncate, close, shm_unlink
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <iterator>
 
 #include "real_client.h"
 #include "dummy_client.h"
+#include "registered_pinned_memory.h"
 #include "uds_transport.h"
 #include "utils.h"
 #include "utils/scoped_vlog_timer.h"
@@ -496,6 +499,8 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
         }
         local_buffer_shm->registered = true;
         local_buffer_shm->is_local = true;
+        pin_host_shm(local_buffer_shm->base_addr, local_buffer_shm->size,
+                     "dummy local buffer segment");
 
         // Best-effort: request hot cache shm from real client
         if (request_hot_cache_fd() != 0) {
@@ -510,6 +515,7 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
 }
 
 int DummyClient::tearDownAll() {
+    unpin_host_shms();
     unregister_shm();
 
     // Cleanup hot cache shm mapping
@@ -542,6 +548,7 @@ int DummyClient::tearDownAll() {
 
 int64_t DummyClient::unregister_shm() {
     LOG(INFO) << "[unregister_shm] client_id=" << client_id_;
+    unpin_host_shms();
 #if defined(USE_ASCEND_DIRECT)
     if (globalConfig().ascend_agent_mode) {
         return to_py_ret(
@@ -551,6 +558,43 @@ int64_t DummyClient::unregister_shm() {
 #endif
     return to_py_ret(
         invoke_rpc<&RealClient::unmap_shm_internal, void>(client_id_));
+}
+
+bool DummyClient::pin_host_shm(void* addr, size_t size, const char* purpose) {
+    auto region =
+        RegisteredPinnedMemoryManager::instance().try_pin(addr, size, purpose);
+    if (!region) return false;
+    std::lock_guard<std::mutex> lock(pinned_shms_mutex_);
+    pinned_shms_.push_back(std::move(region));
+    return true;
+}
+
+void DummyClient::unpin_host_shm(void* addr, size_t size) {
+    std::vector<std::shared_ptr<RegisteredPinnedRegion>> pinned;
+    {
+        std::lock_guard<std::mutex> lock(pinned_shms_mutex_);
+        auto it = std::remove_if(
+            pinned_shms_.begin(), pinned_shms_.end(),
+            [addr, size](const std::shared_ptr<RegisteredPinnedRegion>& region) {
+                if (!region || region->addr() != addr || region->size() != size) {
+                    return false;
+                }
+                return true;
+            });
+        pinned.insert(pinned.end(), std::make_move_iterator(it),
+                      std::make_move_iterator(pinned_shms_.end()));
+        pinned_shms_.erase(it, pinned_shms_.end());
+    }
+    pinned.clear();
+}
+
+void DummyClient::unpin_host_shms() {
+    std::vector<std::shared_ptr<RegisteredPinnedRegion>> pinned;
+    {
+        std::lock_guard<std::mutex> lock(pinned_shms_mutex_);
+        pinned.swap(pinned_shms_);
+    }
+    pinned.clear();
 }
 
 #if defined(USE_ASCEND_DIRECT)
@@ -677,6 +721,7 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
             return -1;
         }
         shm->registered = true;
+        pin_host_shm(shm->base_addr, shm->size, "dummy registered buffer");
     }
 
     return 0;
@@ -716,6 +761,7 @@ int DummyClient::unregister_buffer(void* buffer) {
     auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
         reinterpret_cast<uint64_t>(buffer), client_id_);
     if (ret.has_value()) {
+        unpin_host_shm(shm->base_addr, shm->size);
         shm->registered = false;
     }
     return to_py_ret(ret);
