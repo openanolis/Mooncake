@@ -882,11 +882,18 @@ class MooncakeStorePyWrapper {
         return batch_write_tensor_impl(
             keys, infos, config, "put",
             [this](const std::vector<std::string> &write_keys,
-                   const std::vector<void *> &buffer_ptrs,
-                   const std::vector<size_t> &buffer_sizes,
+                   const std::vector<void *> &buffers,
+                   const std::vector<size_t> &sizes,
                    const ReplicateConfig &write_config) {
-                return store_->batch_put_from(write_keys, buffer_ptrs,
-                                              buffer_sizes, write_config);
+                return store_->batch_put_from(write_keys, buffers, sizes,
+                                              write_config);
+            },
+            [this](const std::vector<std::string> &write_keys,
+                   const std::vector<std::vector<void *>> &buffers,
+                   const std::vector<std::vector<size_t>> &sizes,
+                   const ReplicateConfig &write_config) {
+                return store_->batch_put_from_multi_buffers(
+                    write_keys, buffers, sizes, write_config);
             });
     }
 
@@ -894,6 +901,11 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
         const ReplicateConfig &config = ReplicateConfig{}) {
+        if (pybind11::len(tensors_list) != keys.size()) {
+            LOG(ERROR) << "batch_put_tensor keys and tensors size mismatch";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
         std::vector<PyTensorInfo> infos(keys.size());
         for (size_t i = 0; i < keys.size(); ++i) {
             infos[i] = extract_tensor_info(tensors_list[i], keys[i]);

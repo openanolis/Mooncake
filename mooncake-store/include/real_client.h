@@ -233,9 +233,11 @@ class RealClient : public PyClient {
      * @param config Replication configuration
      * @return Vector of integers, where each element is 0 on success, or a
      * negative value on error
-     * @note The buffer addresses must resolve to Store-managed registered
-     * memory, either explicit register_buffer() regions or the setup-time local
-     * buffer
+     * @note Non-local writes require buffer addresses that resolve to
+     * Store-managed registered memory, either explicit register_buffer()
+     * regions or the setup-time local buffer. Same-process local-memory writes
+     * may also use ordinary host or accelerator source buffers because they are
+     * copied by the local memcpy path.
      */
     std::vector<int> batch_put_from_multi_buffers(
         const std::vector<std::string> &keys,

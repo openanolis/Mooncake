@@ -1035,40 +1035,95 @@ std::optional<TransferFuture> TransferSubmitter::submit(
     return future;
 }
 
+namespace {
+
+void AppendMemcpyOperations(const AllocatedBuffer::Descriptor& handle,
+                            const std::vector<Slice>& slices,
+                            const TransferRequest::OpCode op_code,
+                            std::vector<MemcpyOperation>& operations,
+                            uint64_t src_offset = 0) {
+    operations.reserve(operations.size() + slices.size());
+
+    uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
+    uint64_t offset = src_offset;
+    for (const auto& slice : slices) {
+        if (slice.ptr == nullptr) continue;
+
+        void* dest;
+        const void* src;
+        if (op_code == TransferRequest::READ) {
+            dest = slice.ptr;
+            src = reinterpret_cast<const void*>(base_address + offset);
+        } else {
+            dest = reinterpret_cast<void*>(base_address + offset);
+            src = slice.ptr;
+        }
+        offset += slice.size;
+        operations.emplace_back(dest, src, slice.size);
+    }
+}
+
+}  // namespace
+
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
     TransferRequest::OpCode op_code) {
-    std::optional<TransferFuture> future;
-    std::vector<TransferRequest> requests;
+    if (replicas.size() != all_slices.size()) {
+        LOG(ERROR) << "Mismatched replicas and slice batches: replicas="
+                   << replicas.size() << ", slices=" << all_slices.size();
+        return std::nullopt;
+    }
+
+    bool use_local_memcpy = !replicas.empty();
     for (size_t i = 0; i < replicas.size(); ++i) {
-        auto& replica = replicas[i];
-        auto& slices = all_slices[i];
-        auto& mem_desc = replica.get_memory_descriptor();
-        if (!validateTransferParams(mem_desc.buffer_descriptor, slices)) {
+        const auto& handle =
+            replicas[i].get_memory_descriptor().buffer_descriptor;
+        if (!validateTransferParams(handle, all_slices[i])) {
             return std::nullopt;
         }
-        auto& handle = mem_desc.buffer_descriptor;
-        uint64_t offset = 0;
-        SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment "
-                       << handle.transport_endpoint_;
-            return std::nullopt;
-        }
-        for (auto slice : slices) {
-            TransferRequest request;
-            request.opcode = op_code;
-            request.source = static_cast<char*>(slice.ptr);
-            request.target_id = seg;
-            request.target_offset = handle.buffer_address_ + offset;
-            request.length = slice.size;
-            requests.emplace_back(request);
-            offset += slice.size;
+        if (!isLocalTransfer(handle)) {
+            use_local_memcpy = false;
         }
     }
-    future = submitTransfer(requests);
-    // Update metrics on successful submission
+
+    std::optional<TransferFuture> future;
+    if (use_local_memcpy) {
+        auto state = std::make_shared<MemcpyOperationState>();
+        std::vector<MemcpyOperation> operations;
+        for (size_t i = 0; i < replicas.size(); ++i) {
+            AppendMemcpyOperations(
+                replicas[i].get_memory_descriptor().buffer_descriptor,
+                all_slices[i], op_code, operations);
+        }
+        memcpy_pool_->submitTask(MemcpyTask(std::move(operations), state));
+        future = TransferFuture(state);
+    } else {
+        std::vector<TransferRequest> requests;
+        for (size_t i = 0; i < replicas.size(); ++i) {
+            const auto& handle =
+                replicas[i].get_memory_descriptor().buffer_descriptor;
+            uint64_t offset = 0;
+            SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
+            if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+                LOG(ERROR) << "Failed to open segment "
+                           << handle.transport_endpoint_;
+                return std::nullopt;
+            }
+            for (auto slice : all_slices[i]) {
+                TransferRequest request;
+                request.opcode = op_code;
+                request.source = static_cast<char*>(slice.ptr);
+                request.target_id = seg;
+                request.target_offset = handle.buffer_address_ + offset;
+                request.length = slice.size;
+                requests.emplace_back(request);
+                offset += slice.size;
+            }
+        }
+        future = submitTransfer(requests);
+    }
+
     if (future.has_value()) {
         for (auto& slices : all_slices) {
             updateTransferMetrics(slices, op_code);
@@ -1122,33 +1177,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const TransferRequest::OpCode op_code, uint64_t src_offset) {
     auto state = std::make_shared<MemcpyOperationState>();
 
-    // Create memcpy operations
     std::vector<MemcpyOperation> operations;
-    operations.reserve(slices.size());
-    uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-    uint64_t offset = src_offset;
-
-    for (size_t i = 0; i < slices.size(); ++i) {
-        const auto& slice = slices[i];
-
-        if (slice.ptr == nullptr) continue;
-
-        void* dest;
-        const void* src;
-
-        if (op_code == TransferRequest::READ) {
-            // READ: from handle (remote buffer) to slice (local buffer)
-            dest = slice.ptr;
-            src = reinterpret_cast<const void*>(base_address + offset);
-        } else {
-            // WRITE: from slice (local buffer) to handle (remote buffer)
-            dest = reinterpret_cast<void*>(base_address + offset);
-            src = slice.ptr;
-        }
-        offset += slice.size;
-
-        operations.emplace_back(dest, src, slice.size);
-    }
+    AppendMemcpyOperations(handle, slices, op_code, operations, src_offset);
 
     // Submit memcpy operations to worker pool for async execution
     MemcpyTask task(std::move(operations), state);

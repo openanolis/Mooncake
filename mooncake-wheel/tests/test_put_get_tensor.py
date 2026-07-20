@@ -11,7 +11,7 @@ try:
 except Exception:
     _torch = None
 
-from mooncake.store import MooncakeDistributedStore
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
@@ -127,6 +127,26 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.store.remove(key_int)
         self.store.remove(key_bool)
         self.store.remove(key_rand)
+
+    def test_batch_pub_tensor_same_node(self):
+        """Test same-node tensor batch writes using ReplicateConfig."""
+        import torch
+
+        prefix = f"test_batch_pub_tensor_same_node_{os.getpid()}"
+        keys = [f"{prefix}_{i}" for i in range(2)]
+        tensors = [
+            torch.arange(16, dtype=torch.float32).reshape(4, 4),
+            torch.arange(24, dtype=torch.int64).reshape(2, 3, 4),
+        ]
+
+        config = ReplicateConfig()
+        config.prefer_alloc_in_same_node = True
+        self.assertEqual(
+            self.store.batch_pub_tensor(keys, tensors, config), [0, 0]
+        )
+        for key, tensor in zip(keys, tensors):
+            self.assertTrue(torch.equal(self.store.get_tensor(key), tensor))
+            self.store.remove(key)
 
     @unittest.skipUnless(cuda_available(), "CUDA is not available")
     def test_cuda_local_copy_paths(self):
