@@ -19,9 +19,16 @@ except Exception:  # pragma: no cover - depends on built extension
 
 import msgpack as _msgpack
 
-DEFAULT_BUNDLE_CHUNK_BYTES = 512 * 1024**2
-AUTO_PARALLEL_MIN_BYTES = 4 * 1024**3
+# -- C fast-path: concat_arrays_into(list[ndarray], dest_ptr) ----------------
+try:
+    from mooncake._fast_copy import concat_arrays_into as _concat_arrays_into
+except Exception:  # pragma: no cover
+    _concat_arrays_into = None
+
+DEFAULT_BUNDLE_CHUNK_BYTES = 64 * 1024**2
+AUTO_PARALLEL_MIN_BYTES = DEFAULT_BUNDLE_CHUNK_BYTES
 AUTO_PARALLEL_MIN_CHUNKS = 8
+_TYPED_RAGGED_DEFAULT_DTYPE = "float64"
 MISSING_OBJECT_ERROR = (
     -704
 )  # Mooncake remove returns -704 for an already-missing object.
@@ -148,6 +155,36 @@ class _MultiBufferPayload:
 
 
 @dataclass(frozen=True)
+
+class _DirectCopyPayload:
+    """Deferred-copy payload: holds list[ndarray] for direct C-level copy into pool.
+
+    Unlike _MultiBufferPayload (which creates memoryviews at encode time),
+    this defers ALL copying to the transport layer, where the C extension
+    concat_arrays_into() copies arrays directly into RDMA-registered pool
+    memory in a tight C loop (~30ns per array vs ~1us for Python memoryview).
+    """
+    arrays: list[np.ndarray]
+    total_bytes: int
+    dtype: str | None = None
+    shape: tuple[int, ...] | None = None
+
+    @property
+    def nbytes(self) -> int:
+        return self.total_bytes
+
+    @staticmethod
+    def from_flat_arrays(
+        flat_arrays: list[np.ndarray], dtype: np.dtype, total_elems: int,
+    ) -> "_DirectCopyPayload":
+        return _DirectCopyPayload(
+            arrays=flat_arrays,
+            total_bytes=sum(a.nbytes for a in flat_arrays),
+            dtype=np.dtype(dtype).str,
+            shape=(total_elems,),
+        )
+
+
 class _RawDestinationBuffer:
     ptr: int
     size: int
@@ -2791,15 +2828,20 @@ def _encode_typed_ragged_values(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if dtype_hint is None:
         source_arrays = [np.asarray(value) for value in values if value is not None]
-        dtype = np.result_type(*source_arrays) if source_arrays else np.dtype(np.int64)
+        dtype = np.result_type(*source_arrays) if source_arrays else np.dtype(_TYPED_RAGGED_DEFAULT_DTYPE)
     else:
         dtype = np.dtype(dtype_hint)
     if dtype.hasobject:
         raise ValueError("typed_ragged codec requires non-object dtype")
+
+    ndarray_encoded = _encode_typed_ragged_ndarray_rows(values, dtype)
+    if ndarray_encoded is not None:
+        return ndarray_encoded
+
     arrays = [
         np.asarray([], dtype=dtype)
         if value is None
-        else np.ascontiguousarray(np.asarray(value, dtype=dtype))
+        else _as_contiguous_array_preserve_ndim(value, dtype)
         for value in values
     ]
     max_ndim = max((array.ndim for array in arrays), default=0)
@@ -2817,22 +2859,32 @@ def _encode_typed_ragged_values(
         ndims[row] = array.ndim
         if array.ndim > 0:
             shapes[row, : array.ndim] = array.shape
+    total_elems = int(offset)
     if flat_arrays:
-        buffers = tuple(memoryview(flat.data).cast("B") for flat in flat_arrays)
-        data = _MultiBufferPayload(
-            buffers=buffers,
-            owners=tuple(flat_arrays),
-            dtype=np.dtype(dtype).str,
-            shape=(int(offset),),
-        )
+        if _concat_arrays_into is not None:
+            data = _DirectCopyPayload.from_flat_arrays(flat_arrays, dtype, total_elems)
+        else:
+            buffers = tuple(memoryview(flat.data).cast("B") for flat in flat_arrays)
+            owners = tuple(flat_arrays)
+            data = _MultiBufferPayload(
+                buffers=buffers, owners=owners,
+                dtype=np.dtype(dtype).str, shape=(total_elems,),
+            )
     else:
         empty = np.empty(0, dtype=dtype)
         data = _MultiBufferPayload(
-            buffers=(memoryview(empty.data).cast("B"),),
-            owners=(empty,),
-            dtype=np.dtype(dtype).str,
-            shape=(0,),
+            buffers=(memoryview(empty.data).cast("B"),), owners=(empty,),
+            dtype=np.dtype(dtype).str, shape=(0,),
         )
+    ndarray_rows = [
+        value is not None and isinstance(value, np.ndarray) for value in values
+    ]
+    if all(value is None or is_array for value, is_array in zip(values, ndarray_rows)):
+        row_format = "ndarray"
+    elif any(ndarray_rows):
+        row_format = "mixed"
+    else:
+        row_format = "list"
     return (
         {
             "data": data,
@@ -2841,18 +2893,48 @@ def _encode_typed_ragged_values(
             "ndims": ndims,
             "nulls": nulls,
         },
-        {"dtype": str(dtype), "max_ndim": int(max_ndim), "shape_policy": "ragged"},
+        {
+            "dtype": str(dtype),
+            "max_ndim": int(max_ndim),
+            "shape_policy": "ragged",
+            "row_format": row_format,
+            "ndarray_rows": ndarray_rows if row_format == "mixed" else None,
+        },
     )
 
 
 def _decode_typed_ragged_values(
     payload: dict[str, Any], rows: int, metadata: Optional[Mapping[str, Any]] = None
 ) -> list[Any]:
-    data = payload["data"]
+    raw = payload["data"]
+    dtype_str = (metadata or {}).get("dtype", _TYPED_RAGGED_DEFAULT_DTYPE)
+    np_dtype = np.dtype(dtype_str)
+    # data may arrive as torch.Tensor, bytes, or numpy (pool-backed or typed)
+    if _torch is not None and isinstance(raw, _torch.Tensor):
+        data = raw.numpy()
+    elif isinstance(raw, (bytes, bytearray, memoryview)):
+        data = np.frombuffer(raw, dtype=np_dtype)
+    elif isinstance(raw, np.ndarray):
+        data = raw if raw.dtype == np_dtype else np.frombuffer(raw, dtype=np_dtype)
+    else:
+        data = np.asarray(raw, dtype=np_dtype)
     offsets = payload["offsets"]
     shapes = payload["shapes"]
     ndims = payload["ndims"]
     nulls = payload["nulls"]
+    metadata = metadata or {}
+    row_format = metadata.get("row_format")
+    if (
+        row_format == "ndarray"
+        and metadata.get("physical_layout") == "contiguous_flat"
+    ):
+        fast_values = _decode_typed_ragged_ndarray_rows_fast(
+            data, offsets, shapes, ndims, nulls, rows, metadata
+        )
+        if fast_values is not None:
+            return fast_values
+
+    ndarray_rows = metadata.get("ndarray_rows") or []
     values = []
     for row in range(rows):
         if bool(nulls[row]):
@@ -2862,7 +2944,13 @@ def _decode_typed_ragged_values(
         end = int(offsets[row + 1])
         ndim = int(ndims[row])
         shape = tuple(int(v) for v in shapes[row, :ndim].tolist())
-        values.append(data[begin:end].reshape(shape).tolist())
+        array = data[begin:end].reshape(shape)
+        if row_format == "ndarray" or (
+            row_format == "mixed" and bool(ndarray_rows[row])
+        ):
+            values.append(array)
+        else:
+            values.append(array.tolist())
     return values
 
 
@@ -3382,6 +3470,14 @@ class _BundleManifestStore:
                         target_chunk_bytes,
                         transfer_policy,
                     )
+                elif isinstance(value, _DirectCopyPayload):
+                    payload_spec, payload_keys = self._put_direct_copy_payload(
+                        payload_key,
+                        value,
+                        target_chunk_bytes,
+                        transfer_policy,
+                        config=config,
+                    )
                 else:
                     payload_spec, payload_keys = self._put_payload(
                         payload_key,
@@ -3726,6 +3822,134 @@ class _BundleManifestStore:
             ],
         }
         return payload_spec, written_keys
+
+
+    def _put_direct_copy_payload(
+        self,
+        key: str,
+        value: _DirectCopyPayload,
+        chunk_bytes: int,
+        transfer_policy: BundleTransferPolicy,
+        config: Any = None,
+    ) -> tuple[dict[str, Any], list[str]]:
+        total_bytes = value.total_bytes
+        if total_bytes == 0:
+            return {"key": key, "bytes": 0, "chunks": []}, []
+        if len(value.arrays) == 1:
+            buf = memoryview(value.arrays[0].data).cast("B")
+            return self._put_payload(
+                key,
+                buf,
+                chunk_bytes,
+                transfer_policy,
+                pre_registered=False,
+                config=config,
+            )
+        arrays = value.arrays
+        transport = self._transport
+        pool = transport._ensure_buffer_pool()
+        batch_put_from = transport._batch_put_from
+        if pool is None or not callable(batch_put_from):
+            buf = memoryview(np.concatenate(
+                [a.ravel().view(np.uint8) for a in arrays]
+            ).data).cast("B")
+            return self._put_payload(
+                key,
+                buf,
+                chunk_bytes,
+                transfer_policy,
+                pre_registered=False,
+                config=config,
+            )
+        # Group arrays into chunk-sized batches
+        n = len(arrays)
+        chunk_batches: list[tuple[int, int, int]] = []  # (start, count, bytes)
+        batch_start = 0
+        batch_bytes = 0
+        fallback = False
+        for i in range(n):
+            ab = arrays[i].nbytes
+            if ab > chunk_bytes:
+                fallback = True
+                break
+            if batch_bytes + ab > chunk_bytes and batch_bytes > 0:
+                chunk_batches.append((batch_start, i - batch_start, batch_bytes))
+                batch_start = i
+                batch_bytes = 0
+            batch_bytes += ab
+        if fallback:
+            buf = memoryview(np.concatenate(
+                [a.ravel().view(np.uint8) for a in arrays]
+            ).data).cast("B")
+            return self._put_payload(
+                key,
+                buf,
+                chunk_bytes,
+                transfer_policy,
+                pre_registered=False,
+                config=config,
+            )
+        if batch_bytes > 0:
+            chunk_batches.append((batch_start, n - batch_start, batch_bytes))
+        num_chunks = len(chunk_batches)
+        chunk_keys = [
+            key if num_chunks == 1 else f"{key}/chunk/{idx}"
+            for idx in range(num_chunks)
+        ]
+        def _put_chunk_batch(keys, batches, nthreads=1):
+            for ck, (start, count, size) in zip(keys, batches):
+                lease = pool.acquire(size)
+                try:
+                    _concat_arrays_into(arrays, lease.ptr, start, count, nthreads)
+                    results = _batch_put_from_with_optional_config(
+                        batch_put_from, [ck], [lease.ptr], [size], config
+                    )
+                    transport._check_batch_put_results(results, [ck], "batch_put_from")
+                except Exception:
+                    _cleanup_keys(self._store, [ck], strict=False)
+                    raise
+                finally:
+                    lease.release()
+
+        max_inflight = transfer_policy.max_inflight_put
+        use_parallel = (
+            transfer_policy.put_mode != "batch"
+            and max_inflight > 1
+            and num_chunks >= AUTO_PARALLEL_MIN_CHUNKS
+            and total_bytes >= AUTO_PARALLEL_MIN_BYTES
+        )
+        if not use_parallel:
+            _put_chunk_batch(chunk_keys, chunk_batches)
+        else:
+            group_count = max(1, min(max_inflight, num_chunks))
+            group_size = (num_chunks + group_count - 1) // group_count
+            groups = [
+                (chunk_keys[s:s + group_size], chunk_batches[s:s + group_size])
+                for s in range(0, num_chunks, group_size)
+            ]
+            futures: list = []
+            try:
+                with ThreadPoolExecutor(max_workers=len(groups)) as executor:
+                    futures = [
+                        executor.submit(_put_chunk_batch, gk, gb)
+                        for gk, gb in groups
+                    ]
+                    for f in as_completed(futures):
+                        f.result()
+            except Exception:
+                for f in futures:
+                    f.cancel()
+                _cleanup_keys(self._store, chunk_keys, strict=False)
+                raise
+        payload_spec = {
+            "key": key,
+            "bytes": total_bytes,
+            "chunks": [
+                {"key": ck, "bytes": cb[2]}
+                for ck, cb in zip(chunk_keys, chunk_batches)
+            ],
+        }
+        return payload_spec, list(chunk_keys)
 
     def _policy(
         self,
@@ -5093,7 +5317,9 @@ def raw_destination(
 def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
     if isinstance(value, _TensorObjectBufferPayload):
         return {"encoding": "torch_tensor"}, value
-    if isinstance(value, _MultiBufferPayload):
+    if isinstance(value, _TensorPayload):
+        return _encode_torch_tensor_field(value.tensor)
+    if isinstance(value, (_DirectCopyPayload, _MultiBufferPayload)):
         if value.dtype is not None and value.shape is not None:
             return {
                 "encoding": "ndarray",
@@ -5275,6 +5501,303 @@ def _normalize_structured_scalar(value: Any) -> Any:
         return [_normalize_structured_scalar(item) for item in value]
     return value
 
+
+
+
+
+def _encode_typed_ragged_regular_ndarray_rows(
+    values: list[Any], dtype: np.dtype[Any]
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    row_count = len(values)
+    if row_count < 2:
+        return None
+    first = values[0]
+    if (
+        not isinstance(first, np.ndarray)
+        or first.dtype != dtype
+        or not first.flags.c_contiguous
+    ):
+        return None
+    shape = first.shape
+    for value in values[1:]:
+        if (
+            not isinstance(value, np.ndarray)
+            or value.dtype != dtype
+            or not value.flags.c_contiguous
+            or value.shape != shape
+        ):
+            return None
+
+    row_elems = int(first.size)
+    data = np.asarray(values, dtype=dtype).reshape(-1)
+    offsets = np.arange(row_count + 1, dtype=np.int64) * row_elems
+    nulls = np.zeros(row_count, dtype=np.bool_)
+    max_ndim = int(first.ndim)
+    if max_ndim == 0:
+        shapes = np.zeros((row_count, 1), dtype=np.int64)
+        ndims = np.zeros(row_count, dtype=np.int16)
+    else:
+        shapes = np.empty((row_count, max_ndim), dtype=np.int64)
+        shapes[:] = shape
+        ndims = np.full(row_count, max_ndim, dtype=np.int16)
+    return (
+        {
+            "data": data,
+            "offsets": offsets,
+            "shapes": shapes,
+            "ndims": ndims,
+            "nulls": nulls,
+        },
+        {
+            "dtype": str(dtype),
+            "max_ndim": max_ndim,
+            "shape_policy": "ragged",
+            "row_format": "ndarray",
+            "ndarray_rows": None,
+            "physical_layout": "contiguous_flat",
+        },
+    )
+
+
+def _encode_typed_ragged_ndarray_rows(
+    values: list[Any], dtype: np.dtype[Any]
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    regular_encoded = _encode_typed_ragged_regular_ndarray_rows(values, dtype)
+    if regular_encoded is not None:
+        return regular_encoded
+
+    row_count = len(values)
+    if row_count == 0:
+        return None
+
+    nulls = np.empty(row_count, dtype=np.bool_)
+    lengths = np.empty(row_count, dtype=np.int64)
+    arrays: list[np.ndarray] = []
+    tail_shape: tuple[int, ...] | None = None
+    row_ndim: int | None = None
+    tail_compatible = True
+    saw_scalar = False
+    saw_non_scalar = False
+
+    for row, value in enumerate(values):
+        if value is None:
+            nulls[row] = True
+            lengths[row] = 0
+            continue
+        if not isinstance(value, np.ndarray):
+            return None
+
+        array = _as_contiguous_array_preserve_ndim(value, dtype)
+        arrays.append(array)
+        nulls[row] = False
+        lengths[row] = array.size
+        if array.ndim == 0:
+            saw_scalar = True
+            if saw_non_scalar:
+                tail_compatible = False
+            continue
+
+        saw_non_scalar = True
+        if saw_scalar:
+            tail_compatible = False
+        current_tail = array.shape[1:]
+        if tail_shape is None:
+            tail_shape = current_tail
+            row_ndim = array.ndim
+        elif array.ndim != row_ndim or current_tail != tail_shape:
+            tail_compatible = False
+
+    if tail_compatible and tail_shape is not None and any(dim == 0 for dim in tail_shape):
+        tail_compatible = False
+
+    offsets = np.empty(row_count + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(lengths, out=offsets[1:])
+    total_elems = int(offsets[-1])
+    if len(arrays) == 1:
+        flat = arrays[0].reshape(-1)
+        data = _MultiBufferPayload(
+            buffers=(memoryview(flat.data).cast("B"),),
+            owners=(flat,),
+            dtype=np.dtype(dtype).str,
+            shape=(total_elems,),
+        )
+    elif total_elems:
+        if _concat_arrays_into is not None:
+            flat_arrays = [arr.reshape(-1) for arr in arrays]
+            data = _DirectCopyPayload.from_flat_arrays(flat_arrays, dtype, total_elems)
+        else:
+            flat_arrays = [arr.reshape(-1) for arr in arrays]
+            buffers = tuple(memoryview(flat.data).cast("B") for flat in flat_arrays)
+            data = _MultiBufferPayload(
+                buffers=buffers,
+                owners=tuple(flat_arrays),
+                dtype=np.dtype(dtype).str,
+                shape=(total_elems,),
+            )
+    else:
+        empty = np.empty(0, dtype=dtype)
+        data = _MultiBufferPayload(
+            buffers=(memoryview(empty.data).cast("B"),),
+            owners=(empty,),
+            dtype=np.dtype(dtype).str,
+            shape=(0,),
+        )
+
+    if not arrays or saw_scalar and not saw_non_scalar:
+        max_ndim = 0
+    elif tail_compatible:
+        max_ndim = int(row_ndim or 1)
+    else:
+        max_ndim = max(array.ndim for array in arrays)
+
+    ndims = np.zeros(row_count, dtype=np.int16)
+    if max_ndim == 0:
+        shapes = np.zeros((row_count, 1), dtype=np.int64)
+    elif tail_compatible:
+        shapes = np.zeros((row_count, max_ndim), dtype=np.int64)
+        tail = tail_shape or ()
+        tail_elems = int(np.prod(tail, dtype=np.int64)) if tail else 1
+        shapes[:, 0] = lengths // tail_elems
+        if max_ndim > 1:
+            shapes[:, 1:] = tail
+        ndims[~nulls] = max_ndim
+    else:
+        shapes = np.zeros((row_count, max(max_ndim, 1)), dtype=np.int64)
+        array_index = 0
+        for row, is_null in enumerate(nulls):
+            if bool(is_null):
+                continue
+            array = arrays[array_index]
+            array_index += 1
+            ndims[row] = array.ndim
+            if array.ndim > 0:
+                shapes[row, : array.ndim] = array.shape
+
+    return (
+        {
+            "data": data,
+            "offsets": offsets,
+            "shapes": shapes,
+            "ndims": ndims,
+            "nulls": nulls,
+        },
+        {
+            "dtype": str(dtype),
+            "max_ndim": int(max_ndim),
+            "shape_policy": "ragged",
+            "row_format": "ndarray",
+            "ndarray_rows": None,
+            "physical_layout": "contiguous_flat",
+        },
+    )
+
+
+def _as_contiguous_array_preserve_ndim(value: Any, dtype: np.dtype[Any]) -> np.ndarray:
+    if isinstance(value, np.ndarray) and value.dtype == dtype and value.flags.c_contiguous:
+        return value
+    array = np.asarray(value, dtype=dtype)
+    if array.flags.c_contiguous:
+        return array
+    return np.array(array, dtype=dtype, order="C", copy=True)
+
+
+def _decode_typed_ragged_ndarray_rows_fast(
+    data: np.ndarray,
+    offsets: np.ndarray,
+    shapes: np.ndarray,
+    ndims: np.ndarray,
+    nulls: np.ndarray,
+    rows: int,
+    metadata: Mapping[str, Any],
+) -> list[Any] | None:
+    max_ndim = int(metadata.get("max_ndim", 0))
+    owner = getattr(data, "_mooncake_pool_owner", None)
+    source = data.view(np.ndarray) if isinstance(data, np.ndarray) else data
+    has_nulls = bool(nulls.any())
+
+    def attach_owner(values: list[Any]) -> list[Any]:
+        if owner is None:
+            return values
+        return _OwnerBackedList(values, owner)
+
+    if max_ndim == 1:
+        if not has_nulls:
+            row_width = _regular_offsets_width(offsets, rows)
+            if row_width is not None:
+                return attach_owner(list(source.reshape((rows, row_width))))
+            begins = offsets[:-1].tolist()
+            ends = offsets[1:].tolist()
+            return attach_owner(
+                [source[b:e] for b, e in zip(begins, ends)]
+            )
+        values: list[Any] = []
+        begins = offsets[:-1].tolist()
+        ends = offsets[1:].tolist()
+        for is_null, b, e in zip(nulls, begins, ends):
+            if bool(is_null):
+                values.append(None)
+            else:
+                values.append(source[b:e])
+        return attach_owner(values)
+
+    if max_ndim <= 1 or rows == 0:
+        return None
+
+    non_null_rows = np.flatnonzero(~nulls)
+    if non_null_rows.size == 0:
+        return [None] * rows
+    first_row = int(non_null_rows[0])
+    if int(ndims[first_row]) != max_ndim:
+        return None
+    tail = tuple(int(v) for v in shapes[first_row, 1:max_ndim])
+    if any(dim == 0 for dim in tail):
+        return None
+    for row in non_null_rows:
+        row_index = int(row)
+        if int(ndims[row_index]) != max_ndim:
+            return None
+        if tuple(int(v) for v in shapes[row_index, 1:max_ndim]) != tail:
+            return None
+
+    tail_elems = int(np.prod(tail, dtype=np.int64)) if tail else 1
+    if tail_elems <= 0:
+        return None
+    if int(offsets[-1]) % tail_elems != 0:
+        return None
+    flat_rows = source.reshape((-1, *tail))
+    first_axis_offsets = offsets // tail_elems
+
+    if not has_nulls:
+        row_width = _regular_offsets_width(first_axis_offsets, rows)
+        if row_width is not None:
+            return attach_owner(list(flat_rows.reshape((rows, row_width, *tail))))
+        fa_begins = first_axis_offsets[:-1].tolist()
+        fa_ends = first_axis_offsets[1:].tolist()
+        return attach_owner(
+            [flat_rows[b:e] for b, e in zip(fa_begins, fa_ends)]
+        )
+    values = []
+    fa_begins = first_axis_offsets[:-1].tolist()
+    fa_ends = first_axis_offsets[1:].tolist()
+    for is_null, b, e in zip(nulls, fa_begins, fa_ends):
+        if bool(is_null):
+            values.append(None)
+        else:
+            values.append(flat_rows[b:e])
+    return attach_owner(values)
+
+
+def _regular_offsets_width(offsets: np.ndarray, rows: int) -> int | None:
+    if rows <= 0 or int(offsets[0]) != 0:
+        return None
+    total = int(offsets[-1])
+    if total < 0 or total % rows != 0:
+        return None
+    row_width = total // rows
+    if not bool(np.all(offsets[1:] - offsets[:-1] == row_width)):
+        return None
+    return row_width
 
 
 def _encode_msgpack_ragged_values(
