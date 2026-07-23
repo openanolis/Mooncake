@@ -37,6 +37,11 @@ enum class TransferStrategy {
     SPDK_NVMF = 4  // Spdk nvmf operation
 };
 
+enum class BatchLocalCopyMode {
+    kTransferEngine = 0,
+    kRequireSameProcess = 1,
+};
+
 /**
  * @brief Stream operator for TransferStrategy
  */
@@ -563,7 +568,9 @@ class TransferSubmitter {
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
-        TransferRequest::OpCode op_code);
+        TransferRequest::OpCode op_code,
+        BatchLocalCopyMode local_copy_mode =
+            BatchLocalCopyMode::kTransferEngine);
 
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,

@@ -2734,7 +2734,7 @@ def batch_get_into(self, keys: List[str], buffer_ptrs: List[int], sizes: List[in
 **Returns:**
 - `List[int]`: List of bytes read for each operation (positive = success, negative = error)
 
-⚠️ **Store-managed Buffer Required**: All buffers must resolve to Store-managed registered memory before batch zero-copy operations.
+⚠️ **Store-managed Buffer Required**: Batch reads require destination buffers that resolve to Store-managed registered memory.
 
 **Example:**
 
@@ -2775,7 +2775,7 @@ for ptr in buffer_ptrs:
 ---
 
 #### batch_put_from_multi_buffers()
-Store multiple objects from multiple pre-registered buffers (zero-copy).
+Store multiple objects from multiple buffers. Non-local writes require pre-registered buffers; same-process local writes may use ordinary host or accelerator source buffers.
 
 ```python
 def batch_put_from_multi_buffers(self, keys: List[str], all_buffer_ptrs: List[List[int]], all_sizes: List[List[int]],
@@ -2810,7 +2810,7 @@ List[int]
 **Returns:**
 - `List[int]`: List of bytes read for each operation (positive = success, negative = error)
 
-⚠️ **Store-managed Buffer Required**: All buffers must resolve to Store-managed registered memory before batch zero-copy operations.
+⚠️ **Store-managed Buffer Required**: Batch reads require destination buffers that resolve to Store-managed registered memory.
 
 **Example:**
 

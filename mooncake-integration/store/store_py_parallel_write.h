@@ -28,31 +28,38 @@ inline void append_tensor_metadata_buffers(
     }
 }
 
-inline void mark_tensor_batch_result_size_mismatch(
+inline void apply_tensor_batch_results(
     std::vector<int> &results, const std::vector<size_t> &original_indices,
-    const char *operation_name, size_t result_count) {
-    LOG(ERROR) << operation_name << " returned " << result_count
-               << " results for " << original_indices.size() << " keys";
-    for (size_t original_index : original_indices) {
-        results[original_index] = to_py_ret(ErrorCode::RPC_FAIL);
+    const std::vector<int> &op_results, const char *operation_name) {
+    if (op_results.size() != original_indices.size()) {
+        LOG(ERROR) << operation_name << " returned " << op_results.size()
+                   << " results for " << original_indices.size() << " keys";
+        for (size_t original_index : original_indices) {
+            results[original_index] = to_py_ret(ErrorCode::RPC_FAIL);
+        }
+        return;
+    }
+
+    for (size_t i = 0; i < op_results.size(); ++i) {
+        results[original_indices[i]] = op_results[i];
     }
 }
 
-inline bool prepare_same_process_tensor_write_config(
-    ReplicateConfig &config, const std::string &local_segment,
+inline std::optional<ReplicateConfig> make_same_process_tensor_write_config(
+    const ReplicateConfig &config, const std::string &local_segment,
     const char *operation_name) {
-    if (!config.prefer_alloc_in_same_node) return false;
+    if (!config.prefer_alloc_in_same_node) return std::nullopt;
     if (local_segment.empty()) {
         LOG(ERROR) << operation_name
                    << " cannot resolve local segment for no-staging write";
-        return false;
+        return std::nullopt;
     }
     if (!config.preferred_segment.empty() &&
         config.preferred_segment != local_segment) {
         LOG(ERROR) << operation_name
                    << " no-staging tensor write requires current client "
                       "segment when preferred_segment is set";
-        return false;
+        return std::nullopt;
     }
     if (!config.preferred_segments.empty()) {
         if (config.preferred_segments.size() != 1 ||
@@ -60,12 +67,14 @@ inline bool prepare_same_process_tensor_write_config(
             LOG(ERROR) << operation_name
                        << " no-staging tensor write requires current client "
                           "segment when preferred_segments is set";
-            return false;
+            return std::nullopt;
         }
-        config.preferred_segments.clear();
     }
-    config.preferred_segment = local_segment;
-    return true;
+
+    ReplicateConfig local_config = config;
+    local_config.preferred_segments.clear();
+    local_config.preferred_segment = local_segment;
+    return local_config;
 }
 
 template <typename BatchWriteFromFn, typename BatchWriteFromMultiBuffersFn>
@@ -86,12 +95,11 @@ std::vector<int> batch_write_tensor_impl(
         return group_ids_error;
     }
 
-    ReplicateConfig same_process_config = config;
-    bool use_same_process_write = false;
+    std::optional<ReplicateConfig> same_process_config;
     if (config.prefer_alloc_in_same_node) {
-        use_same_process_write = prepare_same_process_tensor_write_config(
-            same_process_config, store_->get_hostname(), operation_name);
-        if (!use_same_process_write) {
+        same_process_config = make_same_process_tensor_write_config(
+            config, store_->get_hostname(), operation_name);
+        if (!same_process_config.has_value()) {
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
@@ -105,7 +113,7 @@ std::vector<int> batch_write_tensor_impl(
         std::vector<std::string> valid_keys;
         std::vector<size_t> original_indices;
 
-        if (use_same_process_write) {
+        if (same_process_config.has_value()) {
             std::vector<std::vector<void *>> all_buffers;
             std::vector<std::vector<size_t>> all_sizes;
             std::vector<std::vector<char>> padding_storage;
@@ -135,18 +143,11 @@ std::vector<int> batch_write_tensor_impl(
 
             if (!valid_keys.empty()) {
                 ReplicateConfig write_config =
-                    MakeIndexedConfig(same_process_config, original_indices);
+                    MakeIndexedConfig(*same_process_config, original_indices);
                 std::vector<int> op_results = batch_write_from_multi_buffers(
                     valid_keys, all_buffers, all_sizes, write_config);
-                if (op_results.size() != original_indices.size()) {
-                    mark_tensor_batch_result_size_mismatch(
-                        results, original_indices, operation_name,
-                        op_results.size());
-                } else {
-                    for (size_t i = 0; i < op_results.size(); ++i) {
-                        results[original_indices[i]] = op_results[i];
-                    }
-                }
+                apply_tensor_batch_results(results, original_indices,
+                                           op_results, operation_name);
             }
             return results;
         }
@@ -195,9 +196,8 @@ std::vector<int> batch_write_tensor_impl(
                 MakeIndexedConfig(config, original_indices);
             std::vector<int> op_results = batch_write_from(
                 valid_keys, buffer_ptrs, buffer_sizes, write_config);
-            for (size_t i = 0; i < op_results.size(); ++i) {
-                results[original_indices[i]] = op_results[i];
-            }
+            apply_tensor_batch_results(results, original_indices, op_results,
+                                       operation_name);
         }
     }
 

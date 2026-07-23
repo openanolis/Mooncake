@@ -2916,9 +2916,10 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
             py::arg("config") = ReplicateConfig{},
-            "Put object data directly from multiple pre-allocated buffers for "
-            "multiple "
-            "keys")
+            "Put object data directly from multiple buffers for multiple keys. "
+            "Non-local writes require Store-managed registered buffers; "
+            "same-process local writes may use ordinary host or accelerator "
+            "source buffers.")
         .def(
             "batch_get_into_multi_buffers",
             [](MooncakeStorePyWrapper &self,

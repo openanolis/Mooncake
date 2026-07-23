@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1042,12 +1043,12 @@ void AppendMemcpyOperations(const AllocatedBuffer::Descriptor& handle,
                             const TransferRequest::OpCode op_code,
                             std::vector<MemcpyOperation>& operations,
                             uint64_t src_offset = 0) {
-    operations.reserve(operations.size() + slices.size());
-
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
     uint64_t offset = src_offset;
     for (const auto& slice : slices) {
-        if (slice.ptr == nullptr) continue;
+        if (slice.size == 0) {
+            continue;
+        }
 
         void* dest;
         const void* src;
@@ -1058,9 +1059,21 @@ void AppendMemcpyOperations(const AllocatedBuffer::Descriptor& handle,
             dest = reinterpret_cast<void*>(base_address + offset);
             src = slice.ptr;
         }
-        offset += slice.size;
         operations.emplace_back(dest, src, slice.size);
+        offset += slice.size;
     }
+}
+
+size_t CountNonEmptySlices(const std::vector<std::vector<Slice>>& all_slices) {
+    size_t count = 0;
+    for (const auto& slices : all_slices) {
+        for (const auto& slice : slices) {
+            if (slice.size > 0) {
+                ++count;
+            }
+        }
+    }
+    return count;
 }
 
 }  // namespace
@@ -1068,22 +1081,26 @@ void AppendMemcpyOperations(const AllocatedBuffer::Descriptor& handle,
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
-    TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code, BatchLocalCopyMode local_copy_mode) {
     if (replicas.size() != all_slices.size()) {
         LOG(ERROR) << "Mismatched replicas and slice batches: replicas="
                    << replicas.size() << ", slices=" << all_slices.size();
         return std::nullopt;
     }
 
-    bool use_local_memcpy = !replicas.empty();
+    bool use_local_memcpy =
+        local_copy_mode == BatchLocalCopyMode::kRequireSameProcess;
     for (size_t i = 0; i < replicas.size(); ++i) {
         const auto& handle =
             replicas[i].get_memory_descriptor().buffer_descriptor;
         if (!validateTransferParams(handle, all_slices[i])) {
             return std::nullopt;
         }
-        if (!isLocalTransfer(handle)) {
-            use_local_memcpy = false;
+        if (use_local_memcpy && !isLocalTransfer(handle)) {
+            LOG(ERROR) << "same-process batch copy requested for non-local "
+                          "segment "
+                       << handle.transport_endpoint_;
+            return std::nullopt;
         }
     }
 
@@ -1091,6 +1108,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     if (use_local_memcpy) {
         auto state = std::make_shared<MemcpyOperationState>();
         std::vector<MemcpyOperation> operations;
+        operations.reserve(CountNonEmptySlices(all_slices));
         for (size_t i = 0; i < replicas.size(); ++i) {
             AppendMemcpyOperations(
                 replicas[i].get_memory_descriptor().buffer_descriptor,
@@ -1458,7 +1476,16 @@ bool TransferSubmitter::validateTransferParams(
     const AllocatedBuffer::Descriptor& handle,
     const std::vector<Slice>& slices) const {
     uint64_t all_slice_len = 0;
-    for (auto slice : slices) {
+    for (const auto& slice : slices) {
+        if (slice.size > 0 && slice.ptr == nullptr) {
+            LOG(ERROR) << "non-empty slice has null pointer, size:"
+                       << slice.size;
+            return false;
+        }
+        if (all_slice_len > std::numeric_limits<uint64_t>::max() - slice.size) {
+            LOG(ERROR) << "slice lengths overflow";
+            return false;
+        }
         all_slice_len += slice.size;
     }
     if (handle.size_ != all_slice_len) {

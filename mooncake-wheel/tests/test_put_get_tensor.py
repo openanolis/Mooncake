@@ -148,6 +148,37 @@ class TestDistributedObjectStore(unittest.TestCase):
             self.assertTrue(torch.equal(self.store.get_tensor(key), tensor))
             self.store.remove(key)
 
+    def test_batch_pub_tensor_same_node_rejects_non_local_segment(self):
+        """Test no-staging tensor writes reject explicit non-local segments."""
+        import torch
+
+        key = f"test_batch_pub_tensor_non_local_{os.getpid()}"
+        config = ReplicateConfig()
+        config.prefer_alloc_in_same_node = True
+        config.preferred_segment = "not-local-segment"
+
+        result = self.store.batch_pub_tensor(
+            [key], [torch.arange(8, dtype=torch.float32)], config
+        )
+        self.assertEqual(len(result), 1)
+        self.assertLess(result[0], 0)
+        self.assertEqual(self.store.is_exist(key), 0)
+
+    @unittest.skipUnless(cuda_available(), "CUDA is not available")
+    def test_batch_pub_tensor_same_node_cuda(self):
+        """Test same-node tensor batch writes from a CUDA source tensor."""
+        import torch
+
+        key = f"test_batch_pub_tensor_same_node_cuda_{os.getpid()}"
+        tensor = torch.arange(1024, dtype=torch.float32, device="cuda")
+        config = ReplicateConfig()
+        config.prefer_alloc_in_same_node = True
+
+        self.assertEqual(self.store.batch_pub_tensor([key], [tensor], config), [0])
+        retrieved = self.store.get_tensor(key)
+        self.assertTrue(torch.equal(retrieved, tensor.cpu()))
+        self.store.remove(key)
+
     @unittest.skipUnless(cuda_available(), "CUDA is not available")
     def test_cuda_local_copy_paths(self):
         """Test CUDA source writes and CUDA destination reads."""
