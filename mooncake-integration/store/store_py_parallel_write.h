@@ -14,12 +14,43 @@ int write_manifest_impl(const std::string &key,
     return ret;
 }
 
-template <typename BatchWriteFromFn>
-std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
-                                         const std::vector<PyTensorInfo> &infos,
-                                         const ReplicateConfig &config,
-                                         const char *operation_name,
-                                         BatchWriteFromFn &&batch_write_from) {
+inline void append_tensor_write_buffers(const PyTensorInfo &info,
+                                        std::vector<void *> &buffers,
+                                        std::vector<size_t> &sizes) {
+    buffers.push_back(const_cast<TensorMetadata *>(&info.metadata));
+    sizes.push_back(info.metadata.header.data_offset);
+    if (info.tensor_size > 0) {
+        buffers.push_back(reinterpret_cast<void *>(info.data_ptr));
+        sizes.push_back(info.tensor_size);
+    }
+}
+
+inline void apply_tensor_batch_results(
+    std::vector<int> &results, const std::vector<size_t> &original_indices,
+    const std::vector<int> &op_results, const char *operation_name) {
+    if (op_results.size() != original_indices.size()) {
+        LOG(ERROR) << operation_name << " returned unexpected result count";
+        for (size_t index : original_indices) {
+            results[index] = to_py_ret(ErrorCode::RPC_FAIL);
+        }
+        return;
+    }
+    for (size_t i = 0; i < op_results.size(); ++i)
+        results[original_indices[i]] = op_results[i];
+}
+
+template <typename BatchWriteFromMultiBuffersFn>
+std::vector<int> batch_write_tensor_impl(
+    const std::vector<std::string> &keys,
+    const std::vector<PyTensorInfo> &infos, const ReplicateConfig &config,
+    const char *operation_name,
+    BatchWriteFromMultiBuffersFn &&batch_write_from) {
+    if (keys.size() != infos.size()) {
+        LOG(ERROR) << operation_name << " keys and tensors size mismatch";
+        return std::vector<int>(keys.size(),
+                                to_py_ret(ErrorCode::INVALID_PARAMS));
+    }
+
     auto group_ids_error =
         ValidateGroupIdsForBatchConfig(config, keys.size(), operation_name);
     if (!group_ids_error.empty()) {
@@ -27,59 +58,39 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
     }
 
     std::vector<int> results(keys.size(), 0);
-
     {
         py::gil_scoped_release release_gil;
 
         std::vector<std::string> valid_keys;
-        std::vector<void *> buffer_ptrs;
-        std::vector<size_t> buffer_sizes;
         std::vector<size_t> original_indices;
-        std::vector<std::unique_ptr<BufferHandle>> temp_allocations;
-
+        std::vector<std::vector<void *>> all_buffers;
+        std::vector<std::vector<size_t>> all_sizes;
+        valid_keys.reserve(infos.size());
+        original_indices.reserve(infos.size());
+        all_buffers.reserve(infos.size());
+        all_sizes.reserve(infos.size());
         for (size_t i = 0; i < infos.size(); ++i) {
             if (!infos[i].valid()) {
                 results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                 continue;
             }
 
-            size_t total_size =
-                infos[i].metadata.header.data_offset + infos[i].tensor_size;
-            auto alloc_result =
-                store_->client_buffer_allocator_->allocate(total_size);
-
-            if (!alloc_result) {
-                LOG(ERROR) << "Failed to allocate buffer for " << operation_name
-                           << " key: " << keys[i];
-                results[i] = to_py_ret(ErrorCode::NO_AVAILABLE_HANDLE);
-                continue;
-            }
-
-            char *dst = static_cast<char *>(alloc_result->ptr());
-            std::memcpy(dst, &infos[i].metadata,
-                        infos[i].metadata.header.data_offset);
-            if (infos[i].tensor_size > 0) {
-                std::memcpy(dst + infos[i].metadata.header.data_offset,
-                            reinterpret_cast<void *>(infos[i].data_ptr),
-                            infos[i].tensor_size);
-            }
+            all_buffers.emplace_back();
+            all_sizes.emplace_back();
+            append_tensor_write_buffers(infos[i], all_buffers.back(),
+                                        all_sizes.back());
 
             valid_keys.push_back(keys[i]);
-            buffer_ptrs.push_back(alloc_result->ptr());
-            buffer_sizes.push_back(total_size);
             original_indices.push_back(i);
-            temp_allocations.push_back(
-                std::make_unique<BufferHandle>(std::move(*alloc_result)));
         }
 
         if (!valid_keys.empty()) {
             ReplicateConfig write_config =
                 MakeIndexedConfig(config, original_indices);
             std::vector<int> op_results = batch_write_from(
-                valid_keys, buffer_ptrs, buffer_sizes, write_config);
-            for (size_t i = 0; i < op_results.size(); ++i) {
-                results[original_indices[i]] = op_results[i];
-            }
+                valid_keys, all_buffers, all_sizes, write_config);
+            apply_tensor_batch_results(results, original_indices, op_results,
+                                       operation_name);
         }
     }
 

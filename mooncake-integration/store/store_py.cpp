@@ -882,11 +882,26 @@ class MooncakeStorePyWrapper {
         return batch_write_tensor_impl(
             keys, infos, config, "put",
             [this](const std::vector<std::string> &write_keys,
-                   const std::vector<void *> &buffer_ptrs,
-                   const std::vector<size_t> &buffer_sizes,
+                   const std::vector<std::vector<void *>> &buffers,
+                   const std::vector<std::vector<size_t>> &sizes,
                    const ReplicateConfig &write_config) {
-                return store_->batch_put_from(write_keys, buffer_ptrs,
-                                              buffer_sizes, write_config);
+                return real_client_->batch_put_from_multi_buffers(
+                    write_keys, buffers, sizes, write_config);
+            });
+    }
+
+    std::vector<int> batch_upsert_tensor_infos_impl(
+        const std::vector<std::string> &keys,
+        const std::vector<PyTensorInfo> &infos,
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        return batch_write_tensor_impl(
+            keys, infos, config, "upsert",
+            [this](const std::vector<std::string> &write_keys,
+                   const std::vector<std::vector<void *>> &buffers,
+                   const std::vector<std::vector<size_t>> &sizes,
+                   const ReplicateConfig &write_config) {
+                return real_client_->batch_upsert_from_multi_buffers(
+                    write_keys, buffers, sizes, write_config);
             });
     }
 
@@ -1431,78 +1446,11 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
         const ReplicateConfig &config = ReplicateConfig{}) {
-        auto group_ids_error = ValidateGroupIdsForBatchConfig(
-            config, keys.size(), "batch_upsert_tensor");
-        if (!group_ids_error.empty()) {
-            return group_ids_error;
-        }
-
         std::vector<PyTensorInfo> infos(keys.size());
-        std::vector<int> results(keys.size(), 0);
-
-        // 1. Extract Metadata (GIL Held)
         for (size_t i = 0; i < keys.size(); ++i) {
             infos[i] = extract_tensor_info(tensors_list[i], keys[i]);
-            if (!infos[i].valid())
-                results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-
-        // 2. Prepare Buffers and Execute (GIL Released)
-        {
-            py::gil_scoped_release release_gil;
-
-            std::vector<std::string> valid_keys;
-            std::vector<void *> buffer_ptrs;
-            std::vector<size_t> buffer_sizes;
-            std::vector<size_t> original_indices;
-
-            std::vector<std::unique_ptr<BufferHandle>> temp_allocations;
-
-            for (size_t i = 0; i < infos.size(); ++i) {
-                if (!infos[i].valid()) continue;
-
-                size_t total_size =
-                    sizeof(TensorMetadata) + infos[i].tensor_size;
-                auto alloc_result =
-                    store_->client_buffer_allocator_->allocate(total_size);
-
-                if (!alloc_result) {
-                    LOG(ERROR)
-                        << "Failed to allocate buffer for key: " << keys[i];
-                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
-                    continue;
-                }
-
-                // Copy Metadata & Data
-                char *dst = static_cast<char *>(alloc_result->ptr());
-                memcpy(dst, &infos[i].metadata, sizeof(TensorMetadata));
-                if (infos[i].tensor_size > 0) {
-                    memcpy(dst + sizeof(TensorMetadata),
-                           reinterpret_cast<void *>(infos[i].data_ptr),
-                           infos[i].tensor_size);
-                }
-
-                valid_keys.push_back(keys[i]);
-                buffer_ptrs.push_back(alloc_result->ptr());
-                buffer_sizes.push_back(total_size);
-                original_indices.push_back(i);
-
-                temp_allocations.push_back(
-                    std::make_unique<BufferHandle>(std::move(*alloc_result)));
-            }
-
-            if (!valid_keys.empty()) {
-                ReplicateConfig write_config =
-                    MakeIndexedConfig(config, original_indices);
-                std::vector<int> op_results = store_->batch_upsert_from(
-                    valid_keys, buffer_ptrs, buffer_sizes, write_config);
-                for (size_t i = 0; i < op_results.size(); ++i) {
-                    results[original_indices[i]] = op_results[i];
-                }
-            }
-        }
-
-        return results;
+        return batch_upsert_tensor_infos_impl(keys, infos, config);
     }
 
     std::vector<int> batch_upsert_tensor(const std::vector<std::string> &keys,
