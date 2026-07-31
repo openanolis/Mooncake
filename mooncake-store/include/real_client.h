@@ -454,10 +454,28 @@ class RealClient : public PyClient {
         const UUID &client_id);
 
     std::vector<tl::expected<void, ErrorCode>>
+    batch_put_from_cuda_ipc_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<uint64_t> &dummy_metadata_buffers,
+        const std::vector<size_t> &metadata_sizes,
+        const std::vector<CudaIpcBufferHandle> &payloads,
+        const ReplicateConfig &config, int32_t device_id,
+        const UUID &client_id);
+
+    std::vector<tl::expected<void, ErrorCode>>
     batch_upsert_from_multi_buffers_dummy_helper(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config, int32_t device_id,
+        const UUID &client_id);
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_upsert_from_cuda_ipc_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<uint64_t> &dummy_metadata_buffers,
+        const std::vector<size_t> &metadata_sizes,
+        const std::vector<CudaIpcBufferHandle> &payloads,
         const ReplicateConfig &config, int32_t device_id,
         const UUID &client_id);
 
@@ -910,6 +928,22 @@ class RealClient : public PyClient {
         const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const std::vector<std::string> &keys, const UUID &client_id) const;
+
+    std::vector<tl::expected<void, ErrorCode>> batch_write_from_cuda_ipc_dummy(
+        const std::vector<std::string> &keys,
+        const std::vector<uint64_t> &dummy_metadata_buffers,
+        const std::vector<size_t> &metadata_sizes,
+        const std::vector<CudaIpcBufferHandle> &payloads,
+        const ReplicateConfig &config, int32_t device_id, const UUID &client_id,
+        bool upsert);
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_write_from_cuda_ipc_dummy_locked(
+        const ShmContext &context, const std::vector<std::string> &keys,
+        const std::vector<uint64_t> &dummy_metadata_buffers,
+        const std::vector<size_t> &metadata_sizes,
+        const std::vector<CudaIpcBufferHandle> &payloads,
+        const ReplicateConfig &config, const UUID &client_id, bool upsert);
 
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};

@@ -99,12 +99,26 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
+    std::vector<int> batch_put_from_cuda_ipc(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &metadata_buffers,
+        const std::vector<size_t> &metadata_sizes,
+        const std::vector<CudaIpcBufferHandle> &payloads,
+        const ReplicateConfig &config = ReplicateConfig{}) override;
+
     std::vector<int> batch_upsert_from_multi_buffers(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{}) override;
     std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
+
+    std::vector<int> batch_upsert_from_cuda_ipc(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &metadata_buffers,
+        const std::vector<size_t> &metadata_sizes,
+        const std::vector<CudaIpcBufferHandle> &payloads,
+        const ReplicateConfig &config = ReplicateConfig{}) override;
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys);

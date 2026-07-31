@@ -39,12 +39,78 @@ inline void apply_tensor_batch_results(
         results[original_indices[i]] = op_results[i];
 }
 
-template <typename StagedBatchWriteFn, typename DirectBatchWriteFn>
+inline size_t tensor_object_size(const PyTensorInfo &info) {
+    return info.metadata.header.data_offset + info.tensor_size;
+}
+
+template <typename CudaIpcBatchWriteFn>
+bool try_dummy_cuda_ipc_tensor_write(
+    const std::vector<std::string> &keys,
+    const std::vector<PyTensorInfo> &infos, const ReplicateConfig &config,
+    const char *operation_name, std::vector<int> &results,
+    std::vector<size_t> &original_indices,
+    CudaIpcBatchWriteFn &&cuda_ipc_batch_write) {
+    std::vector<std::string> valid_keys;
+    std::vector<void *> metadata_buffers;
+    std::vector<size_t> metadata_sizes;
+    std::vector<CudaIpcBufferHandle> payloads;
+    std::vector<std::unique_ptr<BufferHandle>> metadata_allocations;
+    valid_keys.reserve(infos.size());
+    metadata_buffers.reserve(infos.size());
+    metadata_sizes.reserve(infos.size());
+    payloads.reserve(infos.size());
+    metadata_allocations.reserve(infos.size());
+    original_indices.clear();
+
+    for (size_t i = 0; i < infos.size(); ++i) {
+        if (!infos[i].valid()) {
+            results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+        if (infos[i].tensor_size == 0) return false;
+
+        auto payload = mooncake::device::ExportCudaIpcBuffer(
+            reinterpret_cast<const void *>(infos[i].data_ptr),
+            infos[i].tensor_size);
+        if (!payload) return false;
+
+        auto metadata = store_->allocate_client_buffer(
+            infos[i].metadata.header.data_offset);
+        if (!metadata) {
+            results[i] = to_py_ret(ErrorCode::NO_AVAILABLE_HANDLE);
+            continue;
+        }
+        std::memcpy(metadata->ptr(), &infos[i].metadata,
+                    infos[i].metadata.header.data_offset);
+        valid_keys.push_back(keys[i]);
+        metadata_buffers.push_back(metadata->ptr());
+        metadata_sizes.push_back(infos[i].metadata.header.data_offset);
+        payloads.push_back(*payload);
+        original_indices.push_back(i);
+        metadata_allocations.push_back(
+            std::make_unique<BufferHandle>(std::move(*metadata)));
+    }
+
+    if (!valid_keys.empty()) {
+        ReplicateConfig write_config =
+            MakeIndexedConfig(config, original_indices);
+        auto op_results =
+            cuda_ipc_batch_write(valid_keys, metadata_buffers, metadata_sizes,
+                                 payloads, write_config);
+        apply_tensor_batch_results(results, original_indices, op_results,
+                                   operation_name);
+    }
+    return true;
+}
+
+template <typename StagedBatchWriteFn, typename DirectBatchWriteFn,
+          typename CudaIpcBatchWriteFn>
 std::vector<int> batch_write_tensor_impl(
     const std::vector<std::string> &keys,
     const std::vector<PyTensorInfo> &infos, const ReplicateConfig &config,
     const char *operation_name, StagedBatchWriteFn &&staged_batch_write,
-    DirectBatchWriteFn &&direct_batch_write) {
+    DirectBatchWriteFn &&direct_batch_write,
+    CudaIpcBatchWriteFn &&cuda_ipc_batch_write) {
     if (keys.size() != infos.size()) {
         LOG(ERROR) << operation_name
                    << ": keys and tensor infos must have the same length";
@@ -67,6 +133,12 @@ std::vector<int> batch_write_tensor_impl(
         original_indices.reserve(infos.size());
 
         if (use_dummy_client_) {
+            if (try_dummy_cuda_ipc_tensor_write(
+                    keys, infos, config, operation_name, results,
+                    original_indices, cuda_ipc_batch_write)) {
+                return results;
+            }
+
             auto runtime_accelerator =
                 mooncake::device::GetAcceleratorRegistry()
                     .RuntimeAccelerators();
@@ -83,9 +155,8 @@ std::vector<int> batch_write_tensor_impl(
                     continue;
                 }
 
-                size_t total_size =
-                    infos[i].metadata.header.data_offset + infos[i].tensor_size;
-                auto alloc_result = store_->allocate_client_buffer(total_size);
+                auto alloc_result = store_->allocate_client_buffer(
+                    tensor_object_size(infos[i]));
                 if (!alloc_result) {
                     LOG(ERROR) << "Failed to allocate buffer for "
                                << operation_name << " key: " << keys[i];
@@ -94,6 +165,7 @@ std::vector<int> batch_write_tensor_impl(
                 }
 
                 char *dst = static_cast<char *>(alloc_result->ptr());
+                size_t total_size = tensor_object_size(infos[i]);
                 std::memcpy(dst, &infos[i].metadata,
                             infos[i].metadata.header.data_offset);
                 if (infos[i].tensor_size > 0) {

@@ -15,6 +15,7 @@
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
 #include "device/accelerator_registry.h"
+#include "device/cuda_ipc_buffer.h"
 
 #include <cstdlib>  // for atexit
 #include <memory>
@@ -857,6 +858,15 @@ class MooncakeStorePyWrapper {
                    const ReplicateConfig &write_config) {
                 return real_client_->batch_put_from_multi_buffers(
                     write_keys, buffers, sizes, write_config);
+            },
+            [this](const std::vector<std::string> &write_keys,
+                   const std::vector<void *> &metadata_buffers,
+                   const std::vector<size_t> &metadata_sizes,
+                   const std::vector<CudaIpcBufferHandle> &payloads,
+                   const ReplicateConfig &write_config) {
+                return store_->batch_put_from_cuda_ipc(
+                    write_keys, metadata_buffers, metadata_sizes, payloads,
+                    write_config);
             });
     }
 
@@ -879,6 +889,15 @@ class MooncakeStorePyWrapper {
                    const ReplicateConfig &write_config) {
                 return store_->batch_upsert_from_multi_buffers(
                     write_keys, buffers, sizes, write_config);
+            },
+            [this](const std::vector<std::string> &write_keys,
+                   const std::vector<void *> &metadata_buffers,
+                   const std::vector<size_t> &metadata_sizes,
+                   const std::vector<CudaIpcBufferHandle> &payloads,
+                   const ReplicateConfig &write_config) {
+                return store_->batch_upsert_from_cuda_ipc(
+                    write_keys, metadata_buffers, metadata_sizes, payloads,
+                    write_config);
             });
     }
 

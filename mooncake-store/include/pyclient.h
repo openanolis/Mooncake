@@ -16,6 +16,7 @@
 #include "mutex.h"
 #include "utils.h"
 #include "file_storage.h"
+#include "device/cuda_ipc_buffer_handle.h"
 
 namespace mooncake {
 
@@ -294,6 +295,15 @@ class PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
+    virtual std::vector<int> batch_put_from_cuda_ipc(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &metadata_buffers,
+        const std::vector<size_t> &metadata_sizes,
+        const std::vector<CudaIpcBufferHandle> &payloads,
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
+
     virtual std::shared_ptr<BufferHandle> get_buffer(
         const std::string &key) = 0;
 
@@ -326,6 +336,15 @@ class PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual std::vector<int> batch_upsert_from_cuda_ipc(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &metadata_buffers,
+        const std::vector<size_t> &metadata_sizes,
+        const std::vector<CudaIpcBufferHandle> &payloads,
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
 
     virtual int upsert_parts(
         const std::string &key, std::vector<std::span<const char>> values,

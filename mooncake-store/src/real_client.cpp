@@ -33,6 +33,7 @@
 #include "device/accelerator_registry.h"
 #include "default_config.h"
 #include "uds_transport.h"
+#include "device/cuda_ipc_buffer.h"
 #include "shm_helper.h"
 #include "memory_location.h"
 #ifdef USE_NOF
@@ -4624,6 +4625,110 @@ RealClient::batch_upsert_from_multi_buffers_dummy_helper(
 
     return batch_upsert_from_multi_buffers_internal(
         keys, real_buffers_result.value(), all_sizes, config);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_put_from_cuda_ipc_dummy_helper(
+    const std::vector<std::string> &keys,
+    const std::vector<uint64_t> &dummy_metadata_buffers,
+    const std::vector<size_t> &metadata_sizes,
+    const std::vector<CudaIpcBufferHandle> &payloads,
+    const ReplicateConfig &config, int32_t device_id, const UUID &client_id) {
+    return batch_write_from_cuda_ipc_dummy(keys, dummy_metadata_buffers,
+                                           metadata_sizes, payloads, config,
+                                           device_id, client_id, false);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_upsert_from_cuda_ipc_dummy_helper(
+    const std::vector<std::string> &keys,
+    const std::vector<uint64_t> &dummy_metadata_buffers,
+    const std::vector<size_t> &metadata_sizes,
+    const std::vector<CudaIpcBufferHandle> &payloads,
+    const ReplicateConfig &config, int32_t device_id, const UUID &client_id) {
+    return batch_write_from_cuda_ipc_dummy(keys, dummy_metadata_buffers,
+                                           metadata_sizes, payloads, config,
+                                           device_id, client_id, true);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_write_from_cuda_ipc_dummy(
+    const std::vector<std::string> &keys,
+    const std::vector<uint64_t> &dummy_metadata_buffers,
+    const std::vector<size_t> &metadata_sizes,
+    const std::vector<CudaIpcBufferHandle> &payloads,
+    const ReplicateConfig &config, int32_t device_id, const UUID &client_id,
+    bool upsert) {
+#ifdef USE_ASCEND_DIRECT
+    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
+            device_id)) {
+        LOG(ERROR) << "Failed to set context for physical device " << device_id;
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+#endif
+
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    return batch_write_from_cuda_ipc_dummy_locked(
+        it->second, keys, dummy_metadata_buffers, metadata_sizes, payloads,
+        config, client_id, upsert);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_write_from_cuda_ipc_dummy_locked(
+    const ShmContext &context, const std::vector<std::string> &keys,
+    const std::vector<uint64_t> &dummy_metadata_buffers,
+    const std::vector<size_t> &metadata_sizes,
+    const std::vector<CudaIpcBufferHandle> &payloads,
+    const ReplicateConfig &config, const UUID &client_id, bool upsert) {
+    if (keys.size() != dummy_metadata_buffers.size() ||
+        keys.size() != metadata_sizes.size() ||
+        keys.size() != payloads.size()) {
+        LOG(ERROR) << "Invalid cuda ipc tensor write batch sizes";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    auto metadata_result = map_dummy_addrs_to_real_ptrs(
+        context, dummy_metadata_buffers, metadata_sizes, client_id);
+    if (!metadata_result) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(metadata_result.error()));
+    }
+
+    std::vector<device::CudaIpcBufferMapping> payload_mappings;
+    std::vector<std::vector<void *>> all_buffers;
+    std::vector<std::vector<size_t>> all_sizes;
+    payload_mappings.reserve(keys.size());
+    all_buffers.reserve(keys.size());
+    all_sizes.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto mapping = device::CudaIpcBufferMapping::Open(payloads[i]);
+        if (!mapping) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(mapping.error()));
+        }
+        void *payload_ptr = mapping->ptr();
+        payload_mappings.push_back(std::move(*mapping));
+        all_buffers.push_back({metadata_result->at(i), payload_ptr});
+        all_sizes.push_back(
+            {metadata_sizes[i], static_cast<size_t>(payloads[i].size)});
+    }
+
+    if (upsert) {
+        return batch_upsert_from_multi_buffers_internal(keys, all_buffers,
+                                                        all_sizes, config);
+    }
+    return batch_put_from_multi_buffers_internal(keys, all_buffers, all_sizes,
+                                                 config);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
