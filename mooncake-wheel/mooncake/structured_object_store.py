@@ -24,6 +24,15 @@ try:
 except Exception:  # pragma: no cover
     _concat_arrays_into = None
 
+try:
+    from mooncake._fast_copy import (
+        export_arrow_u8 as _export_arrow_u8,
+        pillow_arrow_view as _pillow_arrow_view,
+    )
+except Exception:  # pragma: no cover
+    _export_arrow_u8 = None
+    _pillow_arrow_view = None
+
 DEFAULT_BUNDLE_CHUNK_BYTES = 64 * 1024**2
 AUTO_PARALLEL_MIN_BYTES = DEFAULT_BUNDLE_CHUNK_BYTES
 AUTO_PARALLEL_MIN_CHUNKS = 8
@@ -3074,7 +3083,7 @@ def _validate_pil_state_tree(value: Any) -> None:
             )
 
 
-def _encode_pil_image(value: Any) -> tuple[bytes, bytes]:
+def _encode_pil_image(value: Any) -> tuple[bytes | memoryview, bytes]:
     frame_count = int(getattr(value, "n_frames", 1))
     if frame_count != 1:
         raise ValueError(
@@ -3114,8 +3123,20 @@ def _encode_pil_image(value: Any) -> tuple[bytes, bytes]:
             )
         ):
             raise ValueError("invalid PIL image palette")
+    pixels = None
+    storage = None
+    if value.mode == "RGB" and _pillow_arrow_view is not None:
+        try:
+            pixels = memoryview(_pillow_arrow_view(value))
+        except (AttributeError, NotImplementedError, ValueError):
+            pass
+        else:
+            if len(pixels) == width * height * 4:
+                storage = "RGBX"
+            else:
+                pixels = None
     state = [
-        1,
+        2 if storage is not None else 1,
         value.mode,
         int(width),
         int(height),
@@ -3123,6 +3144,8 @@ def _encode_pil_image(value: Any) -> tuple[bytes, bytes]:
         palette,
         dict(value.info),
     ]
+    if storage is not None:
+        state.append(storage)
     _validate_pil_state_tree(state)
     state_bytes = _msgpack.packb(
         state,
@@ -3132,7 +3155,7 @@ def _encode_pil_image(value: Any) -> tuple[bytes, bytes]:
     )
     if len(state_bytes) > _PIL_MEDIA_STATE_MAX_BYTES:
         raise ValueError(f"PIL image state is too large: {len(state_bytes)} bytes")
-    return value.tobytes(), state_bytes
+    return (pixels if pixels is not None else value.tobytes()), state_bytes
 
 
 def _value_to_media_parts(
@@ -3206,6 +3229,16 @@ def _multi_buffer_bytes_payload(
     return _MultiBufferPayload(buffers, tuple(parts))
 
 
+class _ArrowU8Provider:
+    def __init__(self, data: Any) -> None:
+        self._data = data
+
+    def __arrow_c_array__(self, requested_schema: Any = None) -> Any:
+        if _export_arrow_u8 is None:
+            raise NotImplementedError("Pillow Arrow support is unavailable")
+        return _export_arrow_u8(self._data, requested_schema)
+
+
 def _decode_pil_image(data: Any, state_bytes: Any) -> Any:
     try:
         if len(state_bytes) > _PIL_MEDIA_STATE_MAX_BYTES:
@@ -3229,11 +3262,13 @@ def _decode_pil_image(data: Any, state_bytes: Any) -> Any:
         _msgpack.UnpackException,
     ) as exc:
         raise ValueError("invalid PIL image state") from exc
-    if not isinstance(state, list) or len(state) != 7 or type(state[0]) is not int:
+    if not isinstance(state, list) or len(state) not in {7, 8}:
         raise ValueError("unsupported PIL image state")
-    if state[0] != 1:
+    version = state[0]
+    if type(version) is not int or version not in {1, 2} or len(state) != version + 6:
         raise ValueError("unsupported PIL image state")
-    _, mode, width, height, image_format, palette, info = state
+    _, mode, width, height, image_format, palette, info, *storage_state = state
+    storage = storage_state[0] if storage_state else None
     if not isinstance(mode, str) or (
         image_format is not None and not isinstance(image_format, str)
     ):
@@ -3251,7 +3286,13 @@ def _decode_pil_image(data: Any, state_bytes: Any) -> Any:
     ):
         raise ValueError("invalid PIL image mode, format, or dimensions")
     pixels = data
-    expected_pixel_bytes = _pil_pixel_bytes(mode, width, height)
+    if storage not in {None, "RGBX"} or (storage == "RGBX" and mode != "RGB"):
+        raise ValueError("invalid PIL image storage")
+    expected_pixel_bytes = (
+        width * height * 4
+        if storage == "RGBX"
+        else _pil_pixel_bytes(mode, width, height)
+    )
     if len(pixels) != expected_pixel_bytes:
         raise ValueError(
             f"invalid PIL image pixel length: {len(pixels)}, "
@@ -3261,7 +3302,16 @@ def _decode_pil_image(data: Any, state_bytes: Any) -> Any:
         from PIL import Image
     except ImportError as exc:
         raise ImportError("Pillow is required to decode PIL image payloads") from exc
-    image = Image.frombuffer(mode, (width, height), pixels, "raw", mode, 0, 1)
+    if storage == "RGBX":
+        image = (
+            Image.fromarrow(_ArrowU8Provider(pixels), mode, (width, height))
+            if _export_arrow_u8 is not None
+            else Image.frombytes(
+                mode, (width, height), pixels, "raw", "RGBX", 0, 1
+            )
+        )
+    else:
+        image = Image.frombuffer(mode, (width, height), pixels, "raw", mode, 0, 1)
     if palette is not None:
         valid_palette = isinstance(palette, list) and len(palette) == 2
         palette_mode = palette[0] if valid_palette else None

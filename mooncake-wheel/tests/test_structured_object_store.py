@@ -2152,6 +2152,75 @@ def test_pil_codec_rejects_unsupported_state_and_framing() -> None:
         sos._media_framed({"media_framing": "pil_v3"})
 
 
+def test_pil_rgb_arrow_path_avoids_tobytes(monkeypatch) -> None:
+    Image = pytest.importorskip("PIL.Image")
+    if sos._pillow_arrow_view is None:
+        pytest.skip("Pillow Arrow fast path is unavailable")
+    image = Image.new("RGB", (5, 3), (1, 2, 3))
+    monkeypatch.setattr(image, "tobytes", lambda: pytest.fail("tobytes called"))
+
+    pixels, state = sos._encode_pil_image(image)
+    actual = sos._decode_pil_image(pixels, state)
+
+    assert actual.getpixel((0, 0)) == (1, 2, 3)
+
+
+def test_pil_rgb_arrow_path_falls_back_to_packed_rgb(monkeypatch) -> None:
+    Image = pytest.importorskip("PIL.Image")
+    image = Image.new("RGB", (5, 3), (1, 2, 3))
+    monkeypatch.setattr(
+        sos, "_pillow_arrow_view", lambda _image: (_ for _ in ()).throw(ValueError())
+    )
+
+    pixels, state = sos._encode_pil_image(image)
+    actual = sos._decode_pil_image(pixels, state)
+
+    assert len(pixels) == 5 * 3 * 3
+    assert actual.getpixel((0, 0)) == (1, 2, 3)
+
+
+def test_pil_rgb_arrow_path_falls_back_without_arrow_decoder(monkeypatch) -> None:
+    Image = pytest.importorskip("PIL.Image")
+    if sos._pillow_arrow_view is None:
+        pytest.skip("Pillow Arrow fast path is unavailable")
+    image = Image.new("RGB", (5, 3), (1, 2, 3))
+    pixels, state = sos._encode_pil_image(image)
+    monkeypatch.setattr(sos, "_export_arrow_u8", None)
+
+    actual = sos._decode_pil_image(pixels, state)
+
+    assert actual.mode == "RGB"
+    assert actual.getpixel((0, 0)) == (1, 2, 3)
+
+
+def test_pil_rgb_arrow_path_releases_buffer_pool_once(monkeypatch) -> None:
+    Image = pytest.importorskip("PIL.Image")
+    if sos._pillow_arrow_view is None:
+        pytest.skip("Pillow Arrow fast path is unavailable")
+    image = Image.new("RGB", (5, 3), (1, 2, 3))
+    monkeypatch.setattr(image, "tobytes", lambda: pytest.fail("tobytes called"))
+    pool = FakeBufferPool()
+    _store, transfer = make_transfer(buffer_pool=pool)
+    ref = transfer.put(
+        {"image": [image]},
+        type="dict",
+        field_schemas={
+            "image": FieldSchema(
+                codec="media_bytes", metadata={"section": "non_tensor_batch"}
+            )
+        },
+    )
+
+    result = transfer.get(ref, type="dict")
+    actual = result["image"][0]
+    assert actual.getpixel((0, 0)) == (1, 2, 3)
+    del result
+    gc.collect()
+    assert pool.release_count < pool.acquire_count
+    MooncakeBundleTransfer.release_result(actual)
+    assert pool.release_count == pool.acquire_count
+
+
 def test_release_result_recurses_into_ragged_row_views() -> None:
     class FakeOwner:
         def __init__(self) -> None:
