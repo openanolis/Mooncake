@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -150,6 +151,9 @@ class WorkerPool {
         collective_slice_queue_;
     std::vector<std::unordered_map<std::string, SliceList>> worker_slice_queue_;
     std::vector<std::mutex> worker_slice_queue_lock_;
+    // Number of slices queued for each worker but not yet moved to its
+    // worker-owned collective queue.
+    std::unique_ptr<std::atomic<uint64_t>[]> queued_slice_count_;
 
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
     std::atomic<uint64_t> recovery_activate_after_ns_{0};

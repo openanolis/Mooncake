@@ -243,12 +243,16 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
       redispatch_counter_(0),
       worker_slice_queue_(worker_count_),
       worker_slice_queue_lock_(worker_count_),
+      queued_slice_count_(
+          std::make_unique<std::atomic<uint64_t>[]>(worker_count_)),
       submitted_slice_count_(0),
       processed_slice_count_(0) {
     collective_slice_queue_.resize(worker_count_);
-    for (int i = 0; i < worker_count_; ++i)
+    for (int i = 0; i < worker_count_; ++i) {
+        queued_slice_count_[i].store(0, std::memory_order_relaxed);
         worker_thread_.emplace_back(
             std::thread(std::bind(&WorkerPool::transferWorker, this, i)));
+    }
     worker_thread_.emplace_back(
         std::thread(std::bind(&WorkerPool::monitorWorker, this)));
 }
@@ -276,6 +280,7 @@ void WorkerPool::enqueueSliceToOwner(Transport::Slice *slice) {
         worker_slice_queue_[owner_thread][slice->peer_nic_path].push_back(
             slice);
     }
+    queued_slice_count_[owner_thread].fetch_add(1, std::memory_order_release);
 }
 
 WorkerPool::~WorkerPool() {
@@ -452,6 +457,8 @@ void WorkerPool::enqueuePreparedSlices(const SliceList &slice_list,
             queue.insert(queue.end(), slice_list.begin() + begin,
                          slice_list.begin() + end);
         }
+        queued_slice_count_[owner_thread].fetch_add(end - begin,
+                                                    std::memory_order_release);
         begin = end;
     }
 
@@ -567,13 +574,19 @@ void WorkerPool::performPostSend(int thread_id) {
     auto &local_slice_queue = collective_slice_queue_[thread_id];
     {
         std::lock_guard<std::mutex> lock(worker_slice_queue_lock_[thread_id]);
+        uint64_t queued_slice_count = 0;
         for (auto &entry : worker_slice_queue_[thread_id]) {
             if (entry.second.empty()) continue;
+            queued_slice_count += entry.second.size();
             auto &local_entry = local_slice_queue[entry.first];
             local_entry.insert(local_entry.end(), entry.second.begin(),
                                entry.second.end());
         }
         worker_slice_queue_[thread_id].clear();
+        if (queued_slice_count != 0) {
+            queued_slice_count_[thread_id].fetch_sub(queued_slice_count,
+                                                     std::memory_order_acq_rel);
+        }
     }
 
     // If this local RNIC is inactive/unhealthy, the remote rail is not the
@@ -1192,20 +1205,26 @@ void WorkerPool::transferWorker(int thread_id) {
             : nullptr;
     uint64_t last_wait_ts = getWorkerClockInNano();
     uint32_t idle_clock_check_count = 0;
+    const auto hasQueuedSlices = [&]() {
+        if (queued_slice_count_[thread_id].load(std::memory_order_acquire) >
+            0) {
+            return true;
+        }
+        for (const auto &entry : collective_slice_queue_[thread_id]) {
+            if (!entry.second.empty()) return true;
+        }
+        return false;
+    };
     while (workers_running_.load(std::memory_order_relaxed)) {
-        auto processed_slice_count =
-            processed_slice_count_.load(std::memory_order_relaxed);
-        auto submitted_slice_count =
-            submitted_slice_count_.load(std::memory_order_relaxed);
+        const bool has_queued_slices = hasQueuedSlices();
         const bool has_outstanding_cq =
             cq_outstanding &&
             cq_outstanding->load(std::memory_order_relaxed) > 0;
-        if (processed_slice_count == submitted_slice_count &&
-            !has_outstanding_cq) {
+        if (!has_queued_slices && !has_outstanding_cq) {
             // Keep the short idle spin for latency, but sample the clock only
-            // periodically. The submitted/processed atomics still detect new
-            // work on every iteration, so this only changes when parking
-            // begins after a long idle period.
+            // periodically. The per-worker queued count detects new work on
+            // every iteration, so this only changes when parking begins after
+            // a long idle period.
             if (++idle_clock_check_count < kIdleClockCheckInterval) continue;
             idle_clock_check_count = 0;
             uint64_t curr_wait_ts = getWorkerClockInNano();
@@ -1215,8 +1234,7 @@ void WorkerPool::transferWorker(int thread_id) {
                 // Double-check condition after acquiring lock to avoid lost
                 // wakeup. parked_worker_count_ is set before this check so
                 // producers that submit after it will notify this worker.
-                if (processed_slice_count_.load(std::memory_order_relaxed) ==
-                        submitted_slice_count_.load() &&
+                if (!hasQueuedSlices() &&
                     !(cq_outstanding &&
                       cq_outstanding->load(std::memory_order_relaxed) > 0)) {
                     cond_var_.wait_for(lock, std::chrono::seconds(1));
