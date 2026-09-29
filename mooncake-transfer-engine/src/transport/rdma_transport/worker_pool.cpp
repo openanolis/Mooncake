@@ -245,11 +245,14 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
       worker_slice_queue_lock_(worker_count_),
       queued_slice_count_(
           std::make_unique<std::atomic<uint64_t>[]>(worker_count_)),
+      collective_slice_pending_(
+          std::make_unique<std::atomic<bool>[]>(worker_count_)),
       submitted_slice_count_(0),
       processed_slice_count_(0) {
     collective_slice_queue_.resize(worker_count_);
     for (int i = 0; i < worker_count_; ++i) {
         queued_slice_count_[i].store(0, std::memory_order_relaxed);
+        collective_slice_pending_[i].store(false, std::memory_order_relaxed);
         worker_thread_.emplace_back(
             std::thread(std::bind(&WorkerPool::transferWorker, this, i)));
     }
@@ -572,6 +575,17 @@ void WorkerPool::untrackPostedSlices(
 
 void WorkerPool::performPostSend(int thread_id) {
     auto &local_slice_queue = collective_slice_queue_[thread_id];
+    const auto refresh_collective_pending = [&]() {
+        bool pending = false;
+        for (const auto &entry : local_slice_queue) {
+            if (!entry.second.empty()) {
+                pending = true;
+                break;
+            }
+        }
+        collective_slice_pending_[thread_id].store(
+            pending, std::memory_order_release);
+    };
     {
         std::lock_guard<std::mutex> lock(worker_slice_queue_lock_[thread_id]);
         uint64_t queued_slice_count = 0;
@@ -586,6 +600,8 @@ void WorkerPool::performPostSend(int thread_id) {
         if (queued_slice_count != 0) {
             queued_slice_count_[thread_id].fetch_sub(queued_slice_count,
                                                      std::memory_order_acq_rel);
+            collective_slice_pending_[thread_id].store(
+                true, std::memory_order_release);
         }
     }
 
@@ -595,8 +611,11 @@ void WorkerPool::performPostSend(int thread_id) {
     if (!context_.active()) {
         auto local_slice_queue_clone = local_slice_queue;
         local_slice_queue.clear();
+        collective_slice_pending_[thread_id].store(
+            false, std::memory_order_release);
         for (auto &entry : local_slice_queue_clone)
             redispatch(entry.second, thread_id, true);
+        refresh_collective_pending();
         return;
     }
 
@@ -608,9 +627,12 @@ void WorkerPool::performPostSend(int thread_id) {
             redispatch_counter_.load(std::memory_order_relaxed);
         auto local_slice_queue_clone = local_slice_queue;
         local_slice_queue.clear();
+        collective_slice_pending_[thread_id].store(
+            false, std::memory_order_release);
         bool handoff_to_local_worker = !context_.active();
         for (auto &entry : local_slice_queue_clone)
             redispatch(entry.second, thread_id, handoff_to_local_worker);
+        refresh_collective_pending();
         return;
     }
 
@@ -770,6 +792,7 @@ void WorkerPool::performPostSend(int thread_id) {
         if (!local_retry_list.empty())
             redispatch(local_retry_list, thread_id, true);
     }
+    refresh_collective_pending();
 }
 
 int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch,
@@ -1102,6 +1125,8 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             if (owner_thread == thread_id && !defer_local_redispatch) {
                 collective_slice_queue_[thread_id][peer_nic_path].push_back(
                     slice);
+                collective_slice_pending_[thread_id].store(
+                    true, std::memory_order_release);
             } else {
                 enqueueSliceToOwner(slice);
                 shared_redispatch_count++;
@@ -1206,14 +1231,10 @@ void WorkerPool::transferWorker(int thread_id) {
     uint64_t last_wait_ts = getWorkerClockInNano();
     uint32_t idle_clock_check_count = 0;
     const auto hasQueuedSlices = [&]() {
-        if (queued_slice_count_[thread_id].load(std::memory_order_acquire) >
-            0) {
-            return true;
-        }
-        for (const auto &entry : collective_slice_queue_[thread_id]) {
-            if (!entry.second.empty()) return true;
-        }
-        return false;
+        return queued_slice_count_[thread_id].load(
+                   std::memory_order_acquire) > 0 ||
+               collective_slice_pending_[thread_id].load(
+                   std::memory_order_acquire);
     };
     while (workers_running_.load(std::memory_order_relaxed)) {
         const bool has_queued_slices = hasQueuedSlices();

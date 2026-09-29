@@ -154,6 +154,9 @@ class WorkerPool {
     // Number of slices queued for each worker but not yet moved to its
     // worker-owned collective queue.
     std::unique_ptr<std::atomic<uint64_t>[]> queued_slice_count_;
+    // Whether a worker-owned collective queue currently contains slices.
+    // This avoids scanning the per-peer unordered_map in the worker hot path.
+    std::unique_ptr<std::atomic<bool>[]> collective_slice_pending_;
 
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
     std::atomic<uint64_t> recovery_activate_after_ns_{0};
