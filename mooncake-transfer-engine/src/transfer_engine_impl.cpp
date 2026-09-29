@@ -16,10 +16,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <cmath>
+#include <numeric>
 #include <string>
+#include <thread>
 #include <sys/resource.h>
 #include <unistd.h>
 #ifdef WITH_METRICS
@@ -29,7 +33,10 @@
 
 #include "transfer_metadata_plugin.h"
 #include "common.h"
+#include "ib_link_speed.h"
 #include "transport/transport.h"
+#include "transport/rdma_transport/rdma_context.h"
+#include "transport/rdma_transport/rdma_transport.h"
 #include "transport/rdma_twosided/rdma_twosided_transport.h"
 #include "transport/shm_transport/shm_transport.h"
 #ifdef USE_BAREX
@@ -39,6 +46,205 @@
 namespace mooncake {
 
 namespace {
+
+constexpr uint8_t kTransferCommandVersion = 1;
+constexpr uint8_t kScatterGatherCommand = 1;
+constexpr uint8_t kScatterGatherRelativeCommand = 2;
+constexpr uint8_t kScatterRelative32Encoding = 1;
+constexpr uint8_t kScatterRelative32FixedLengthEncoding = 2;
+constexpr uint8_t kScatterRelative32FixedLengthRemoteEncoding = 3;
+constexpr uint32_t kMaxScatterSpans = 131072;
+constexpr uint64_t kMaxScatterBytes = 512ULL << 20;
+constexpr uint32_t kMaxScatterChunkBytes = 16U << 20;
+constexpr size_t kScatterCommandHeaderBytes =
+    3 * sizeof(uint8_t) + 2 * sizeof(uint16_t) + 2 * sizeof(uint32_t) +
+    2 * sizeof(uint64_t);
+constexpr size_t kScatterRelativeHeaderBytes =
+    sizeof(uint8_t) + sizeof(uint32_t) + 2 * sizeof(uint64_t);
+constexpr double kScatterRttSeconds = 10e-6;
+constexpr double kScatterControlSeconds = 120e-6;
+// The direct-scatter path is dominated by WQE/CQ handling on ERDMA. The
+// measured rate for the 264-byte Engram workload is about 1M requests/s;
+// using the old 3M optimistic estimate kept the planner on direct scatter for
+// 384-row lookups even though the gather path was already faster.
+constexpr double kScatterPostRate = 1.0e6;
+constexpr double kScatterCopyRate = 30.0e6;
+constexpr double kScatterCopyBandwidth = 20.0e9;
+constexpr double kScatterSafetyMargin = 1.10;
+constexpr double kScatterChunkAmortizationSeconds = 250e-6;
+constexpr size_t kScatterChunkAlignment = 64ULL << 10;
+
+class ScatterLaneWorkers {
+   public:
+    ScatterLaneWorkers() {
+        workers_.reserve(7);
+        for (size_t lane = 1; lane <= 7; ++lane) {
+            try {
+                workers_.emplace_back([this, lane] { workerLoop(lane); });
+            } catch (...) {
+                // The command path falls back to temporary workers when the
+                // persistent helpers cannot all be created.
+                break;
+            }
+        }
+    }
+
+    ~ScatterLaneWorkers() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        ready_.notify_all();
+        for (auto& worker : workers_) worker.join();
+    }
+
+    template <typename Function>
+    bool run(size_t worker_count, Function& function) {
+        if (worker_count == 0 || worker_count > workers_.size()) return false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            DCHECK_EQ(callback_, nullptr);
+            callback_ = [](void* context, size_t lane) {
+                (*static_cast<Function*>(context))(lane);
+            };
+            context_ = &function;
+            active_workers_ = worker_count;
+            remaining_workers_ = worker_count;
+            worker_exception_ = nullptr;
+            ++generation_;
+        }
+        ready_.notify_all();
+
+        std::exception_ptr caller_exception;
+        try {
+            function(0);
+        } catch (...) {
+            caller_exception = std::current_exception();
+        }
+
+        std::exception_ptr worker_exception;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            completed_.wait(lock, [this] { return remaining_workers_ == 0; });
+            worker_exception = worker_exception_;
+            callback_ = nullptr;
+            context_ = nullptr;
+        }
+        if (caller_exception) std::rethrow_exception(caller_exception);
+        if (worker_exception) std::rethrow_exception(worker_exception);
+        return true;
+    }
+
+   private:
+    using Callback = void (*)(void*, size_t);
+
+    void workerLoop(size_t lane) {
+        uint64_t seen_generation = 0;
+        while (true) {
+            Callback callback = nullptr;
+            void* context = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                ready_.wait(lock, [this, &seen_generation] {
+                    return stopping_ || generation_ != seen_generation;
+                });
+                if (stopping_) return;
+                seen_generation = generation_;
+                if (lane > active_workers_) continue;
+                callback = callback_;
+                context = context_;
+            }
+
+            try {
+                callback(context, lane);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!worker_exception_)
+                    worker_exception_ = std::current_exception();
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (--remaining_workers_ == 0) completed_.notify_one();
+            }
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::condition_variable completed_;
+    std::vector<std::thread> workers_;
+    Callback callback_ = nullptr;
+    void* context_ = nullptr;
+    std::exception_ptr worker_exception_;
+    uint64_t generation_ = 0;
+    size_t active_workers_ = 0;
+    size_t remaining_workers_ = 0;
+    bool stopping_ = false;
+};
+
+ScatterLaneWorkers& scatterLaneWorkers() {
+    thread_local ScatterLaneWorkers workers;
+    return workers;
+}
+
+template <typename T>
+void appendUnsigned(std::string& output, T value) {
+    for (size_t i = 0; i < sizeof(T); ++i)
+        output.push_back(static_cast<char>(value >> (i * 8)));
+}
+
+template <typename T>
+void writeUnsigned(char*& output, T value) {
+    for (size_t i = 0; i < sizeof(T); ++i)
+        *output++ = static_cast<char>(value >> (i * 8));
+}
+
+template <typename T>
+bool readUnsigned(std::string_view input, size_t& offset, T& value) {
+    if (input.size() - std::min(input.size(), offset) < sizeof(T)) return false;
+    value = 0;
+    for (size_t i = 0; i < sizeof(T); ++i) {
+        value |= static_cast<T>(static_cast<unsigned char>(input[offset + i]))
+                 << (i * 8);
+    }
+    offset += sizeof(T);
+    return true;
+}
+
+template <typename T>
+T loadUnsigned(const char* input) {
+    T value = 0;
+    for (size_t i = 0; i < sizeof(T); ++i) {
+        value |= static_cast<T>(static_cast<unsigned char>(input[i]))
+                 << (i * 8);
+    }
+    return value;
+}
+
+void appendVarint(std::string& output, uint64_t value) {
+    while (value >= 0x80) {
+        output.push_back(static_cast<char>((value & 0x7f) | 0x80));
+        value >>= 7;
+    }
+    output.push_back(static_cast<char>(value));
+}
+
+bool readVarint(std::string_view input, size_t& offset, uint64_t& value) {
+    value = 0;
+    for (unsigned shift = 0; shift < 64 && offset < input.size(); shift += 7) {
+        const auto byte = static_cast<unsigned char>(input[offset++]);
+        value |= static_cast<uint64_t>(byte & 0x7f) << shift;
+        if ((byte & 0x80) == 0) return true;
+    }
+    return false;
+}
+
+bool hostAccessibleLocation(const std::string& location) {
+    return location == kWildcardLocation || location == "cpu" ||
+           location.rfind("cpu:", 0) == 0 ||
+           location.rfind(kSegmentsLocationPrefix, 0) == 0;
+}
+
 bool overlapWithRegion(uintptr_t addr, uint64_t length, void* region_addr,
                        uint64_t region_length) {
     return overlap(reinterpret_cast<void*>(addr), length, region_addr,
@@ -221,6 +427,11 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
               << "";
 
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
+    metadata_->registerOnCommandCallBack([this](const std::string& peer,
+                                                const std::string& request,
+                                                std::string& response) {
+        return handleTransferCommand(peer, request, response);
+    });
 #ifdef USE_ASCEND
     std::string mutable_server_name =
         local_server_name_ + ":npu_" + std::to_string(devicePhyId);
@@ -512,10 +723,1018 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
 int TransferEngineImpl::freeEngine() {
     if (metadata_) {
+        metadata_->registerOnCommandCallBack({});
+        setScatterStagingAllocator({});
         metadata_->removeRpcMetaEntry(local_server_name_);
         metadata_.reset();
     }
     return 0;
+}
+
+void TransferEngineImpl::setScatterStagingAllocator(
+    TransferEngine::ScatterStagingAllocator allocator) {
+    std::unique_lock<std::mutex> lock(scatter_staging_mutex_);
+    scatter_staging_allocator_ = std::move(allocator);
+    if (!scatter_staging_allocator_) {
+        scatter_staging_cv_.wait(
+            lock, [this] { return active_scatter_commands_ == 0; });
+    }
+}
+
+bool TransferEngineImpl::supportsTransferCommand(
+    const std::string& peer_server_name) {
+    if (!metadata_) return false;
+    if (metadata_->supportsCommand(peer_server_name)) return true;
+    // In P2P mode the RPC descriptor is synthesized from peer_server_name and
+    // intentionally has no command capability until a control-plane exchange
+    // occurs. Probe once on demand so the planner can choose active gather on
+    // the first scatter request instead of falling back to direct RDMA for the
+    // first request and only becoming eligible after endpoint setup.
+    if (!metadata_->isP2PHandshakeMode()) return false;
+    if (metadata_->sendProbe(peer_server_name) != 0) return false;
+    return metadata_->supportsCommand(peer_server_name);
+}
+
+bool TransferEngineImpl::canUseRemoteScatterPlan(
+    const std::string& peer_server_name, uint64_t plan_address,
+    size_t plan_bytes) {
+    if (!metadata_ ||
+        !metadata_->supportsRemoteCommandPayload(peer_server_name) ||
+        plan_bytes == 0)
+        return false;
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto next = local_memory_regions_.upper_bound(plan_address);
+    if (next == local_memory_regions_.begin()) return false;
+    const auto& region = std::prev(next)->second;
+    const auto begin = reinterpret_cast<uintptr_t>(region.addr);
+    return plan_address >= begin && plan_bytes <= region.length &&
+           plan_address - begin <= region.length - plan_bytes &&
+           region.remote_accessible && hostAccessibleLocation(region.location);
+}
+
+std::unique_ptr<PreparedHandshakeCommand>
+TransferEngineImpl::prepareScatterCommand(
+    const std::string& peer_server_name) const {
+    return metadata_ ? metadata_->prepareCommand(peer_server_name) : nullptr;
+}
+
+size_t TransferEngineImpl::scatterCommandSpanBudget(
+    const std::string& peer_server_name) {
+    if (!metadata_) return 0;
+    if (!supportsTransferCommand(peer_server_name)) return 0;
+    TransferMetadata::RpcMetaDesc peer;
+    if (metadata_->getRpcMetaEntry(peer_server_name, peer) != 0 ||
+        peer.command_capability.empty())
+        return 0;
+
+    size_t remaining = kMaxTransferCommandLength;
+    const auto consume = [&remaining](size_t bytes) {
+        if (bytes > remaining) return false;
+        remaining -= bytes;
+        return true;
+    };
+    const auto& source_ip = metadata_->localRpcMeta().ip_or_host_name;
+    if (!consume(sizeof(uint8_t)) || !consume(peer.command_capability.size()) ||
+        !consume(kScatterCommandHeaderBytes + kScatterRelativeHeaderBytes) ||
+        !consume(local_server_name_.size()) || !consume(source_ip.size()))
+        return 0;
+    return remaining;
+}
+
+TransferEngineImpl::ScatterTransportProfile
+TransferEngineImpl::scatterTransportProfile() const {
+    double bytes_per_second = 12.5e9;
+    size_t context_count = 1;
+    if (multi_transports_) {
+        auto* transport = multi_transports_->getTransport("rdma");
+        if (auto* rdma = dynamic_cast<RdmaTransport*>(transport)) {
+            double total_gbps = 0;
+            context_count = std::max<size_t>(1, rdma->getContextList().size());
+            for (const auto& context : rdma->getContextList()) {
+                total_gbps += ibLinkSpeedGbps(context->activeSpeed(),
+                                              context->activeWidth());
+            }
+            if (total_gbps > 0) bytes_per_second = total_gbps * 1e9 / 8.0;
+        }
+    }
+    const auto& config = globalConfig();
+    return {
+        .link_bytes_per_second = bytes_per_second,
+        .queue_depth = std::max<size_t>(
+            1, config.max_wr * config.num_qp_per_ep * context_count),
+        .pipeline_width =
+            std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 8),
+    };
+}
+
+size_t TransferEngineImpl::scatterSmallFragmentLimit(
+    const ScatterTransportProfile& profile) {
+    if (profile.queue_depth == 0) return 0;
+    const double budget = 1.0 / kScatterPostRate +
+                          kScatterRttSeconds / profile.queue_depth -
+                          1.0 / kScatterCopyRate;
+    return budget <= 0 ? 0
+                       : static_cast<size_t>(kScatterCopyBandwidth * budget);
+}
+
+TransferEngineImpl::ScatterPlan TransferEngineImpl::planScatter(
+    size_t fragments, size_t spans, uint64_t bytes,
+    const ScatterTransportProfile& profile) {
+    return planScatter(fragments, spans, spans, bytes, profile);
+}
+
+// `gather_spans` models the command payload/copy work; `direct_requests`
+// models the RDMA work after the planner coalesces adjacent logical ranges.
+TransferEngineImpl::ScatterPlan TransferEngineImpl::planScatter(
+    size_t fragments, size_t gather_spans, size_t direct_requests,
+    uint64_t bytes, const ScatterTransportProfile& profile) {
+    if (fragments == 0 || gather_spans == 0 || direct_requests == 0 ||
+        bytes == 0 || profile.link_bytes_per_second <= 0 ||
+        profile.queue_depth == 0)
+        return {};
+    const double wire = bytes / profile.link_bytes_per_second;
+    const double direct =
+        kScatterRttSeconds +
+        std::max({wire, direct_requests / kScatterPostRate,
+                  std::ceil(static_cast<double>(direct_requests) /
+                            profile.queue_depth) *
+                      kScatterRttSeconds});
+
+    ScatterPlan best;
+    double best_cost = std::numeric_limits<double>::infinity();
+    for (uint8_t depth : {1, 2, 4, 8}) {
+        if (depth > profile.pipeline_width) continue;
+        const double bdp = profile.link_bytes_per_second * kScatterRttSeconds;
+        // Cover the BDP and amortize batch/status handling. Keep the transfer
+        // within one wave of staging slots so all slots can pack in parallel.
+        const double target = std::clamp(
+            std::max({2.0 * bdp / depth,
+                      profile.link_bytes_per_second *
+                          kScatterChunkAmortizationSeconds,
+                      static_cast<double>(bytes) / depth}),
+            static_cast<double>(1ULL << 20), static_cast<double>(16ULL << 20));
+        const size_t chunk = std::min<size_t>(
+            16ULL << 20,
+            static_cast<size_t>(std::ceil(target / kScatterChunkAlignment)) *
+                kScatterChunkAlignment);
+        const double chunks = std::ceil(static_cast<double>(bytes) / chunk);
+        const double pack =
+            bytes / kScatterCopyBandwidth + gather_spans / kScatterCopyRate;
+        const double bulk = kScatterRttSeconds +
+                            std::max({wire, chunks / kScatterPostRate,
+                                      std::ceil(chunks / profile.queue_depth) *
+                                          kScatterRttSeconds});
+        const double fill =
+            std::min<uint64_t>(bytes, chunk) / kScatterCopyBandwidth;
+        const double drain =
+            std::min<uint64_t>(bytes, chunk) / profile.link_bytes_per_second;
+        const double gather = kScatterControlSeconds + fill +
+                              std::max(pack, bulk) +
+                              std::min(pack, bulk) / depth + drain;
+        if (gather < best_cost) {
+            best_cost = gather;
+            best.pipeline_depth = depth;
+            best.chunk_bytes = chunk;
+        }
+    }
+    best.gather = best_cost * kScatterSafetyMargin < direct;
+    return best;
+}
+
+Status TransferEngineImpl::transferDirect(
+    const std::vector<TransferRequest>& requests,
+    std::vector<Status>* request_statuses) {
+    if (requests.empty()) return Status::OK();
+    if (request_statuses)
+        request_statuses->assign(requests.size(), Status::OK());
+
+    MultiTransport::ScatterSubmission submission;
+    Status aggregate = submitScatter(requests, submission);
+    if (submission.batch_id == INVALID_BATCH_ID) {
+        if (request_statuses)
+            std::fill(request_statuses->begin(), request_statuses->end(),
+                      aggregate);
+        return aggregate;
+    }
+
+    size_t request_index = 0;
+    bool valid_task_mapping = true;
+    for (size_t task_id = 0; task_id < submission.task_sizes.size();
+         ++task_id) {
+        const size_t request_start = request_index;
+        const size_t task_size = submission.task_sizes[task_id];
+        const bool task_fits = request_start <= requests.size() &&
+                               task_size <= requests.size() - request_start;
+        const size_t request_end =
+            task_fits ? request_start + task_size : request_start;
+        valid_task_mapping &= task_fits && task_size != 0;
+        TransferStatus transfer_status;
+        Status status;
+        while (true) {
+            status = getTransferStatus(submission.batch_id, task_id,
+                                       transfer_status);
+            if (!status.ok()) break;
+            if (transfer_status.s == TransferStatusEnum::COMPLETED) break;
+            if (transfer_status.s != TransferStatusEnum::WAITING &&
+                transfer_status.s != TransferStatusEnum::PENDING) {
+                status = Status::Socket("direct scatter transfer failed");
+                break;
+            }
+            PAUSE();
+        }
+        if (!status.ok()) {
+            if (aggregate.ok()) aggregate = status;
+            if (request_statuses)
+                std::fill(request_statuses->begin() + request_start,
+                          request_statuses->begin() + request_end, status);
+        } else if (request_statuses &&
+                   transfer_status.s == TransferStatusEnum::COMPLETED) {
+            std::fill(request_statuses->begin() + request_start,
+                      request_statuses->begin() + request_end, Status::OK());
+        } else if (request_statuses) {
+            std::vector<TransferStatusEnum> request_results;
+            const auto detail_status =
+                multi_transports_->getScatterRequestStatuses(
+                    submission.batch_id, task_id, request_results);
+            if (detail_status.ok() &&
+                request_results.size() == request_end - request_start) {
+                for (size_t i = request_start; i < request_end; ++i) {
+                    (*request_statuses)[i] =
+                        request_results[i - request_start] ==
+                                TransferStatusEnum::COMPLETED
+                            ? Status::OK()
+                            : Status::Socket("direct scatter transfer failed");
+                }
+            } else {
+                if (aggregate.ok()) {
+                    aggregate = detail_status.ok()
+                                    ? Status::Context(
+                                          "invalid direct scatter status count")
+                                    : detail_status;
+                }
+                std::fill(request_statuses->begin() + request_start,
+                          request_statuses->begin() + request_end,
+                          aggregate.ok()
+                              ? Status::Socket("direct scatter transfer failed")
+                              : aggregate);
+            }
+        }
+        request_index = task_fits ? request_end : requests.size();
+    }
+    if (!valid_task_mapping || request_index != requests.size()) {
+        const auto mapping_status =
+            Status::Context("invalid direct scatter task mapping");
+        if (aggregate.ok()) aggregate = mapping_status;
+        if (request_statuses)
+            std::fill(request_statuses->begin() + request_index,
+                      request_statuses->end(), mapping_status);
+    }
+    auto free_status = freeBatchID(submission.batch_id);
+    if (!free_status.ok() && aggregate.ok()) aggregate = free_status;
+    return aggregate;
+}
+
+Status TransferEngineImpl::requestScatterGather(
+    const std::string& peer_server_name, uint64_t destination_address,
+    const ScatterSpan* spans, size_t span_count,
+    std::string_view fixed_relative_offsets, uint32_t fixed_span_length,
+    uint64_t source_base, uint64_t source_size, uint64_t total_bytes,
+    size_t chunk_bytes, uint8_t pipeline_depth, bool compact_plan,
+    std::unique_ptr<PreparedHandshakeCommand> prepared_command) {
+    const bool profile = VLOG_IS_ON(1);
+    const auto trace_start = profile ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+    if (!metadata_ || !supportsTransferCommand(peer_server_name))
+        return Status::NotImplemented(
+            "peer does not support transfer commands");
+    const bool preencoded_fixed = !fixed_relative_offsets.empty();
+    if ((!spans && !preencoded_fixed) || span_count == 0 ||
+        span_count > kMaxScatterSpans || total_bytes == 0 ||
+        total_bytes > kMaxScatterBytes || chunk_bytes == 0 ||
+        chunk_bytes > kMaxScatterChunkBytes || pipeline_depth == 0 ||
+        pipeline_depth > 8 ||
+        (preencoded_fixed &&
+         (fixed_span_length == 0 ||
+          fixed_relative_offsets.size() != span_count * sizeof(uint32_t) ||
+          total_bytes !=
+              static_cast<uint64_t>(span_count) * fixed_span_length)))
+        return Status::InvalidArgument("invalid scatter gather request");
+
+    const std::string destination_endpoint = local_server_name_;
+    const std::string source_ip = metadata_->localRpcMeta().ip_or_host_name;
+    if (destination_endpoint.size() > UINT16_MAX ||
+        source_ip.size() > UINT16_MAX)
+        return Status::InvalidArgument("scatter destination is too long");
+    const size_t span_budget = scatterCommandSpanBudget(peer_server_name);
+    if (span_budget == 0)
+        return Status::TooManyRequests("scatter command envelope is too large");
+    const auto validated_at = profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+
+    bool relative32 = compact_plan && source_size > 0 &&
+                      source_size <= UINT32_MAX &&
+                      source_base <= UINT64_MAX - source_size;
+    uint32_t fixed_length =
+        preencoded_fixed ? fixed_span_length : spans[0].length;
+    if (preencoded_fixed) {
+        relative32 = relative32 && fixed_length <= chunk_bytes &&
+                     fixed_length <= source_size;
+    } else {
+        for (size_t i = 0; i < span_count; ++i) {
+            const auto& span = spans[i];
+            if (!relative32) break;
+            relative32 =
+                span.source_address >= source_base &&
+                span.source_address - source_base <= UINT32_MAX &&
+                span.length <= source_size &&
+                span.source_address - source_base <= source_size - span.length;
+            if (span.length != fixed_length) fixed_length = 0;
+        }
+    }
+    const bool fixed_relative32 = relative32 && fixed_length != 0;
+    if (preencoded_fixed && !fixed_relative32)
+        return Status::InvalidArgument("invalid fixed scatter gather plan");
+    const bool remote_fixed_plan =
+        preencoded_fixed && fixed_relative_offsets.size() <= total_bytes &&
+        canUseRemoteScatterPlan(peer_server_name, destination_address,
+                                fixed_relative_offsets.size());
+    if (remote_fixed_plan &&
+        reinterpret_cast<uint64_t>(fixed_relative_offsets.data()) !=
+            destination_address) {
+        std::memcpy(reinterpret_cast<void*>(destination_address),
+                    fixed_relative_offsets.data(),
+                    fixed_relative_offsets.size());
+    }
+
+    std::string request;
+    request.reserve(
+        kScatterCommandHeaderBytes + kScatterRelativeHeaderBytes +
+        destination_endpoint.size() + source_ip.size() +
+        (remote_fixed_plan
+             ? sizeof(uint64_t)
+             : span_count * (fixed_relative32 ? 4 : (relative32 ? 8 : 10))));
+    appendUnsigned<uint8_t>(request, kTransferCommandVersion);
+    appendUnsigned<uint8_t>(request, relative32 ? kScatterGatherRelativeCommand
+                                                : kScatterGatherCommand);
+    appendUnsigned<uint8_t>(request, pipeline_depth);
+    appendUnsigned<uint16_t>(
+        request, static_cast<uint16_t>(destination_endpoint.size()));
+    appendUnsigned<uint16_t>(request, static_cast<uint16_t>(source_ip.size()));
+    appendUnsigned<uint32_t>(request, static_cast<uint32_t>(span_count));
+    appendUnsigned<uint32_t>(request, static_cast<uint32_t>(chunk_bytes));
+    appendUnsigned<uint64_t>(request, destination_address);
+    appendUnsigned<uint64_t>(request, total_bytes);
+    if (relative32) {
+        appendUnsigned<uint8_t>(
+            request,
+            remote_fixed_plan
+                ? kScatterRelative32FixedLengthRemoteEncoding
+                : (fixed_relative32 ? kScatterRelative32FixedLengthEncoding
+                                    : kScatterRelative32Encoding));
+        appendUnsigned<uint64_t>(request, source_base);
+        appendUnsigned<uint64_t>(request, source_size);
+        if (fixed_relative32) appendUnsigned<uint32_t>(request, fixed_length);
+    }
+    request.append(destination_endpoint);
+    request.append(source_ip);
+    const size_t spans_begin = request.size();
+    if (remote_fixed_plan) {
+        appendUnsigned<uint64_t>(request, destination_address);
+    } else if (preencoded_fixed) {
+        request.append(fixed_relative_offsets);
+    } else if (relative32) {
+        const size_t words_per_span = fixed_relative32 ? 1 : 2;
+        request.resize(request.size() +
+                       span_count * words_per_span * sizeof(uint32_t));
+        char* output = request.data() + spans_begin;
+        for (size_t i = 0; i < span_count; ++i) {
+            const auto& span = spans[i];
+            writeUnsigned<uint32_t>(
+                output,
+                static_cast<uint32_t>(span.source_address - source_base));
+            if (!fixed_relative32) writeUnsigned<uint32_t>(output, span.length);
+        }
+    } else {
+        for (size_t i = 0; i < span_count; ++i) {
+            const auto& span = spans[i];
+            appendVarint(request, span.source_address);
+            appendVarint(request, span.length);
+        }
+    }
+    const size_t fixed_header_bytes = preencoded_fixed ? sizeof(uint32_t) : 0;
+    if (span_budget < fixed_header_bytes ||
+        request.size() - spans_begin > span_budget - fixed_header_bytes)
+        return Status::TooManyRequests("scatter gather plan is too large");
+    const auto encoded_at = profile ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+
+    std::string response;
+    const int rc =
+        prepared_command
+            ? metadata_->sendCommand(peer_server_name, *prepared_command,
+                                     request, response)
+            : metadata_->sendCommand(peer_server_name, request, response);
+    if (rc != 0) return Status::Socket("scatter gather command failed");
+    if (response.size() < 2 ||
+        static_cast<uint8_t>(response[0]) != kTransferCommandVersion)
+        return Status::Context("invalid scatter gather response");
+    if (response[1] != 0) return Status::Context(response.substr(2));
+    const auto completed_at = profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+    const auto milliseconds = [](auto duration) {
+        return std::chrono::duration<double, std::milli>(duration).count();
+    };
+    if (profile) {
+        VLOG(1) << "scatter gather requester profile ranges=" << span_count
+                << " bytes=" << total_bytes << " plan_bytes=" << request.size()
+                << " depth=" << static_cast<unsigned>(pipeline_depth)
+                << " validate_ms=" << milliseconds(validated_at - trace_start)
+                << " encode_ms=" << milliseconds(encoded_at - validated_at)
+                << " control_ms=" << milliseconds(completed_at - encoded_at)
+                << " total_ms=" << milliseconds(completed_at - trace_start);
+    }
+    return Status::OK();
+}
+
+int TransferEngineImpl::handleTransferCommand(const std::string& peer_address,
+                                              const std::string& request,
+                                              std::string& response) {
+    const Status status = executeScatterGather(peer_address, request);
+    response.clear();
+    response.push_back(static_cast<char>(kTransferCommandVersion));
+    response.push_back(status.ok() ? 0 : 1);
+    if (!status.ok()) response.append(status.ToString());
+    return status.ok() ? 0 : static_cast<int>(status.code());
+}
+
+Status TransferEngineImpl::executeScatterGather(const std::string& peer_address,
+                                                std::string_view request) {
+    const bool profile = VLOG_IS_ON(1);
+    const auto trace_start = profile ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+    TransferEngine::ScatterStagingAllocator allocator;
+    {
+        std::lock_guard<std::mutex> lock(scatter_staging_mutex_);
+        if (!scatter_staging_allocator_)
+            return Status::NotImplemented("scatter staging pool unavailable");
+        allocator = scatter_staging_allocator_;
+        ++active_scatter_commands_;
+    }
+    struct ActiveGuard {
+        std::function<void()> release;
+        ~ActiveGuard() { release(); }
+    } active_guard{[this] {
+        std::lock_guard<std::mutex> lock(scatter_staging_mutex_);
+        --active_scatter_commands_;
+        scatter_staging_cv_.notify_all();
+    }};
+
+    size_t offset = 0;
+    uint8_t version = 0, command = 0, pipeline_depth = 0;
+    uint16_t endpoint_size = 0, source_ip_size = 0;
+    uint32_t span_count = 0, chunk_bytes = 0;
+    uint64_t destination_address = 0, total_bytes = 0;
+    if (!readUnsigned(request, offset, version) ||
+        !readUnsigned(request, offset, command) ||
+        !readUnsigned(request, offset, pipeline_depth) ||
+        !readUnsigned(request, offset, endpoint_size) ||
+        !readUnsigned(request, offset, source_ip_size) ||
+        !readUnsigned(request, offset, span_count) ||
+        !readUnsigned(request, offset, chunk_bytes) ||
+        !readUnsigned(request, offset, destination_address) ||
+        !readUnsigned(request, offset, total_bytes) ||
+        version != kTransferCommandVersion ||
+        (command != kScatterGatherCommand &&
+         command != kScatterGatherRelativeCommand) ||
+        pipeline_depth == 0 || pipeline_depth > 8 || span_count == 0 ||
+        span_count > kMaxScatterSpans || chunk_bytes == 0 ||
+        chunk_bytes > kMaxScatterChunkBytes || total_bytes == 0 ||
+        total_bytes > kMaxScatterBytes) {
+        return Status::InvalidArgument("invalid scatter gather command");
+    }
+
+    uint8_t span_encoding = 0;
+    uint64_t source_base = 0, source_size = 0;
+    if (command == kScatterGatherRelativeCommand &&
+        (!readUnsigned(request, offset, span_encoding) ||
+         !readUnsigned(request, offset, source_base) ||
+         !readUnsigned(request, offset, source_size) ||
+         (span_encoding != kScatterRelative32Encoding &&
+          span_encoding != kScatterRelative32FixedLengthEncoding &&
+          span_encoding != kScatterRelative32FixedLengthRemoteEncoding) ||
+         source_size == 0 || source_size > UINT32_MAX ||
+         source_base > UINT64_MAX - source_size)) {
+        return Status::InvalidArgument("invalid relative scatter command");
+    }
+    uint32_t fixed_length = 0;
+    const bool fixed_relative32 =
+        span_encoding == kScatterRelative32FixedLengthEncoding ||
+        span_encoding == kScatterRelative32FixedLengthRemoteEncoding;
+    const bool remote_fixed_plan =
+        span_encoding == kScatterRelative32FixedLengthRemoteEncoding;
+    if (fixed_relative32 &&
+        (!readUnsigned(request, offset, fixed_length) || fixed_length == 0 ||
+         fixed_length > chunk_bytes || fixed_length > source_size)) {
+        return Status::InvalidArgument(
+            "invalid fixed-length relative scatter command");
+    }
+    const size_t remaining = request.size() - std::min(request.size(), offset);
+    if (remaining < endpoint_size || remaining - endpoint_size < source_ip_size)
+        return Status::InvalidArgument("invalid scatter gather command");
+
+    const std::string destination_endpoint(
+        request.substr(offset, endpoint_size));
+    offset += endpoint_size;
+    const std::string source_ip(request.substr(offset, source_ip_size));
+    offset += source_ip_size;
+    const auto peer_host = parseHostNameWithPort(peer_address).first;
+    if (peer_host.empty() || source_ip.empty() || peer_host != source_ip)
+        return Status::RejectHandshake(
+            "scatter destination does not match command peer");
+    if (destination_address > UINT64_MAX - total_bytes)
+        return Status::InvalidArgument("scatter destination range overflows");
+
+    uint64_t remote_offsets_address = 0;
+    if (remote_fixed_plan &&
+        (!readUnsigned(request, offset, remote_offsets_address) ||
+         remote_offsets_address != destination_address)) {
+        return Status::InvalidArgument("invalid remote scatter plan address");
+    }
+
+    const char* fixed_wire_offsets = nullptr;
+    const uint32_t* fixed_offsets = nullptr;
+    std::vector<uint32_t> decoded_fixed_offsets;
+    bool defer_fixed_offset_validation = false;
+    uint32_t fixed_max_offset = 0;
+    std::vector<ScatterSpan> spans;
+    if (!fixed_relative32) spans.reserve(span_count);
+    uint64_t decoded_bytes = 0;
+    SegmentHandle segment = static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT);
+    struct SegmentGuard {
+        TransferEngineImpl* engine;
+        SegmentHandle* segment;
+        ~SegmentGuard() {
+            if (*segment != static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT)) {
+                engine->closeSegment(*segment);
+            }
+        }
+    } segment_guard{this, &segment};
+    TransferEngine::ScatterStagingBuffer remote_plan_staging;
+    std::chrono::steady_clock::time_point plan_fetched_at = trace_start;
+
+    if (remote_fixed_plan) {
+        const size_t offsets_bytes =
+            static_cast<size_t>(span_count) * sizeof(uint32_t);
+        if (offset != request.size() || offsets_bytes > total_bytes ||
+            remote_offsets_address > UINT64_MAX - offsets_bytes) {
+            return Status::InvalidArgument("invalid remote scatter plan size");
+        }
+        const size_t double_chunk =
+            chunk_bytes <= std::numeric_limits<size_t>::max() / 2
+                ? static_cast<size_t>(chunk_bytes) * 2
+                : chunk_bytes;
+        constexpr size_t kPlanAlignment = alignof(uint32_t);
+        if (offsets_bytes > std::numeric_limits<size_t>::max() - double_chunk -
+                                (kPlanAlignment - 1)) {
+            return Status::Memory("scatter remote plan staging size overflows");
+        }
+        const size_t requested_bytes =
+            offsets_bytes + double_chunk + (kPlanAlignment - 1);
+        remote_plan_staging = allocator(requested_bytes);
+        if (!remote_plan_staging ||
+            remote_plan_staging.capacity < requested_bytes) {
+            return Status::Memory("scatter remote plan staging pool exhausted");
+        }
+        size_t plan_offset = remote_plan_staging.capacity - offsets_bytes;
+        const auto plan_address =
+            reinterpret_cast<uintptr_t>(remote_plan_staging.data) + plan_offset;
+        plan_offset -= plan_address & (kPlanAlignment - 1);
+        if (plan_offset < double_chunk) {
+            return Status::Memory("scatter remote plan staging pool exhausted");
+        }
+        auto* plan_buffer =
+            static_cast<char*>(remote_plan_staging.data) + plan_offset;
+        segment = openSegment(destination_endpoint);
+        if (segment == static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT)) {
+            return Status::Endpoint("failed to open scatter destination");
+        }
+        const std::vector<TransferRequest> plan_request{TransferRequest{
+            .opcode = TransferRequest::READ,
+            .source = plan_buffer,
+            .target_id = segment,
+            .target_offset = remote_offsets_address,
+            .length = offsets_bytes,
+        }};
+        const auto plan_status = transferDirect(plan_request);
+        if (!plan_status.ok()) return plan_status;
+        fixed_wire_offsets = plan_buffer;
+        // Keep the plan in the tail of the allocation while the prefix is
+        // reused for gather staging.
+        remote_plan_staging.capacity = plan_offset;
+        if (profile) plan_fetched_at = std::chrono::steady_clock::now();
+    }
+
+    // Keep unregister from returning while gather workers still dereference
+    // validated source addresses.
+    std::shared_lock<std::shared_mutex> source_registration_lock(mutex_);
+    const MemoryRegion* cached_region = nullptr;
+    auto contains = [&](uint64_t address, uint64_t length) {
+        auto in_region = [&](const MemoryRegion& region) {
+            const auto begin = reinterpret_cast<uintptr_t>(region.addr);
+            return address >= begin && length <= region.length &&
+                   address - begin <= region.length - length &&
+                   region.remote_accessible &&
+                   hostAccessibleLocation(region.location);
+        };
+        if (cached_region && in_region(*cached_region)) return true;
+        auto next = local_memory_regions_.upper_bound(address);
+        if (next == local_memory_regions_.begin()) return false;
+        const auto& region = std::prev(next)->second;
+        if (!in_region(region)) return false;
+        cached_region = &region;
+        return true;
+    };
+    const bool relative32 = command == kScatterGatherRelativeCommand;
+    if (relative32 && !contains(source_base, source_size)) {
+        return Status::AddressNotRegistered(
+            "scatter source window is not registered host memory");
+    }
+    if (fixed_relative32) {
+        const size_t offsets_bytes =
+            static_cast<size_t>(span_count) * sizeof(uint32_t);
+        if ((!remote_fixed_plan &&
+             request.size() - std::min(request.size(), offset) <
+                 offsets_bytes) ||
+            total_bytes != static_cast<uint64_t>(span_count) * fixed_length) {
+            return Status::InvalidArgument("invalid relative scatter span");
+        }
+        if (!remote_fixed_plan) fixed_wire_offsets = request.data() + offset;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        if (remote_fixed_plan) {
+            fixed_offsets =
+                reinterpret_cast<const uint32_t*>(fixed_wire_offsets);
+        } else {
+            decoded_fixed_offsets.resize(span_count);
+            std::memcpy(decoded_fixed_offsets.data(), fixed_wire_offsets,
+                        offsets_bytes);
+            fixed_offsets = decoded_fixed_offsets.data();
+        }
+        const uint32_t max_offset =
+            static_cast<uint32_t>(source_size - fixed_length);
+        if (remote_fixed_plan) {
+            defer_fixed_offset_validation = true;
+            fixed_max_offset = max_offset;
+        } else {
+            uint32_t invalid_offset = 0;
+            for (uint32_t i = 0; i < span_count; ++i)
+                invalid_offset |= fixed_offsets[i] > max_offset;
+            if (invalid_offset != 0)
+                return Status::InvalidArgument("invalid relative scatter span");
+        }
+#else
+        decoded_fixed_offsets.resize(span_count);
+        for (uint32_t i = 0; i < span_count; ++i) {
+            const uint32_t relative_offset = loadUnsigned<uint32_t>(
+                fixed_wire_offsets + static_cast<size_t>(i) * sizeof(uint32_t));
+            if (relative_offset > source_size - fixed_length) {
+                return Status::InvalidArgument("invalid relative scatter span");
+            }
+            decoded_fixed_offsets[i] = relative_offset;
+        }
+        fixed_offsets = decoded_fixed_offsets.data();
+#endif
+        if (!remote_fixed_plan) offset += offsets_bytes;
+        decoded_bytes = total_bytes;
+    } else {
+        for (uint32_t i = 0; i < span_count; ++i) {
+            uint64_t source = 0, length = 0;
+            if (relative32) {
+                uint32_t relative_offset = 0, relative_length = 0;
+                if (!readUnsigned(request, offset, relative_offset) ||
+                    !readUnsigned(request, offset, relative_length)) {
+                    return Status::InvalidArgument(
+                        "invalid relative scatter span");
+                }
+                if (relative_length == 0 || relative_length > chunk_bytes ||
+                    relative_length > source_size ||
+                    relative_offset > source_size - relative_length) {
+                    return Status::InvalidArgument(
+                        "invalid relative scatter span");
+                }
+                source = source_base + relative_offset;
+                length = relative_length;
+            } else if (!readVarint(request, offset, source) ||
+                       !readVarint(request, offset, length) || length == 0 ||
+                       length > chunk_bytes || length > UINT32_MAX ||
+                       !contains(source, length)) {
+                return Status::AddressNotRegistered(
+                    "scatter source is not registered host memory");
+            }
+            if (decoded_bytes > total_bytes ||
+                length > total_bytes - decoded_bytes) {
+                return Status::InvalidArgument("invalid scatter byte count");
+            }
+            spans.push_back({source, static_cast<uint32_t>(length)});
+            decoded_bytes += length;
+        }
+    }
+    if (offset != request.size() || decoded_bytes != total_bytes)
+        return Status::InvalidArgument("scatter gather size mismatch");
+    const auto validated_at = profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+
+    struct Chunk {
+        size_t begin;
+        size_t end;
+        size_t bytes;
+        size_t destination_offset;
+    };
+    std::vector<Chunk> chunks;
+    size_t begin = 0, bytes = 0, destination_offset = 0;
+    if (fixed_relative32) {
+        const size_t spans_per_chunk = chunk_bytes / fixed_length;
+        while (begin < span_count) {
+            const size_t end =
+                std::min<size_t>(span_count, begin + spans_per_chunk);
+            bytes = (end - begin) * fixed_length;
+            chunks.push_back({begin, end, bytes, destination_offset});
+            destination_offset += bytes;
+            begin = end;
+        }
+    } else {
+        for (size_t i = 0; i < spans.size(); ++i) {
+            if (bytes != 0 && bytes + spans[i].length > chunk_bytes) {
+                chunks.push_back({begin, i, bytes, destination_offset});
+                begin = i;
+                destination_offset += bytes;
+                bytes = 0;
+            }
+            bytes += spans[i].length;
+        }
+        chunks.push_back({begin, spans.size(), bytes, destination_offset});
+    }
+
+    const size_t legacy_double_flight_bytes =
+        chunk_bytes <= std::numeric_limits<size_t>::max() / 2
+            ? chunk_bytes * 2
+            : chunk_bytes;
+
+    std::vector<TransferEngine::ScatterStagingBuffer> staging;
+    const size_t depth = std::min<size_t>(pipeline_depth, chunks.size());
+    if (remote_plan_staging) staging.push_back(std::move(remote_plan_staging));
+    for (size_t i = staging.size(); i < depth; ++i) {
+        const size_t requested_bytes = legacy_double_flight_bytes;
+        auto buffer = allocator(requested_bytes);
+        if (!buffer || buffer.capacity < chunk_bytes)
+            buffer = allocator(chunk_bytes);
+        if (!buffer || buffer.capacity < chunk_bytes) break;
+        staging.push_back(std::move(buffer));
+    }
+    if (staging.empty())
+        return Status::Memory("scatter staging pool exhausted");
+    const auto buffers_at = profile ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+
+    if (segment == static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT)) {
+        segment = openSegment(destination_endpoint);
+        if (segment == static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT)) {
+            return Status::Endpoint("failed to open scatter destination");
+        }
+    }
+    const auto opened_at = profile ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
+
+    struct Flight {
+        BatchID batch = INVALID_BATCH_ID;
+        std::vector<TransferRequest> requests{1};
+    };
+    struct Slot {
+        std::vector<Flight> flights;
+    };
+    std::vector<Slot> slots(staging.size());
+    for (size_t i = 0; i < slots.size(); ++i) {
+        const size_t flight_count =
+            std::clamp<size_t>(staging[i].capacity / chunk_bytes, 1, 2);
+        slots[i].flights.resize(flight_count);
+    }
+    std::vector<std::chrono::nanoseconds> pack_time(profile ? slots.size() : 0);
+    std::vector<std::chrono::nanoseconds> submit_time(profile ? slots.size()
+                                                              : 0);
+    auto drain = [&](Flight& flight) {
+        if (flight.batch == INVALID_BATCH_ID) return Status::OK();
+        TransferStatus transfer_status;
+        Status aggregate = Status::OK();
+        uint32_t polls = 0;
+        while (true) {
+            const auto status =
+                getTransferStatus(flight.batch, 0, transfer_status);
+            bool terminal = false;
+            if (!status.ok()) {
+                if (aggregate.ok()) aggregate = status;
+                terminal = true;
+            } else if (transfer_status.s == TransferStatusEnum::COMPLETED) {
+                terminal = true;
+            } else if (transfer_status.s != TransferStatusEnum::WAITING &&
+                       transfer_status.s != TransferStatusEnum::PENDING) {
+                if (aggregate.ok())
+                    aggregate =
+                        Status::Socket("scatter gather RDMA write failed");
+                terminal = true;
+            }
+            if (terminal) {
+                const auto free_status = freeBatchID(flight.batch);
+                if (!free_status.IsBatchBusy()) {
+                    flight.batch = INVALID_BATCH_ID;
+                    if (!free_status.ok() && aggregate.ok())
+                        aggregate = free_status;
+                    return aggregate;
+                }
+            }
+            if (++polls < 64)
+                PAUSE();
+            else
+                std::this_thread::yield();
+        }
+    };
+
+    std::vector<Status> slot_status(slots.size(), Status::OK());
+    std::atomic<size_t> validated_slots{0};
+    std::atomic<uint32_t> invalid_fixed_offset{0};
+    auto run_slot = [&](size_t slot_index) {
+        if (defer_fixed_offset_validation) {
+            const size_t offsets_per_slot =
+                (span_count + slots.size() - 1) / slots.size();
+            const size_t begin =
+                std::min<size_t>(span_count, slot_index * offsets_per_slot);
+            const size_t end =
+                std::min<size_t>(span_count, begin + offsets_per_slot);
+            uint32_t invalid_offset = 0;
+            for (size_t i = begin; i < end; ++i)
+                invalid_offset |= fixed_offsets[i] > fixed_max_offset;
+            if (invalid_offset != 0)
+                invalid_fixed_offset.fetch_or(invalid_offset);
+            validated_slots.fetch_add(1);
+            uint32_t polls = 0;
+            while (validated_slots.load() < slots.size()) {
+                if (++polls < 64)
+                    PAUSE();
+                else
+                    std::this_thread::yield();
+            }
+            if (invalid_fixed_offset.load() != 0) {
+                slot_status[slot_index] =
+                    Status::InvalidArgument("invalid relative scatter span");
+                return;
+            }
+        }
+
+        auto& slot = slots[slot_index];
+        auto* staging_base = static_cast<char*>(staging[slot_index].data);
+        size_t sequence = 0;
+        Status aggregate = Status::OK();
+        for (size_t i = slot_index; i < chunks.size(); i += slots.size()) {
+            const size_t flight_index = sequence++ % slot.flights.size();
+            auto& flight = slot.flights[flight_index];
+            auto status = drain(flight);
+            if (!status.ok()) {
+                aggregate = status;
+                break;
+            }
+            auto* output = staging_base + flight_index * chunk_bytes;
+
+            size_t packed = 0;
+            const auto pack_started =
+                profile ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+            if (fixed_relative32) {
+                for (size_t j = chunks[i].begin; j < chunks[i].end; ++j) {
+                    const uint32_t relative_offset = fixed_offsets[j];
+                    const void* source = reinterpret_cast<const void*>(
+                        source_base + relative_offset);
+                    std::memcpy(output + packed, source, fixed_length);
+                    packed += fixed_length;
+                }
+            } else {
+                for (size_t j = chunks[i].begin; j < chunks[i].end; ++j) {
+                    std::memcpy(
+                        output + packed,
+                        reinterpret_cast<const void*>(spans[j].source_address),
+                        spans[j].length);
+                    packed += spans[j].length;
+                }
+            }
+            if (profile) {
+                pack_time[slot_index] +=
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - pack_started);
+            }
+            const auto submit_started =
+                profile ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+            flight.batch = allocateBatchID(1);
+            if (flight.batch == INVALID_BATCH_ID) {
+                aggregate = Status::Memory("failed to allocate scatter batch");
+                break;
+            }
+            flight.requests[0] = TransferRequest{
+                .opcode = TransferRequest::WRITE,
+                .source = output,
+                .target_id = segment,
+                .target_offset =
+                    destination_address + chunks[i].destination_offset,
+                .length = chunks[i].bytes,
+            };
+            status = submitTransfer(flight.batch, flight.requests);
+            if (profile) {
+                submit_time[slot_index] +=
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - submit_started);
+            }
+            if (!status.ok()) {
+                drain(flight);
+                aggregate = status;
+                break;
+            }
+        }
+        for (auto& flight : slot.flights) {
+            const auto status = drain(flight);
+            if (!status.ok() && aggregate.ok()) aggregate = status;
+        }
+        slot_status[slot_index] = aggregate;
+    };
+
+    const auto pipeline_started = profile
+                                      ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+    if (slots.size() == 1) {
+        run_slot(0);
+    } else {
+        Status launch_status = Status::OK();
+        bool reused_workers = false;
+        try {
+            reused_workers =
+                scatterLaneWorkers().run(slots.size() - 1, run_slot);
+        } catch (...) {
+            launch_status = Status::Context("scatter gather worker failed");
+        }
+        if (!launch_status.ok()) {
+            return launch_status;
+        }
+        if (!reused_workers) {
+            std::vector<std::thread> workers;
+            workers.reserve(slots.size() - 1);
+            try {
+                for (size_t i = 1; i < slots.size(); ++i)
+                    workers.emplace_back(run_slot, i);
+            } catch (...) {
+                launch_status =
+                    Status::Memory("failed to launch scatter gather workers");
+            }
+            if (launch_status.ok()) {
+                run_slot(0);
+            } else if (defer_fixed_offset_validation) {
+                invalid_fixed_offset.store(1);
+                validated_slots.store(slots.size());
+            }
+            for (auto& worker : workers) worker.join();
+            if (!launch_status.ok()) return launch_status;
+        }
+    }
+    const auto completed_at = profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+    Status aggregate = Status::OK();
+    for (const auto& status : slot_status)
+        if (!status.ok() && aggregate.ok()) aggregate = status;
+    if (closeSegment(segment) != 0 && aggregate.ok())
+        aggregate = Status::Endpoint("failed to close scatter destination");
+    segment = static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT);
+    const auto milliseconds = [](auto duration) {
+        return std::chrono::duration<double, std::milli>(duration).count();
+    };
+    const auto total_pack = std::accumulate(pack_time.begin(), pack_time.end(),
+                                            std::chrono::nanoseconds::zero());
+    const auto total_submit =
+        std::accumulate(submit_time.begin(), submit_time.end(),
+                        std::chrono::nanoseconds::zero());
+    if (profile) {
+        VLOG(1) << "scatter gather owner profile ranges="
+                << (fixed_relative32 ? span_count : spans.size())
+                << " bytes=" << total_bytes << " chunks=" << chunks.size()
+                << " depth=" << slots.size()
+                << " validate_ms=" << milliseconds(validated_at - trace_start)
+                << " plan_fetch_ms="
+                << (remote_fixed_plan
+                        ? milliseconds(plan_fetched_at - trace_start)
+                        : 0.0)
+                << " buffers_ms=" << milliseconds(buffers_at - validated_at)
+                << " open_ms=" << milliseconds(opened_at - buffers_at)
+                << " pack_ms=" << milliseconds(total_pack)
+                << " submit_ms=" << milliseconds(total_submit)
+                << " pipeline_ms="
+                << milliseconds(completed_at - pipeline_started)
+                << " total_ms=" << milliseconds(completed_at - trace_start);
+    }
+    return aggregate;
 }
 
 // Only for testing

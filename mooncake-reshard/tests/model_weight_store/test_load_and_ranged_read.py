@@ -5,6 +5,7 @@ import copy
 from dataclasses import replace
 from itertools import product
 from math import prod
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,11 @@ from mooncake.reshard.weight.manifest import (
 from mooncake.reshard.weight.store import WeightStoreError
 from mooncake.reshard.weight.store import WeightStore
 from mooncake.reshard.weight._store.contracts import WeightLoadPlan
+from mooncake.reshard.weight._planner.range_lowering import (
+    coalesce_adjacent_store_ranges,
+    lower_stored_load_ranges,
+)
+from mooncake.reshard.weight.storage_manifest import StoredFragmentSnapshot
 from mooncake.reshard.weight._store.validation import same_runtime_snapshot
 
 from .helpers import (
@@ -59,6 +65,145 @@ def runtime_fragment_for_snapshot(**overrides) -> RuntimeBindingFragment:
     }
     values.update(overrides)
     return RuntimeBindingFragment(**values)
+
+
+def test_store_range_lowering_coalesces_only_exactly_adjacent_ranges() -> None:
+    target = runtime_fragment_for_snapshot()
+    ranges = (
+        (target, "payload-a", 0, 16, 4),
+        (target, "payload-a", 4, 20, 4),
+        (target, "payload-a", 12, 24, 4),
+        (target, "payload-a", 16, 28, 4),
+        (target, "payload-b", 20, 32, 4),
+    )
+
+    lowered = coalesce_adjacent_store_ranges(ranges, max_range_bytes=8)
+
+    assert lowered == (
+        (target, "payload-a", 0, 16, 8),
+        (target, "payload-a", 12, 24, 8),
+        (target, "payload-b", 20, 32, 4),
+    )
+
+
+def test_stored_load_lowering_coalesces_before_request_batch_limit() -> None:
+    target = runtime_fragment_for_snapshot(
+        nbytes=8,
+        storage_address=0x1000,
+        storage_nbytes=8,
+        storage_offset_bytes=0,
+    )
+    source = StoredFragmentSnapshot(
+        fragment_id="stored-0",
+        tensor_id="tensor-0",
+        global_offset=(0,),
+        local_shape=(8,),
+        object_key="payload-0",
+        object_offset=0,
+        nbytes=8,
+    )
+
+    def operation(target_offset: int, source_offset: int):
+        return SimpleNamespace(
+            target=SimpleNamespace(fragment_id=target.fragment_id),
+            target_offset=target_offset,
+            source=source,
+            source_offset=source_offset,
+            iter_segments=lambda *, max_segments: iter(
+                [(source_offset, target_offset, 4)]
+            ),
+        )
+
+    lowered = lower_stored_load_ranges(
+        {target.fragment_id: (operation(0, 0), operation(4, 4))},
+        {target.fragment_id: target},
+        max_segments=1,
+        max_range_bytes=8,
+    )
+
+    assert lowered == ((target, "payload-0", 0, 0, 8),)
+
+
+def test_stored_load_lowering_sorts_interleaved_physical_ranges_before_coalescing() -> None:
+    target = runtime_fragment_for_snapshot(
+        nbytes=16,
+        storage_address=0x1000,
+        storage_nbytes=16,
+        storage_offset_bytes=0,
+    )
+    source = StoredFragmentSnapshot(
+        fragment_id="stored-0",
+        tensor_id="tensor-0",
+        global_offset=(0,),
+        local_shape=(16,),
+        object_key="payload-0",
+        object_offset=0,
+        nbytes=16,
+    )
+
+    def operation(target_offset: int, source_offset: int):
+        return SimpleNamespace(
+            target=SimpleNamespace(fragment_id=target.fragment_id),
+            target_offset=target_offset,
+            source=source,
+            source_offset=source_offset,
+            iter_segments=lambda *, max_segments: iter(
+                [(source_offset, target_offset, 4)]
+            ),
+        )
+
+    lowered = lower_stored_load_ranges(
+        {
+            target.fragment_id: (
+                operation(8, 8),
+                operation(0, 0),
+                operation(12, 12),
+                operation(4, 4),
+            )
+        },
+        {target.fragment_id: target},
+        max_segments=1,
+        max_range_bytes=16,
+    )
+
+    assert lowered == ((target, "payload-0", 0, 0, 16),)
+
+
+@pytest.mark.parametrize(
+    "ranges",
+    [
+        ((runtime_fragment_for_snapshot(), "payload", -1, 0, 1),),
+        ((runtime_fragment_for_snapshot(), "payload", 0, -1, 1),),
+        ((runtime_fragment_for_snapshot(), "payload", 0, 0, 0),),
+    ],
+)
+def test_store_range_lowering_rejects_invalid_geometry(ranges) -> None:
+    with pytest.raises(ValueError, match="geometry"):
+        coalesce_adjacent_store_ranges(ranges, max_range_bytes=8)
+
+
+def test_load_range_limit_uses_scatter_capacity_by_default() -> None:
+    store, _ = make_weight_store()
+    weight_store = WeightStore(store)
+
+    assert weight_store.max_ranges_per_request == 1024
+    assert weight_store.max_load_ranges_per_request == 131_072
+
+
+def test_explicit_range_limit_remains_shared_by_upload_and_load() -> None:
+    store, _ = make_weight_store()
+    weight_store = WeightStore(store, max_ranges_per_request=17)
+
+    assert weight_store.max_ranges_per_request == 17
+    assert weight_store.max_load_ranges_per_request == 17
+
+
+def test_explicit_load_range_limit_overrides_scatter_default() -> None:
+    store, _ = make_weight_store()
+    weight_store = WeightStore(store, max_load_ranges_per_request=23)
+
+    assert weight_store.max_ranges_per_request == 1024
+    assert weight_store.max_load_ranges_per_request == 23
 
 
 @pytest.mark.parametrize(
