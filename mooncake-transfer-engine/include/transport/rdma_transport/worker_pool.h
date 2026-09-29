@@ -151,12 +151,13 @@ class WorkerPool {
         collective_slice_queue_;
     std::vector<std::unordered_map<std::string, SliceList>> worker_slice_queue_;
     std::vector<std::mutex> worker_slice_queue_lock_;
-    // Number of slices queued for each worker but not yet moved to its
-    // worker-owned collective queue.
-    std::unique_ptr<std::atomic<uint64_t>[]> queued_slice_count_;
-    // Whether a worker-owned collective queue currently contains slices.
-    // This avoids scanning the per-peer unordered_map in the worker hot path.
-    std::unique_ptr<std::atomic<bool>[]> collective_slice_pending_;
+    // Per-worker pending state. The low bit records whether the worker-owned
+    // collective queue contains slices; the remaining bits encode twice the
+    // number of slices in the cross-thread worker queue. Keeping both in one
+    // atomic makes the worker hot-path check a single load.
+    static constexpr uint64_t kCollectiveSlicePendingBit = 1;
+    static constexpr uint64_t kQueuedSliceCountUnit = 2;
+    std::unique_ptr<std::atomic<uint64_t>[]> pending_slice_state_;
 
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
     std::atomic<uint64_t> recovery_activate_after_ns_{0};
