@@ -38,6 +38,18 @@
 
 namespace mooncake {
 
+// These timestamps are used for worker parking and CQ-stall diagnostics.
+// They are compared only with timestamps from this helper (or with exact
+// CLOCK_REALTIME values for diagnostic ages), so coarse wall-clock time keeps
+// the existing time domain while avoiding the cost of a full clock read.
+static inline uint64_t getWorkerClockInNano() {
+    timespec ts;
+    if (clock_gettime(CLOCK_REALTIME_COARSE, &ts) != 0)
+        return static_cast<uint64_t>(getCurrentTimeInNano());
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+           static_cast<uint64_t>(ts.tv_nsec);
+}
+
 static std::string resolveBufferLocation(
     const TransferMetadata::BufferDesc &buffer, uint64_t offset) {
     std::string location = buffer.name;
@@ -747,11 +759,13 @@ void WorkerPool::performPostSend(int thread_id) {
     }
 }
 
-int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
+int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch,
+                              uint64_t poll_ts, int cq_index) {
     if (context_.cqCount() <= 0) return 0;
     if (thread_id < 0 || thread_id >= worker_count_) return 0;
 
-    const uint64_t poll_ts = getCurrentTimeInNano();
+    if (cq_index < 0) cq_index = cqIndexForPostingThread(thread_id);
+    if (poll_ts == 0) poll_ts = getWorkerClockInNano();
     const uint64_t previous_poll_ts =
         last_poll_ts_ns_.exchange(poll_ts, std::memory_order_release);
     last_poll_ts_ns_.notify_all();
@@ -767,9 +781,11 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
     }
 
     const static size_t kPollCount = 64;
-    std::unordered_map<std::atomic<int> *, int> qp_depth_set;
-    std::vector<ibv_wc> wc_list;
-    const int cq_index = cqIndexForPostingThread(thread_id);
+    thread_local std::unordered_map<std::atomic<int> *, int> qp_depth_set;
+    thread_local std::vector<ibv_wc> wc_list;
+    qp_depth_set.clear();
+    wc_list.clear();
+    if (wc_list.capacity() < kPollCount) wc_list.reserve(kPollCount);
     if (cq_index < 0) return 0;
     if (!context_.cq(cq_index)) return 0;
     ibv_wc wc[kPollCount];
@@ -791,10 +807,7 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
         Transport::Slice *slice = (Transport::Slice *)wc[i].wr_id;
         assert(slice);
         assert(postingThreadForPeer(slice->peer_nic_path) == thread_id);
-        if (qp_depth_set.count(slice->rdma.qp_depth))
-            qp_depth_set[slice->rdma.qp_depth]++;
-        else
-            qp_depth_set[slice->rdma.qp_depth] = 1;
+        ++qp_depth_set[slice->rdma.qp_depth];
         wc_list.push_back(wc[i]);
     }
     if (nr_poll)
@@ -1171,15 +1184,31 @@ bool WorkerPool::hasOutstandingCq(int thread_id) {
 void WorkerPool::transferWorker(int thread_id) {
     bindToSocket(numa_socket_id_);
     const static uint64_t kWaitPeriodInNano = 100000000;  // 100ms
-    uint64_t last_wait_ts = getCurrentTimeInNano();
+    constexpr uint32_t kIdleClockCheckInterval = 256;
+    const int cq_index = cqIndexForPostingThread(thread_id);
+    std::atomic<int> *cq_outstanding =
+        cq_index >= 0 && cq_index < context_.cqCount()
+            ? context_.cqOutstandingCount(cq_index)
+            : nullptr;
+    uint64_t last_wait_ts = getWorkerClockInNano();
+    uint32_t idle_clock_check_count = 0;
     while (workers_running_.load(std::memory_order_relaxed)) {
         auto processed_slice_count =
             processed_slice_count_.load(std::memory_order_relaxed);
         auto submitted_slice_count =
             submitted_slice_count_.load(std::memory_order_relaxed);
+        const bool has_outstanding_cq =
+            cq_outstanding &&
+            cq_outstanding->load(std::memory_order_relaxed) > 0;
         if (processed_slice_count == submitted_slice_count &&
-            !hasOutstandingCq(thread_id)) {
-            uint64_t curr_wait_ts = getCurrentTimeInNano();
+            !has_outstanding_cq) {
+            // Keep the short idle spin for latency, but sample the clock only
+            // periodically. The submitted/processed atomics still detect new
+            // work on every iteration, so this only changes when parking
+            // begins after a long idle period.
+            if (++idle_clock_check_count < kIdleClockCheckInterval) continue;
+            idle_clock_check_count = 0;
+            uint64_t curr_wait_ts = getWorkerClockInNano();
             if (curr_wait_ts - last_wait_ts > kWaitPeriodInNano) {
                 std::unique_lock<std::mutex> lock(cond_mutex_);
                 parked_worker_count_.fetch_add(1, std::memory_order_acq_rel);
@@ -1188,7 +1217,8 @@ void WorkerPool::transferWorker(int thread_id) {
                 // producers that submit after it will notify this worker.
                 if (processed_slice_count_.load(std::memory_order_relaxed) ==
                         submitted_slice_count_.load() &&
-                    !hasOutstandingCq(thread_id)) {
+                    !(cq_outstanding &&
+                      cq_outstanding->load(std::memory_order_relaxed) > 0)) {
                     cond_var_.wait_for(lock, std::chrono::seconds(1));
                 }
                 parked_worker_count_.fetch_sub(1, std::memory_order_acq_rel);
@@ -1196,11 +1226,15 @@ void WorkerPool::transferWorker(int thread_id) {
             }
             continue;
         }
+        idle_clock_check_count = 0;
         performPostSend(thread_id);
 #ifndef USE_FAKE_POST_SEND
-        performPollCq(thread_id);
+        const uint64_t poll_ts = getWorkerClockInNano();
+        performPollCq(thread_id, false, poll_ts, cq_index);
+        last_wait_ts = poll_ts;
+#else
+        last_wait_ts = getWorkerClockInNano();
 #endif
-        last_wait_ts = getCurrentTimeInNano();
     }
 }
 
@@ -1462,14 +1496,13 @@ GidRefreshResult WorkerPool::refreshPublishedLocalGid() {
 
 void WorkerPool::monitorWorker() {
     bindToSocket(numa_socket_id_);
-    auto last_reset_ts = getCurrentTimeInNano();
+    auto last_reset_ts = getWorkerClockInNano();
     uint64_t outstanding_since_ns = 0;
     uint64_t last_timeout_log_ns = 0;
     uint64_t last_processed_count =
         processed_slice_count_.load(std::memory_order_relaxed);
     while (workers_running_) {
-        const uint64_t current_ts =
-            static_cast<uint64_t>(getCurrentTimeInNano());
+        const uint64_t current_ts = getWorkerClockInNano();
         maybeActivateRecoveredContext();
         // Check short breaker TTLs on every loop, like GID recovery.
         maybeReactivateContext();

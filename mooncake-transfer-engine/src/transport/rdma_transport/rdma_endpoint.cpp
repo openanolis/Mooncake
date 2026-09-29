@@ -1083,9 +1083,13 @@ int RdmaEndPoint::submitPostSend(
                                     wr_count))
             break;
 
+        // The WRs are posted as one batch. A shared timestamp preserves the
+        // timeout/diagnostic meaning of slice->ts without calling
+        // clock_gettime once per small fragment.
+        const int64_t post_ts = getCurrentTimeInNano();
         for (int i = 0; i < wr_count; ++i) {
             auto *slice = slice_list[start + i];
-            slice->ts = getCurrentTimeInNano();
+            slice->ts = post_ts;
             slice->status = Transport::Slice::POSTED;
         }
         ibv_send_wr *bad_wr = nullptr;
