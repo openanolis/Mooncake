@@ -211,16 +211,18 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
 // add, get and remove RPCMetaEntryMeta
 TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
     auto hostname_port = parseHostNameWithPort(local_server_name);
+    const std::string server_name =
+        metadata_server == P2PHANDSHAKE ? local_server_name : "test_server";
     TransferMetadata::RpcMetaDesc desc;
     desc.ip_or_host_name = hostname_port.first.c_str();
     desc.rpc_port = hostname_port.second;
-    int re = metadata_client->addRpcMetaEntry("test_server", desc);
+    int re = metadata_client->addRpcMetaEntry(server_name, desc);
     ASSERT_EQ(re, 0);
     TransferMetadata::RpcMetaDesc desc1;
-    re = metadata_client->getRpcMetaEntry("test_server", desc1);
+    re = metadata_client->getRpcMetaEntry(server_name, desc1);
     ASSERT_EQ(desc.ip_or_host_name, desc1.ip_or_host_name);
     ASSERT_EQ(desc.rpc_port, desc1.rpc_port);
-    re = metadata_client->removeRpcMetaEntry("test_server");
+    re = metadata_client->removeRpcMetaEntry(server_name);
     ASSERT_EQ(re, 0);
 }
 
@@ -824,6 +826,59 @@ TEST(TransferMetadataVersionTest, P2PRpcMetaKeepsLegacyVersionZero) {
     EXPECT_EQ(metadata.localRpcMeta().metadata_version, 0U);
 }
 
+TEST(TransferMetadataCommandTest, AuthenticatedBinaryCommandRoundTrips) {
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int server_sockfd = -1;
+    const uint16_t server_port = findAvailableTcpPort(server_sockfd);
+    ASSERT_GT(server_port, 0);
+    const std::string server_name = "127.0.0.1:" + std::to_string(server_port);
+    TransferMetadata::RpcMetaDesc server_rpc{};
+    server_rpc.ip_or_host_name = "127.0.0.1";
+    server_rpc.rpc_port = server_port;
+    server_rpc.sockfd = server_sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(server_name, server_rpc), 0);
+    ASSERT_EQ(server.startHandshakeDaemon({}, server_port, server_sockfd), 0);
+
+    const std::string request("scatter\0plan", 12);
+    const std::string expected_response("done\0ok", 7);
+    server.registerOnCommandCallBack([&](const std::string &peer,
+                                         const std::string &command,
+                                         std::string &response) {
+        EXPECT_EQ(peer.substr(0, peer.find(':')), "127.0.0.1");
+        EXPECT_EQ(command, request);
+        response = expected_response;
+        return 0;
+    });
+
+    int client_sockfd = -1;
+    const uint16_t client_port = findAvailableTcpPort(client_sockfd);
+    ASSERT_GT(client_port, 0);
+    const std::string client_name = "127.0.0.1:" + std::to_string(client_port);
+    TransferMetadata::RpcMetaDesc client_rpc{};
+    client_rpc.ip_or_host_name = "127.0.0.1";
+    client_rpc.rpc_port = client_port;
+    client_rpc.sockfd = client_sockfd;
+    ASSERT_EQ(client.addRpcMetaEntry(client_name, client_rpc), 0);
+
+    std::string response;
+    EXPECT_EQ(client.sendCommand(server_name, request, response),
+              ERR_NOT_IMPLEMENTED);
+
+    TransferMetadata::HandShakeDesc handshake_request, handshake_response;
+    ASSERT_EQ(client.sendHandshake(server_name, handshake_request,
+                                   handshake_response),
+              0);
+    ASSERT_TRUE(client.supportsCommand(server_name));
+    ASSERT_EQ(client.sendCommand(server_name, request, response), 0);
+    EXPECT_EQ(response, expected_response);
+
+    const std::string oversized(kMaxTransferCommandLength, 'x');
+    EXPECT_EQ(client.sendCommand(server_name, oversized, response),
+              ERR_INVALID_ARGUMENT);
+}
+
 TEST(TransferMetadataPublicationTest, PreservesLocalOnlyBufferWithoutRkey) {
     constexpr uint64_t kRemoteAddr = 0x1000;
     constexpr uint64_t kLocalOnlyAddr = 0x2000;
@@ -988,6 +1043,55 @@ TEST(HandshakeFrameTest, ValidTypedFrameWithTlsLikeNativeEndianLength) {
 
     close(fds[0]);
     close(fds[1]);
+}
+
+TEST(HandshakeCommandTest, ReusableAndFreshPreparedCommandsRoundTrip) {
+    auto server = HandShakePlugin::Create(P2PHANDSHAKE);
+    auto client = HandShakePlugin::Create(P2PHANDSHAKE);
+    ASSERT_NE(server, nullptr);
+    ASSERT_NE(client, nullptr);
+
+    std::atomic<size_t> received{0};
+    std::mutex peers_mutex;
+    std::vector<std::string> peers;
+    server->registerOnCommandCallBack([&](const std::string &peer,
+                                          const std::string &request,
+                                          std::string &response) {
+        response = request;
+        {
+            std::lock_guard<std::mutex> lock(peers_mutex);
+            peers.push_back(peer);
+        }
+        received.fetch_add(1);
+        return 0;
+    });
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    ASSERT_EQ(server->startDaemon(port, sockfd), 0);
+
+    const std::string payload(384 * 1024, 'x');
+    for (const bool reusable : {true, true, true, false, false}) {
+        auto prepared =
+            client->prepareCommand("127.0.0.1", port, "127.0.0.1", reusable);
+        ASSERT_NE(prepared, nullptr);
+        std::string response;
+        ASSERT_EQ(prepared->send(payload, response), 0);
+        EXPECT_EQ(response, payload);
+    }
+    EXPECT_EQ(received.load(), 5);
+    ASSERT_EQ(peers.size(), 5);
+    EXPECT_EQ(peers[0], peers[1]);
+    EXPECT_EQ(peers[1], peers[2]);
+    EXPECT_NE(peers[2], peers[3]);
+    EXPECT_NE(peers[3], peers[4]);
+
+    auto abandoned =
+        client->prepareCommand("127.0.0.1", port, "127.0.0.1", true);
+    ASSERT_NE(abandoned, nullptr);
+    client.reset();
+    abandoned.reset();
 }
 
 TEST(HandshakeFrameTest, OldProtocolFrameStillWorks) {
