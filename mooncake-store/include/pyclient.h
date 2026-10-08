@@ -328,6 +328,8 @@ class PyClient {
     virtual int64_t get_into(const std::string &key, void *buffer,
                              size_t size) = 0;
 
+    // GPU destinations are supported when registered with register_buffer().
+    // Keep each destination and its registration alive until this call returns.
     // query_result_cache is optional and is only used to reuse fresh
     // batch_query() results for this read; callers still do not provide any
     // replica-selection or ranged-read metadata directly.

@@ -584,6 +584,168 @@ TEST_F(RealClientTest, PinnedSsdRestoreReadsNonTailRangeIntoGpu) {
     EXPECT_TRUE(std::equal(actual.begin(), actual.end(),
                            source.begin() + kSourceOffset));
 }
+
+TEST_F(RealClientTest, RemoteMemoryRangesReadIntoRegisteredGpuBuffer) {
+    if (FLAGS_protocol != "rdma") {
+        GTEST_SKIP() << "Direct GPU scatter requires RDMA";
+    }
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "0");
+    ScopedEnvVar scatter_only("MC_STORE_GATHER_READ", "0");
+    StartMasterAndSetupClient();
+    auto requester = RealClient::create();
+    ASSERT_EQ(requester->setup_real("localhost:17828", "P2PHANDSHAKE",
+                                    16 * 1024 * 1024, 16 * 1024 * 1024,
+                                    FLAGS_protocol, FLAGS_device_name,
+                                    master_address_),
+              0);
+
+    const std::string key = "remote_memory_gpu_ranges";
+    std::vector<char> source(256);
+    for (size_t i = 0; i < source.size(); ++i)
+        source[i] = static_cast<char>(i % 251);
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    constexpr size_t kCapacity = 96;
+    void* destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&destination, kCapacity), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [&requester, &registered](void* ptr) {
+        if (registered) {
+            EXPECT_EQ(requester->unregister_buffer(ptr), 0);
+        }
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> owner(destination, cleanup);
+    ASSERT_EQ(requester->register_buffer(destination, kCapacity), 0);
+    registered = true;
+    ASSERT_EQ(cudaMemset(destination, 0xa5, kCapacity), cudaSuccess);
+
+    const auto results = requester->get_into_ranges(
+        {destination}, {{key}}, {{{3, 35, kCapacity, kCapacity}}},
+        {{{11, 41, 0, 0}}}, {{{7, 5, 0, 1}}});
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_EQ(results[0].size(), 1);
+    EXPECT_EQ(results[0][0], (std::vector<int64_t>{
+                                 7, 5, 0, toInt(ErrorCode::INVALID_PARAMS)}));
+
+    std::vector<unsigned char> actual(kCapacity);
+    ASSERT_EQ(cudaMemcpy(actual.data(), destination, kCapacity,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    for (size_t i = 0; i < kCapacity; ++i) {
+        unsigned char expected = 0xa5;
+        if (i >= 3 && i < 10)
+            expected = static_cast<unsigned char>(source[11 + i - 3]);
+        if (i >= 35 && i < 40)
+            expected = static_cast<unsigned char>(source[41 + i - 35]);
+        EXPECT_EQ(actual[i], expected) << "destination offset " << i;
+    }
+
+    auto* interior = static_cast<char*>(destination) + 8;
+    EXPECT_EQ(requester->get_into_ranges({interior}, {{key}}, {{{1}}}, {{{73}}},
+                                         {{{5}}}),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{5}}}));
+    ASSERT_EQ(cudaMemcpy(actual.data(), destination, kCapacity,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    for (size_t i = 0; i < 5; ++i)
+        EXPECT_EQ(actual[9 + i], static_cast<unsigned char>(source[73 + i]));
+}
+
+TEST_F(RealClientTest, RemoteMemoryGatherReadsIntoRegisteredGpuBuffer) {
+    if (FLAGS_protocol != "rdma") {
+        GTEST_SKIP() << "GPU gather reads require RDMA";
+    }
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "0");
+    StartMasterAndSetupClient();
+    auto requester = RealClient::create();
+    ASSERT_EQ(requester->setup_real("localhost:17829", "P2PHANDSHAKE",
+                                    16 * 1024 * 1024, 16 * 1024 * 1024,
+                                    FLAGS_protocol, FLAGS_device_name,
+                                    master_address_),
+              0);
+
+    const std::string key = "remote_memory_gpu_gather";
+    std::vector<char> source(1 << 20);
+    for (size_t i = 0; i < source.size(); ++i)
+        source[i] = static_cast<char>((i * 17 + i / 251) % 253);
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    const auto snapshot = requester->prepare_get_into_ranges_snapshot({key});
+    ASSERT_TRUE(snapshot.query_result_cache.at(key).has_value());
+    ASSERT_FALSE(snapshot.query_result_cache.at(key)->replicas.empty());
+    MasterClient discovery(generate_uuid());
+    ASSERT_EQ(discovery.Connect(master_address_), ErrorCode::OK);
+    const auto owner_endpoint = snapshot.query_result_cache.at(key)
+                                    ->replicas[0]
+                                    .get_memory_descriptor()
+                                    .buffer_descriptor.transport_endpoint_;
+    const auto gather_endpoint =
+        discovery.ResolveGatherEndpoint(owner_endpoint);
+    ASSERT_TRUE(gather_endpoint.has_value());
+    ASSERT_FALSE(gather_endpoint->empty());
+
+    constexpr size_t kCount = 512;
+    constexpr size_t kLength = 264;
+    constexpr size_t kPrefix = 31;
+    constexpr size_t kCapacity = kPrefix + kCount * kLength + 23;
+    std::vector<size_t> dst_offsets, src_offsets, sizes;
+    for (size_t i = 0; i < kCount; ++i) {
+        dst_offsets.push_back(kPrefix + i * kLength);
+        src_offsets.push_back((i * 3593) % (source.size() - kLength));
+        sizes.push_back(kLength);
+    }
+
+    void* destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&destination, kCapacity), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [&requester, &registered](void* ptr) {
+        if (registered) {
+            EXPECT_EQ(requester->unregister_buffer(ptr), 0);
+        }
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> owner(destination, cleanup);
+    ASSERT_EQ(requester->register_buffer(destination, kCapacity), 0);
+    registered = true;
+
+    for (const char* mode : {"0", "1"}) {
+        SCOPED_TRACE(std::string("MC_STORE_GATHER_READ=") + mode);
+        ScopedEnvVar gather_mode("MC_STORE_GATHER_READ", mode);
+        ASSERT_EQ(cudaMemset(destination, 0xa5, kCapacity), cudaSuccess);
+        const auto results =
+            requester->get_into_ranges({destination}, {{key}}, {{dst_offsets}},
+                                       {{src_offsets}}, {{sizes}});
+        ASSERT_EQ(results.size(), 1);
+        ASSERT_EQ(results[0].size(), 1);
+        ASSERT_EQ(results[0][0].size(), kCount);
+        for (const auto result : results[0][0]) EXPECT_EQ(result, kLength);
+
+        std::vector<unsigned char> actual(kCapacity);
+        ASSERT_EQ(cudaMemcpy(actual.data(), destination, kCapacity,
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        for (size_t i = 0; i < kPrefix; ++i) EXPECT_EQ(actual[i], 0xa5);
+        for (size_t i = 0; i < kCount; ++i) {
+            EXPECT_EQ(std::memcmp(actual.data() + dst_offsets[i],
+                                  source.data() + src_offsets[i], kLength),
+                      0)
+                << "fragment " << i;
+        }
+        for (size_t i = kPrefix + kCount * kLength; i < kCapacity; ++i)
+            EXPECT_EQ(actual[i], 0xa5);
+    }
+}
 #endif
 
 TEST_F(RealClientTest, AllocateAndMountSegmentAlignsAndUnmounts) {
