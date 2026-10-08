@@ -2067,9 +2067,19 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     chunk_bytes = (lane_bytes + kChunkAlignment - 1) &
                                   ~(kChunkAlignment - 1);
                 }
+                uint8_t pipeline_depth = decision.pipeline_depth;
+                // Large fixed plans otherwise keep the planner's multi-MiB
+                // chunk, so the first CPU pack cannot overlap RDMA. On the
+                // 26 MiB Engram scatter, 512 KiB and depth 2 was the best
+                // measured point; smaller lookups keep the planner decision.
+                constexpr size_t kLargeFixedChunkBytes = 512ULL << 10;
+                if (fixed.total_bytes > kMultiLaneMaxBytes) {
+                    chunk_bytes = kLargeFixedChunkBytes;
+                    pipeline_depth = 2;
+                }
                 fixed.chunk_bytes =
                     std::max<size_t>(chunk_bytes, payload->fixed_span_length);
-                fixed.pipeline_depth = decision.pipeline_depth;
+                fixed.pipeline_depth = pipeline_depth;
                 fixed.compact_plan = true;
                 fixed.fixed_span_length = payload->fixed_span_length;
                 fixed.prepared_command = std::move(prepared_command);
