@@ -61,105 +61,36 @@ EngramStore::get_query_cache(const std::vector<int>& layer_ids,
                              const std::vector<std::string>& keys) const {
     if (layer_ids.empty()) return nullptr;
 
-    std::shared_ptr<QueryCacheRefreshState> refresh_state;
-    uint64_t refresh_generation = 0;
-    for (;;) {
-        const auto now = std::chrono::steady_clock::now();
-        std::unique_lock<std::mutex> lock(query_cache_mutex_);
-        std::shared_ptr<QueryCacheEntry> cached;
-        if (layer_ids.size() == 1) {
-            const auto found = query_cache_.find(layer_ids.front());
-            if (found != query_cache_.end()) cached = found->second;
-        } else {
-            cached = multi_layer_query_cache_;
-        }
-        if (cached && cached->layer_ids == layer_ids &&
-            cached->snapshot.reusable(now)) {
-            return cached;
-        }
-
-        auto [state_it, inserted] =
-            query_cache_refreshes_.try_emplace(
-                layer_ids, std::make_shared<QueryCacheRefreshState>());
-        (void)inserted;
-        refresh_state = state_it->second;
-        if (refresh_state->in_flight) {
-            refresh_state->condition.wait(lock, [&] {
-                return !refresh_state->in_flight;
-            });
-            continue;
-        }
-        refresh_state->in_flight = true;
-        refresh_generation = query_cache_generations_[layer_ids];
-        lock.unlock();
-
-        const auto finish_refresh = [&]() {
-            {
-                std::lock_guard<std::mutex> lock(query_cache_mutex_);
-                refresh_state->in_flight = false;
-                query_cache_refreshes_.erase(layer_ids);
-            }
-            refresh_state->condition.notify_all();
-        };
-
-        try {
-            // Keep every allocation and cache publication under the cleanup
-            // guard. A failed allocation must not leave this key permanently
-            // marked as in-flight.
-            auto entry = std::make_shared<QueryCacheEntry>();
-            entry->layer_ids = layer_ids;
-            entry->snapshot = store_->prepare_get_into_ranges_snapshot(keys);
-            const bool reusable =
-                entry->snapshot.reusable(std::chrono::steady_clock::now());
-            bool retry_after_invalidation = false;
-            {
-                std::lock_guard<std::mutex> lock(query_cache_mutex_);
-                const auto generation_it =
-                    query_cache_generations_.find(layer_ids);
-                const uint64_t current_generation =
-                    generation_it == query_cache_generations_.end()
-                        ? 0
-                        : generation_it->second;
-                const bool generation_current =
-                    current_generation == refresh_generation;
-                // Do not publish a snapshot prepared before an invalidation. A
-                // concurrent remove/populate must force the next lookup to
-                // query the current object generation rather than reuse stale
-                // placement data.
-                if (reusable && generation_current) {
-                    if (layer_ids.size() == 1)
-                        query_cache_[layer_ids.front()] = entry;
-                    else
-                        multi_layer_query_cache_ = entry;
-                }
-                retry_after_invalidation = reusable && !generation_current;
-            }
-            finish_refresh();
-            if (retry_after_invalidation) continue;
-            return reusable ? std::shared_ptr<const QueryCacheEntry>(entry)
-                            : nullptr;
-        } catch (...) {
-            finish_refresh();
-            throw;
-        }
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(query_cache_mutex_);
+    std::shared_ptr<QueryCacheEntry>* cache_entry;
+    if (layer_ids.size() == 1) {
+        cache_entry = &query_cache_[layer_ids.front()];
+    } else {
+        cache_entry = &multi_layer_query_cache_;
     }
+    if (*cache_entry && (*cache_entry)->layer_ids == layer_ids &&
+        (*cache_entry)->snapshot.reusable(now)) {
+        return *cache_entry;
+    }
+
+    auto entry = std::make_shared<QueryCacheEntry>();
+    entry->layer_ids = layer_ids;
+    entry->snapshot = store_->prepare_get_into_ranges_snapshot(keys);
+    if (!entry->snapshot.reusable(now)) return nullptr;
+
+    *cache_entry = entry;
+    return entry;
 }
 
 void EngramStore::invalidate_query_cache(int layer_id) const {
     std::lock_guard<std::mutex> lock(query_cache_mutex_);
     query_cache_.erase(layer_id);
-    ++query_cache_generations_[std::vector<int>{layer_id}];
     if (multi_layer_query_cache_ &&
         std::find(multi_layer_query_cache_->layer_ids.begin(),
                   multi_layer_query_cache_->layer_ids.end(),
                   layer_id) != multi_layer_query_cache_->layer_ids.end()) {
         multi_layer_query_cache_.reset();
-    }
-    for (auto& [layers, generation] : query_cache_generations_) {
-        if (layers.size() > 1 &&
-            std::find(layers.begin(), layers.end(), layer_id) != layers.end()) {
-            ++generation;
-        }
     }
 }
 
@@ -189,18 +120,6 @@ int EngramStore::lookup_into(int layer_id, const int64_t* row_ids, int B, int L,
 
 int EngramStore::lookup_many_into(
     const std::vector<LookupRequest>& requests) const {
-    return lookup_many_into_impl(requests, true);
-}
-
-int EngramStore::lookup_many_into_registered(
-    const std::vector<LookupRequest>& requests) const {
-    if (!store_) return -1;
-    return lookup_many_into_impl(requests, false);
-}
-
-int EngramStore::lookup_many_into_impl(
-    const std::vector<LookupRequest>& requests,
-    bool clear_outputs_on_failure) const {
     if (requests.empty()) return 0;
 
     struct LookupPlan {
@@ -258,10 +177,8 @@ int EngramStore::lookup_many_into_impl(
     }
 
     auto fail_lookups = [&]() {
-        if (clear_outputs_on_failure) {
-            for (const auto& plan : plans)
-                std::memset(plan.request->output, 0, plan.expected_size);
-        }
+        for (const auto& plan : plans)
+            std::memset(plan.request->output, 0, plan.expected_size);
         return -1;
     };
 

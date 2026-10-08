@@ -21,7 +21,6 @@
 #include <json/value.h>
 #include <net/if.h>
 #include <netdb.h>
-#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 
@@ -46,10 +45,7 @@
 #endif  // USE_ETCD
 
 #include <cassert>
-#include <condition_variable>
-#include <deque>
 #include <set>
-#include <unordered_map>
 
 #include "common.h"
 #include "config.h"
@@ -783,165 +779,6 @@ static inline const std::string getNetworkAddress(struct sockaddr *addr) {
     return "";
 }
 
-struct PendingSocketConnect {
-    int fd = -1;
-    int flags = 0;
-    bool connected = false;
-    int64_t deadline_ms = 0;
-    std::string remote_address;
-};
-
-ssize_t sendFullyNoSignal(int fd, const void *buffer, size_t length) {
-    const auto *position = static_cast<const char *>(buffer);
-    size_t remaining = length;
-    while (remaining != 0) {
-        const ssize_t written = send(fd, position, remaining, MSG_NOSIGNAL);
-        if (written < 0 && (errno == EAGAIN || errno == EINTR)) continue;
-        if (written <= 0) return written;
-        position += written;
-        remaining -= written;
-    }
-    return static_cast<ssize_t>(length);
-}
-
-int sendCommandFrame(int fd, const std::string &request) {
-    const uint64_t length = request.size() + sizeof(uint8_t);
-    const uint8_t type =
-        static_cast<uint8_t>(HandShakeRequestType::TransferCommand);
-    if (sendFullyNoSignal(fd, &length, sizeof(length)) !=
-            static_cast<ssize_t>(sizeof(length)) ||
-        sendFullyNoSignal(fd, &type, sizeof(type)) !=
-            static_cast<ssize_t>(sizeof(type)) ||
-        sendFullyNoSignal(fd, request.data(), request.size()) !=
-            static_cast<ssize_t>(request.size()))
-        return ERR_SOCKET;
-    return 0;
-}
-
-int beginSocketConnect(struct addrinfo *addr, const std::string &source_ip,
-                       PendingSocketConnect &pending) {
-    int on = 1;
-    pending.fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
-    if (pending.fd == -1) {
-        PLOG(ERROR) << "SocketHandShakePlugin: socket()";
-        return ERR_SOCKET;
-    }
-    const auto fail = [&](int status) {
-        close(pending.fd);
-        pending.fd = -1;
-        return status;
-    };
-    if (setsockopt(pending.fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on))) {
-        PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(TCP_NODELAY)";
-        return fail(ERR_SOCKET);
-    }
-    if (setsockopt(pending.fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
-        PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
-        return fail(ERR_SOCKET);
-    }
-
-    if (!source_ip.empty()) {
-        struct addrinfo hints {};
-        struct addrinfo *sources = nullptr;
-        hints.ai_family = addr->ai_family;
-        hints.ai_socktype = addr->ai_socktype;
-        if (getaddrinfo(source_ip.c_str(), "0", &hints, &sources))
-            return fail(ERR_DNS);
-        bool bound = false;
-        for (auto *source = sources; source; source = source->ai_next) {
-            if (bind(pending.fd, source->ai_addr, source->ai_addrlen) == 0) {
-                bound = true;
-                break;
-            }
-        }
-        freeaddrinfo(sources);
-        if (!bound) return fail(ERR_SOCKET);
-    }
-
-    struct timeval timeout;
-    timeout.tv_sec = 60;
-    timeout.tv_usec = 0;
-    if (setsockopt(pending.fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                   sizeof(timeout))) {
-        PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
-        return fail(ERR_SOCKET);
-    }
-
-    // SO_RCVTIMEO does not bound connect(). Start every connection in
-    // non-blocking mode so callers can either wait here or overlap the TCP
-    // handshake with command planning before finishSocketConnect().
-    pending.flags = fcntl(pending.fd, F_GETFL, 0);
-    if (pending.flags == -1 ||
-        fcntl(pending.fd, F_SETFL, pending.flags | O_NONBLOCK) == -1) {
-        PLOG(ERROR) << "SocketHandShakePlugin: fcntl(O_NONBLOCK)";
-        return fail(ERR_SOCKET);
-    }
-
-    pending.remote_address = getNetworkAddress(addr->ai_addr);
-    pending.deadline_ms = getCurrentTimeInMilli() +
-                          globalConfig().handshake_connect_timeout * 1000;
-    if (connect(pending.fd, addr->ai_addr, addr->ai_addrlen) == 0) {
-        pending.connected = true;
-        return 0;
-    }
-    if (errno != EINPROGRESS) {
-        PLOG(ERROR) << "SocketHandShakePlugin: connect()"
-                    << pending.remote_address;
-        return fail(ERR_SOCKET);
-    }
-    return 0;
-}
-
-int finishSocketConnect(PendingSocketConnect &pending) {
-    const auto fail = [&](int status) {
-        close(pending.fd);
-        pending.fd = -1;
-        return status;
-    };
-    if (!pending.connected) {
-        struct pollfd pfd;
-        pfd.fd = pending.fd;
-        pfd.events = POLLOUT;
-        while (true) {
-            const int64_t remaining_ms =
-                pending.deadline_ms - getCurrentTimeInMilli();
-            const int ret =
-                remaining_ms <= 0 ? 0 : poll(&pfd, 1, (int)remaining_ms);
-            if (ret > 0) break;
-            if (ret == 0) {
-                errno = ETIMEDOUT;
-                PLOG(ERROR) << "SocketHandShakePlugin: connect() "
-                            << pending.remote_address;
-                return fail(ERR_SOCKET);
-            }
-            if (errno != EINTR) {
-                PLOG(ERROR) << "SocketHandShakePlugin: poll()";
-                return fail(ERR_SOCKET);
-            }
-        }
-
-        int conn_err = 0;
-        socklen_t err_len = sizeof(conn_err);
-        if (getsockopt(pending.fd, SOL_SOCKET, SO_ERROR, &conn_err, &err_len)) {
-            PLOG(ERROR) << "SocketHandShakePlugin: getsockopt(SO_ERROR)";
-            return fail(ERR_SOCKET);
-        }
-        if (conn_err) {
-            errno = conn_err;
-            PLOG(ERROR) << "SocketHandShakePlugin: connect()"
-                        << pending.remote_address;
-            return fail(ERR_SOCKET);
-        }
-    }
-
-    if (fcntl(pending.fd, F_SETFL, pending.flags) == -1) {
-        PLOG(ERROR) << "SocketHandShakePlugin: fcntl(restore flags)";
-        return fail(ERR_SOCKET);
-    }
-    pending.connected = true;
-    return 0;
-}
-
 struct SocketHandShakePlugin : public HandShakePlugin {
     SocketHandShakePlugin() : listener_running_(false), listen_fd_(-1) {
         auto &config = globalConfig();
@@ -956,395 +793,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         }
     }
 
-    struct CommandJob {
-        int fd;
-        std::string peer_address;
-        std::string request;
-        std::chrono::steady_clock::time_point accepted;
-        std::chrono::steady_clock::time_point received;
-    };
-
-    struct CachedCommandConnection {
-        int fd = -1;
-        std::chrono::steady_clock::time_point idle_since;
-    };
-
-    struct CommandConnectionCache {
-        std::mutex mutex;
-        std::unordered_map<std::string, CachedCommandConnection> connections;
-        bool stopping = false;
-    };
-
-    struct SocketPreparedCommand final : PreparedHandshakeCommand {
-        SocketPreparedCommand(std::shared_ptr<CommandConnectionCache> cache,
-                              PendingSocketConnect pending,
-                              std::chrono::steady_clock::time_point started,
-                              std::string cache_key, bool reusable, bool reused)
-            : cache(std::move(cache)),
-              pending(std::move(pending)),
-              started(started),
-              cache_key(std::move(cache_key)),
-              reusable(reusable),
-              reused(reused) {}
-
-        ~SocketPreparedCommand() override {
-            if (pending.fd < 0) return;
-            if (reusable && reused && cache) {
-                SocketHandShakePlugin::cacheCommandConnection(cache, cache_key,
-                                                              pending.fd);
-            } else {
-                close(pending.fd);
-            }
-            pending.fd = -1;
-        }
-
-        int send(const std::string &request, std::string &response) override {
-            const auto send_started = std::chrono::steady_clock::now();
-            int ret = finishSocketConnect(pending);
-            if (ret) return ret;
-            const auto connected = std::chrono::steady_clock::now();
-            ret = sendCommandFrame(pending.fd, request);
-            if (ret) {
-                close(pending.fd);
-                pending.fd = -1;
-                return ret;
-            }
-            const auto written = std::chrono::steady_clock::now();
-            auto [type, wire_response] = readString(pending.fd);
-            const auto read = std::chrono::steady_clock::now();
-            if (type != HandShakeRequestType::TransferCommand) {
-                close(pending.fd);
-                pending.fd = -1;
-                return ERR_SOCKET;
-            }
-            response = std::move(wire_response);
-            const int completed_fd = pending.fd;
-            pending.fd = -1;
-            if (reusable && cache) {
-                SocketHandShakePlugin::cacheCommandConnection(cache, cache_key,
-                                                              completed_fd);
-            } else {
-                close(completed_fd);
-            }
-            const auto milliseconds = [](auto duration) {
-                return std::chrono::duration<double, std::milli>(duration)
-                    .count();
-            };
-            VLOG(1) << "prepared transfer command socket profile bytes="
-                    << request.size() << " prepare_lead_ms="
-                    << milliseconds(send_started - started)
-                    << " finish_ms=" << milliseconds(connected - send_started)
-                    << " write_ms=" << milliseconds(written - connected)
-                    << " read_ms=" << milliseconds(read - written)
-                    << " send_ms=" << milliseconds(read - send_started)
-                    << " reused=" << reused;
-            return 0;
-        }
-
-        std::shared_ptr<CommandConnectionCache> cache;
-        PendingSocketConnect pending;
-        std::chrono::steady_clock::time_point started;
-        std::string cache_key;
-        bool reusable;
-        bool reused;
-    };
-
-    static std::string commandConnectionKey(const std::string &ip_or_host_name,
-                                            uint16_t rpc_port,
-                                            const std::string &source_ip) {
-        return ip_or_host_name + ":" + std::to_string(rpc_port) + "|" +
-               source_ip;
-    }
-
-    int takeCommandConnection(const std::string &cache_key) {
-        int fd = -1;
-        {
-            std::lock_guard<std::mutex> lock(command_connection_cache_->mutex);
-            auto entry = command_connection_cache_->connections.find(cache_key);
-            if (entry == command_connection_cache_->connections.end())
-                return -1;
-            const bool expired =
-                std::chrono::steady_clock::now() - entry->second.idle_since >
-                std::chrono::seconds(30);
-            fd = entry->second.fd;
-            command_connection_cache_->connections.erase(entry);
-            if (expired) {
-                close(fd);
-                return -1;
-            }
-        }
-
-        char byte = 0;
-        const ssize_t peeked =
-            recv(fd, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
-        if (peeked < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return fd;
-        }
-        close(fd);
-        return -1;
-    }
-
-    static void cacheCommandConnection(
-        const std::shared_ptr<CommandConnectionCache> &cache,
-        const std::string &cache_key, int fd) {
-        if (fd < 0) return;
-        int replaced = -1;
-        {
-            std::lock_guard<std::mutex> lock(cache->mutex);
-            if (cache->stopping) {
-                replaced = fd;
-            } else {
-                auto [entry, inserted] = cache->connections.emplace(
-                    cache_key, CachedCommandConnection{
-                                   fd, std::chrono::steady_clock::now()});
-                if (!inserted) {
-                    replaced = entry->second.fd;
-                    entry->second = {fd, std::chrono::steady_clock::now()};
-                }
-            }
-        }
-        if (replaced >= 0) close(replaced);
-    }
-
-    void closeCommandConnections() {
-        std::unordered_map<std::string, CachedCommandConnection> connections;
-        {
-            std::lock_guard<std::mutex> lock(command_connection_cache_->mutex);
-            command_connection_cache_->stopping = true;
-            connections.swap(command_connection_cache_->connections);
-        }
-        for (const auto &[key, connection] : connections) {
-            (void)key;
-            close(connection.fd);
-        }
-    }
-
-    bool enqueueCommand(int fd, std::string peer_address, std::string request,
-                        std::chrono::steady_clock::time_point accepted,
-                        std::chrono::steady_clock::time_point received) {
-        {
-            std::lock_guard<std::mutex> lock(command_mutex_);
-            if (!on_command_callback_ || command_stopping_ ||
-                command_queue_.size() >= kCommandQueueDepth)
-                return false;
-            command_queue_.push_back(CommandJob{fd, std::move(peer_address),
-                                                std::move(request), accepted,
-                                                received});
-        }
-        command_cv_.notify_one();
-        return true;
-    }
-
-    struct IdleCommandConnection {
-        int fd = -1;
-        std::string peer_address;
-        std::string request_buffer;
-    };
-
-    void returnCommandConnection(int fd, std::string peer_address,
-                                 std::string request_buffer = {}) {
-        if (fd < 0) return;
-        {
-            std::lock_guard<std::mutex> lock(command_idle_mutex_);
-            if (!command_reuse_running_) {
-                close(fd);
-                return;
-            }
-            pending_idle_commands_.push_back(
-                {fd, std::move(peer_address), std::move(request_buffer)});
-        }
-        const uint8_t wake = 1;
-        if (command_wakeup_pipe_[1] >= 0) {
-            const ssize_t wake_result =
-                write(command_wakeup_pipe_[1], &wake, sizeof(wake));
-            (void)wake_result;
-        }
-    }
-
-    void commandReuseWorker() {
-        std::vector<IdleCommandConnection> idle;
-        while (command_reuse_running_) {
-            {
-                std::lock_guard<std::mutex> lock(command_idle_mutex_);
-                for (auto &connection : pending_idle_commands_)
-                    idle.push_back(std::move(connection));
-                pending_idle_commands_.clear();
-            }
-
-            std::vector<struct pollfd> poll_fds(idle.size() + 1);
-            poll_fds[0] = {command_wakeup_pipe_[0], POLLIN, 0};
-            for (size_t i = 0; i < idle.size(); ++i) {
-                poll_fds[i + 1] = {
-                    idle[i].fd, static_cast<short>(POLLIN | POLLERR | POLLHUP),
-                    0};
-            }
-
-            const int ready = poll(poll_fds.data(), poll_fds.size(), -1);
-            if (ready < 0) {
-                if (errno == EINTR) continue;
-                PLOG(ERROR) << "SocketHandShakePlugin: command poll()";
-                break;
-            }
-            if (poll_fds[0].revents & POLLIN) {
-                uint8_t wake[64];
-                while (read(command_wakeup_pipe_[0], wake, sizeof(wake)) > 0) {
-                }
-            }
-            if (!command_reuse_running_) break;
-
-            for (size_t i = idle.size(); i != 0; --i) {
-                const short events = poll_fds[i].revents;
-                if (events == 0) continue;
-                IdleCommandConnection connection = std::move(idle[i - 1]);
-                idle[i - 1] = std::move(idle.back());
-                idle.pop_back();
-
-                if (!(events & POLLIN)) {
-                    close(connection.fd);
-                    continue;
-                }
-                char first_byte = 0;
-                const ssize_t peeked =
-                    recv(connection.fd, &first_byte, sizeof(first_byte),
-                         MSG_PEEK | MSG_DONTWAIT);
-                if (peeked <= 0) {
-                    close(connection.fd);
-                    continue;
-                }
-                const auto accepted = std::chrono::steady_clock::now();
-                const auto type =
-                    readString(connection.fd, connection.request_buffer);
-                const auto received = std::chrono::steady_clock::now();
-                if (type != HandShakeRequestType::TransferCommand ||
-                    !enqueueCommand(connection.fd,
-                                    std::move(connection.peer_address),
-                                    std::move(connection.request_buffer),
-                                    accepted, received)) {
-                    close(connection.fd);
-                }
-            }
-        }
-
-        command_reuse_running_ = false;
-        for (const auto &connection : idle) close(connection.fd);
-        std::vector<IdleCommandConnection> pending;
-        {
-            std::lock_guard<std::mutex> lock(command_idle_mutex_);
-            pending.swap(pending_idle_commands_);
-        }
-        for (const auto &connection : pending) close(connection.fd);
-    }
-
-    void startCommandReuse() {
-        if (command_reuse_running_) return;
-        if (pipe(command_wakeup_pipe_)) {
-            PLOG(ERROR) << "SocketHandShakePlugin: command pipe()";
-            command_wakeup_pipe_[0] = -1;
-            command_wakeup_pipe_[1] = -1;
-            return;
-        }
-        for (const int fd : command_wakeup_pipe_) {
-            const int flags = fcntl(fd, F_GETFL, 0);
-            if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-        }
-        command_reuse_running_ = true;
-        command_reuse_worker_ = std::thread([this] { commandReuseWorker(); });
-    }
-
-    void stopCommandReuse() {
-        if (command_reuse_running_.exchange(false)) {
-            const uint8_t wake = 1;
-            if (command_wakeup_pipe_[1] >= 0) {
-                const ssize_t wake_result =
-                    write(command_wakeup_pipe_[1], &wake, sizeof(wake));
-                (void)wake_result;
-            }
-        }
-        if (command_reuse_worker_.joinable()) command_reuse_worker_.join();
-        for (int &fd : command_wakeup_pipe_) {
-            if (fd >= 0) close(fd);
-            fd = -1;
-        }
-    }
-
-    void commandWorker() {
-        while (true) {
-            CommandJob job;
-            OnReceiveCommand callback;
-            {
-                std::unique_lock<std::mutex> lock(command_mutex_);
-                command_cv_.wait(lock, [this] {
-                    return command_stopping_ || !command_queue_.empty();
-                });
-                if (command_stopping_ && command_queue_.empty()) return;
-                job = std::move(command_queue_.front());
-                command_queue_.pop_front();
-                callback = on_command_callback_;
-            }
-
-            const auto started = std::chrono::steady_clock::now();
-            std::string response;
-            try {
-                if (callback) callback(job.peer_address, job.request, response);
-            } catch (const std::exception &exception) {
-                LOG(ERROR) << "SocketHandShakePlugin: command failed: "
-                           << exception.what();
-                response.clear();
-            } catch (...) {
-                LOG(ERROR) << "SocketHandShakePlugin: command failed";
-                response.clear();
-            }
-            const auto executed = std::chrono::steady_clock::now();
-            const size_t request_bytes = job.request.size();
-            const int write_status = writeString(
-                job.fd, HandShakeRequestType::TransferCommand, response);
-            if (write_status) {
-                LOG(ERROR) << "SocketHandShakePlugin: failed to send command "
-                              "response";
-            }
-            const auto responded = std::chrono::steady_clock::now();
-            if (write_status) {
-                close(job.fd);
-            } else {
-                returnCommandConnection(job.fd, std::move(job.peer_address),
-                                        std::move(job.request));
-            }
-            const auto milliseconds = [](auto duration) {
-                return std::chrono::duration<double, std::milli>(duration)
-                    .count();
-            };
-            VLOG(1) << "transfer command owner socket profile bytes="
-                    << request_bytes << " receive_ms="
-                    << milliseconds(job.received - job.accepted)
-                    << " queue_ms=" << milliseconds(started - job.received)
-                    << " execute_ms=" << milliseconds(executed - started)
-                    << " respond_ms=" << milliseconds(responded - executed)
-                    << " total_ms=" << milliseconds(responded - job.accepted);
-        }
-    }
-
-    void stopCommandWorkers() {
-        {
-            std::lock_guard<std::mutex> lock(command_mutex_);
-            command_stopping_ = true;
-        }
-        command_cv_.notify_all();
-        for (auto &worker : command_workers_) worker.join();
-        command_workers_.clear();
-        while (!command_queue_.empty()) {
-            close(command_queue_.front().fd);
-            command_queue_.pop_front();
-        }
-    }
-
     virtual ~SocketHandShakePlugin() {
         if (listener_running_) {
             listener_running_ = false;
             listener_.join();
         }
-        stopCommandReuse();
-        stopCommandWorkers();
-        closeCommandConnections();
         closeListen();
     }
 
@@ -1362,21 +815,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
     virtual void registerOnProbeCallBack(OnReceiveCallBack callback) {
         on_probe_callback_ = callback;
-    }
-
-    virtual void registerOnCommandCallBack(OnReceiveCommand callback) {
-        bool start_reuse = false;
-        {
-            std::lock_guard<std::mutex> lock(command_mutex_);
-            on_command_callback_ = std::move(callback);
-            if (on_command_callback_ && command_workers_.empty()) {
-                command_stopping_ = false;
-                for (size_t i = 0; i < kCommandWorkerCount; ++i)
-                    command_workers_.emplace_back([this] { commandWorker(); });
-                start_reuse = true;
-            }
-        }
-        if (start_reuse) startCommandReuse();
     }
 
     virtual int startDaemon(uint16_t listen_port, int sockfd) {
@@ -1455,8 +893,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         listener_running_ = true;
         listener_ = std::thread([this]() {
             while (listener_running_) {
-                sockaddr_storage addr{};
-                socklen_t addr_len = sizeof(addr);
+                sockaddr_in addr;
+                socklen_t addr_len = sizeof(sockaddr_in);
                 int conn_fd = accept(listen_fd_, (sockaddr *)&addr, &addr_len);
                 if (conn_fd < 0) {
                     if (errno != EWOULDBLOCK && errno != EINTR)
@@ -1464,18 +902,9 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     continue;
                 }
 
-                if (addr.ss_family != AF_INET && addr.ss_family != AF_INET6) {
+                if (addr.sin_family != AF_INET && addr.sin_family != AF_INET6) {
                     LOG(ERROR) << "SocketHandShakePlugin: unsupported socket "
                                   "type, should be AF_INET or AF_INET6";
-                    close(conn_fd);
-                    continue;
-                }
-
-                int no_delay = 1;
-                if (setsockopt(conn_fd, IPPROTO_TCP, TCP_NODELAY, &no_delay,
-                               sizeof(no_delay))) {
-                    PLOG(ERROR)
-                        << "SocketHandShakePlugin: setsockopt(TCP_NODELAY)";
                     close(conn_fd);
                     continue;
                 }
@@ -1496,27 +925,9 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
                 Json::Value local, peer;
 
-                const auto accepted = std::chrono::steady_clock::now();
                 auto [type, json_str] = readString(conn_fd);
-                const auto received = std::chrono::steady_clock::now();
                 if (type == HandShakeRequestType::Invalid) {
                     close(conn_fd);
-                    continue;
-                }
-
-                if (type == HandShakeRequestType::TransferCommand) {
-                    timeout.tv_sec = 60;
-                    if (setsockopt(conn_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
-                                   sizeof(timeout))) {
-                        close(conn_fd);
-                        continue;
-                    }
-                    if (!enqueueCommand(conn_fd, std::move(peer_hostname),
-                                        std::move(json_str), accepted,
-                                        received)) {
-                        writeString(conn_fd, type, {});
-                        close(conn_fd);
-                    }
                     continue;
                 }
 
@@ -1661,76 +1072,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return ret;
     }
 
-    virtual int sendCommand(std::string ip_or_host_name, uint16_t rpc_port,
-                            const std::string &source_ip,
-                            const std::string &request, std::string &response) {
-        struct addrinfo hints {};
-        struct addrinfo *result = nullptr;
-        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        char service[16];
-        sprintf(service, "%u", rpc_port);
-        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result))
-            return ERR_DNS;
-
-        int ret = ERR_SOCKET;
-        for (auto *address = result; address; address = address->ai_next) {
-            ret = doSendCommand(address, source_ip, request, response);
-            if (ret == 0) break;
-        }
-        freeaddrinfo(result);
-        return ret;
-    }
-
-    std::unique_ptr<PreparedHandshakeCommand> prepareCommand(
-        std::string ip_or_host_name, uint16_t rpc_port,
-        const std::string &source_ip, bool reusable) override {
-        const std::string cache_key =
-            reusable
-                ? commandConnectionKey(ip_or_host_name, rpc_port, source_ip)
-                : std::string{};
-        const auto started = std::chrono::steady_clock::now();
-        if (reusable) {
-            const int cached_fd = takeCommandConnection(cache_key);
-            if (cached_fd >= 0) {
-                PendingSocketConnect pending;
-                pending.fd = cached_fd;
-                pending.flags = fcntl(cached_fd, F_GETFL, 0);
-                pending.connected = true;
-                if (pending.flags >= 0) {
-                    return std::make_unique<SocketPreparedCommand>(
-                        command_connection_cache_, std::move(pending), started,
-                        cache_key, true, true);
-                }
-                close(cached_fd);
-            }
-        }
-
-        struct addrinfo hints {};
-        struct addrinfo *result = nullptr;
-        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        char service[16];
-        sprintf(service, "%u", rpc_port);
-        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result))
-            return {};
-
-        std::unique_ptr<PreparedHandshakeCommand> prepared;
-        for (auto *address = result; address; address = address->ai_next) {
-            PendingSocketConnect pending;
-            if (beginSocketConnect(address, source_ip, pending) == 0) {
-                prepared = std::make_unique<SocketPreparedCommand>(
-                    command_connection_cache_, std::move(pending), started,
-                    cache_key, reusable, false);
-                break;
-            }
-        }
-        freeaddrinfo(result);
-        return prepared;
-    }
-
     virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
                      const Json::Value &local, Json::Value &peer) {
         struct addrinfo hints;
@@ -1767,15 +1108,104 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return ret;
     }
 
-    int doConnect(struct addrinfo *addr, int &conn_fd,
-                  const std::string &source_ip = {}) {
-        PendingSocketConnect pending;
-        int ret = beginSocketConnect(addr, source_ip, pending);
-        if (ret) return ret;
-        ret = finishSocketConnect(pending);
-        if (ret) return ret;
-        conn_fd = pending.fd;
-        pending.fd = -1;
+    int doConnect(struct addrinfo *addr, int &conn_fd) {
+        int on = 1;
+        conn_fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+        if (conn_fd == -1) {
+            PLOG(ERROR) << "SocketHandShakePlugin: socket()";
+            return ERR_SOCKET;
+        }
+        if (setsockopt(conn_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
+            PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_REUSEADDR)";
+            close(conn_fd);
+            return ERR_SOCKET;
+        }
+
+        struct timeval timeout;
+        timeout.tv_sec = 60;
+        timeout.tv_usec = 0;
+        if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                       sizeof(timeout))) {
+            PLOG(ERROR) << "SocketHandShakePlugin: setsockopt(SO_RCVTIMEO)";
+            close(conn_fd);
+            return ERR_SOCKET;
+        }
+
+        // SO_RCVTIMEO does not apply to connect(). A blocking connect() to
+        // an unroutable address (e.g. a torn-down pod IP) stalls for the
+        // kernel's full SYN-retry cycle -- minutes -- and this runs on RDMA
+        // worker threads, where the stall also blocks CQ polling. Connect in
+        // non-blocking mode and bound the wait with poll().
+        int flags = fcntl(conn_fd, F_GETFL, 0);
+        if (flags == -1 || fcntl(conn_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+            PLOG(ERROR) << "SocketHandShakePlugin: fcntl(O_NONBLOCK)";
+            close(conn_fd);
+            return ERR_SOCKET;
+        }
+
+        if (connect(conn_fd, addr->ai_addr, addr->ai_addrlen)) {
+            if (errno != EINPROGRESS) {
+                PLOG(ERROR) << "SocketHandShakePlugin: connect()"
+                            << getNetworkAddress(addr->ai_addr);
+                close(conn_fd);
+                return ERR_SOCKET;
+            }
+
+            const int64_t deadline_ms =
+                getCurrentTimeInMilli() +
+                globalConfig().handshake_connect_timeout * 1000;
+            struct pollfd pfd;
+            pfd.fd = conn_fd;
+            pfd.events = POLLOUT;
+            while (true) {
+                const int64_t remaining_ms =
+                    deadline_ms - getCurrentTimeInMilli();
+                // poll() returning 0 already means the timeout expired; an
+                // exhausted deadline (only reachable after EINTR) is the
+                // same condition.
+                int ret =
+                    remaining_ms <= 0 ? 0 : poll(&pfd, 1, (int)remaining_ms);
+                if (ret > 0) break;
+                if (ret == 0) {
+                    errno = ETIMEDOUT;
+                    PLOG(ERROR) << "SocketHandShakePlugin: connect() "
+                                << getNetworkAddress(addr->ai_addr);
+                    close(conn_fd);
+                    return ERR_SOCKET;
+                }
+                if (errno != EINTR) {
+                    PLOG(ERROR) << "SocketHandShakePlugin: poll()";
+                    close(conn_fd);
+                    return ERR_SOCKET;
+                }
+                // EINTR: retry with the remaining time.
+            }
+
+            int conn_err = 0;
+            socklen_t err_len = sizeof(conn_err);
+            if (getsockopt(conn_fd, SOL_SOCKET, SO_ERROR, &conn_err,
+                           &err_len)) {
+                PLOG(ERROR) << "SocketHandShakePlugin: getsockopt(SO_ERROR)";
+                close(conn_fd);
+                return ERR_SOCKET;
+            }
+            if (conn_err) {
+                errno = conn_err;
+                PLOG(ERROR) << "SocketHandShakePlugin: connect()"
+                            << getNetworkAddress(addr->ai_addr);
+                close(conn_fd);
+                return ERR_SOCKET;
+            }
+        }
+
+        // Restore blocking mode; the request/response exchange relies on
+        // blocking reads bounded by SO_RCVTIMEO.
+        if (fcntl(conn_fd, F_SETFL, flags) == -1) {
+            PLOG(ERROR) << "SocketHandShakePlugin: fcntl(restore flags)";
+            close(conn_fd);
+            return ERR_SOCKET;
+        }
+
         return 0;
     }
 
@@ -1936,40 +1366,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return 0;
     }
 
-    int doSendCommand(struct addrinfo *addr, const std::string &source_ip,
-                      const std::string &request, std::string &response) {
-        const auto started = std::chrono::steady_clock::now();
-        int conn_fd = -1;
-        int ret = doConnect(addr, conn_fd, source_ip);
-        if (ret) return ret;
-        const auto connected = std::chrono::steady_clock::now();
-
-        ret = writeString(conn_fd, HandShakeRequestType::TransferCommand,
-                          request);
-        if (ret) {
-            close(conn_fd);
-            return ret;
-        }
-        const auto written = std::chrono::steady_clock::now();
-        auto [type, wire_response] = readString(conn_fd);
-        const auto read = std::chrono::steady_clock::now();
-        if (type != HandShakeRequestType::TransferCommand) {
-            close(conn_fd);
-            return ERR_SOCKET;
-        }
-        response = std::move(wire_response);
-        close(conn_fd);
-        const auto milliseconds = [](auto duration) {
-            return std::chrono::duration<double, std::milli>(duration).count();
-        };
-        VLOG(1) << "transfer command socket profile bytes=" << request.size()
-                << " connect_ms=" << milliseconds(connected - started)
-                << " write_ms=" << milliseconds(written - connected)
-                << " read_ms=" << milliseconds(read - written)
-                << " total_ms=" << milliseconds(read - started);
-        return 0;
-    }
-
     int doSendMetadata(struct addrinfo *addr, const Json::Value &local_metadata,
                        Json::Value &peer_metadata) {
         int conn_fd = -1;
@@ -2016,24 +1412,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     std::thread listener_;
     int listen_fd_;
     int listen_backlog_;
-
-    static constexpr size_t kCommandWorkerCount = 4;
-    static constexpr size_t kCommandQueueDepth = 16;
-    std::mutex command_mutex_;
-    std::condition_variable command_cv_;
-    std::deque<CommandJob> command_queue_;
-    std::vector<std::thread> command_workers_;
-    OnReceiveCommand on_command_callback_;
-    bool command_stopping_ = false;
-
-    std::mutex command_idle_mutex_;
-    std::vector<IdleCommandConnection> pending_idle_commands_;
-    std::atomic<bool> command_reuse_running_{false};
-    std::thread command_reuse_worker_;
-    int command_wakeup_pipe_[2] = {-1, -1};
-
-    std::shared_ptr<CommandConnectionCache> command_connection_cache_ =
-        std::make_shared<CommandConnectionCache>();
 
     OnReceiveCallBack on_connection_callback_;
     OnReceiveCallBack on_metadata_callback_;

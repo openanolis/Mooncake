@@ -28,7 +28,6 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <shared_mutex>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -40,12 +39,6 @@
 namespace mooncake {
 struct MetadataStoragePlugin;
 struct HandShakePlugin;
-class TransferEngineImplTestPeer;
-
-struct PreparedHandshakeCommand {
-    virtual ~PreparedHandshakeCommand() = default;
-    virtual int send(const std::string &request, std::string &response) = 0;
-};
 
 // Result of a metadata-backend lookup, distinguishing an authoritative
 // key absence (kNotFound — the master removed the segment key on peer
@@ -62,8 +55,6 @@ enum class GetResult {
 #define P2PHANDSHAKE "P2PHANDSHAKE"
 
 class TransferMetadata {
-    friend class TransferEngineImplTestPeer;
-
    public:
     struct DeviceDesc {
         std::string name;
@@ -176,13 +167,12 @@ class TransferMetadata {
 
     struct RpcMetaDesc {
         std::string ip_or_host_name;
-        uint16_t rpc_port = 0;
+        uint16_t rpc_port;
         uint64_t metadata_version{0};
-        std::string command_capability;
 #ifdef USE_BAREX
-        uint16_t barex_port = 0;
+        uint16_t barex_port;
 #endif
-        int sockfd = -1;  // local cache
+        int sockfd;  // local cache
     };
 
     struct HandShakeDesc {
@@ -213,8 +203,6 @@ class TransferMetadata {
         uint32_t notify_qp_num = 0;
         uint16_t notify_rq_depth = 0;
         bool ctrl_channel = false;
-        // Opaque token advertising support for authenticated binary commands.
-        std::string command_capability;
         std::string reply_msg;  // on error
 #ifdef USE_EFA
         std::string efa_addr;  // EFA endpoint address (hex encoded)
@@ -303,21 +291,6 @@ class TransferMetadata {
     int sendNotify(const std::string &peer_server_name,
                    const NotifyDesc &local_desc, NotifyDesc &peer_desc);
     int sendProbe(const std::string &peer_server_name);
-    bool isP2PHandshakeMode() const { return p2p_handshake_mode_; }
-
-    using OnReceiveCommand =
-        std::function<int(const std::string &peer_address,
-                          const std::string &request, std::string &response)>;
-    void registerOnCommandCallBack(OnReceiveCommand callback);
-    std::unique_ptr<PreparedHandshakeCommand> prepareCommand(
-        const std::string &peer_server_name);
-    int sendCommand(const std::string &peer_server_name,
-                    const std::string &request, std::string &response);
-    int sendCommand(const std::string &peer_server_name,
-                    PreparedHandshakeCommand &prepared,
-                    const std::string &request, std::string &response);
-    bool supportsCommand(const std::string &peer_server_name);
-    bool supportsRemoteCommandPayload(const std::string &peer_server_name);
 
     void dumpMetadataContent(const std::string &segment_name = "",
                              uint64_t offset = 0, uint64_t length = 0);
@@ -364,10 +337,6 @@ class TransferMetadata {
     RWSpinlock rpc_meta_lock_;
     std::unordered_map<std::string, RpcMetaDesc> rpc_meta_map_;
     RpcMetaDesc local_rpc_meta_;
-
-    std::shared_mutex command_mutex_;
-    OnReceiveCommand on_command_callback_;
-    std::string command_capability_;
 
     std::atomic<SegmentID> next_segment_id_;
 
