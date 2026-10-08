@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <fstream>
@@ -517,6 +518,58 @@ class TerminalFailureTransport : public BatchResultTransport {
 
    private:
     bool initially_finished_;
+    std::vector<TransferTask*> tasks_;
+};
+
+class OneShotPollingFailureTransport : public BatchResultTransport {
+   public:
+    enum class Outcome { STATUS_ERROR, TIMEOUT };
+
+    explicit OneShotPollingFailureTransport(Outcome outcome)
+        : outcome_(outcome) {}
+
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        for (auto* task : tasks) task->is_finished = true;
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        ++status_calls_;
+        if (status_calls_ == 1) {
+            if (outcome_ == Outcome::STATUS_ERROR)
+                return Status::Context("synthetic status polling failure");
+            status.s = TransferStatusEnum::TIMEOUT;
+            return Status::OK();
+        }
+        status.s = TransferStatusEnum::COMPLETED;
+        return Status::OK();
+    }
+
+    size_t statusCalls() const { return status_calls_; }
+
+   private:
+    Outcome outcome_;
+    size_t status_calls_ = 0;
+};
+
+class PendingPollingFailureTransport : public BatchResultTransport {
+   public:
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        tasks_ = tasks;
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus&) override {
+        return Status::Context("synthetic persistent status failure");
+    }
+
+    void finishTasks() {
+        for (auto* task : tasks_) task->is_finished = true;
+    }
+
+   private:
     std::vector<TransferTask*> tasks_;
 };
 
@@ -1040,6 +1093,131 @@ TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
     EXPECT_EQ(transport->request_counts, (std::vector<size_t>{2}));
     transport->addExtraSlice();
     EXPECT_EQ(run(), (std::vector<bool>{false, false}));
+}
+
+TEST_F(TransportTest, ScatterStatusPollingFailureCompletesRequestExactlyOnce) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<OneShotPollingFailureTransport>(
+        OneShotPollingFailureTransport::Outcome::STATUS_ERROR);
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(
+        impl, {{"one-shot-status-error", transport}});
+
+    constexpr SegmentID kSegmentId = 12;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "one-shot-status-error";
+    impl.getMetadata()->addLocalSegment(kSegmentId, "remote",
+                                        std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    std::array<size_t, 1> offsets{0};
+    std::array<size_t, 1> lengths{1};
+    std::vector<bool> fragment_ok;
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "remote",
+        .remote_base_offset = 0,
+        .remote_size = buffer.size(),
+        .local_buffer = buffer.data(),
+        .local_capacity = buffer.size(),
+        .local_offsets = offsets,
+        .remote_offsets = offsets,
+        .lengths = lengths,
+        .on_fragment_complete =
+            [&](size_t, const Status& status) {
+                fragment_ok.push_back(status.ok());
+            },
+    };
+
+    EXPECT_FALSE(engine.submitScatter({range}).wait().ok());
+    EXPECT_EQ(fragment_ok, (std::vector<bool>{false}));
+    EXPECT_EQ(transport->statusCalls(), 1);
+}
+
+TEST_F(TransportTest, ScatterTimeoutCompletesLegacyRequestExactlyOnce) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<OneShotPollingFailureTransport>(
+        OneShotPollingFailureTransport::Outcome::TIMEOUT);
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(
+        impl, {{"one-shot-timeout", transport}});
+
+    constexpr SegmentID kSegmentId = 12;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "one-shot-timeout";
+    impl.getMetadata()->addLocalSegment(kSegmentId, "remote",
+                                        std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    std::array<size_t, 1> offsets{0};
+    std::array<size_t, 1> lengths{1};
+    std::vector<bool> fragment_ok;
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "remote",
+        .remote_base_offset = 0,
+        .remote_size = buffer.size(),
+        .local_buffer = buffer.data(),
+        .local_capacity = buffer.size(),
+        .local_offsets = offsets,
+        .remote_offsets = offsets,
+        .lengths = lengths,
+        .on_fragment_complete =
+            [&](size_t, const Status& status) {
+                fragment_ok.push_back(status.ok());
+            },
+    };
+
+    EXPECT_FALSE(engine.submitScatter({range}).wait().ok());
+    EXPECT_EQ(fragment_ok, (std::vector<bool>{false}));
+    EXPECT_EQ(transport->statusCalls(), 1);
+}
+
+TEST_F(TransportTest, ScatterPollingErrorKeepsBuffersUntilBatchDrains) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<PendingPollingFailureTransport>();
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(
+        impl, {{"pending-status-error", transport}});
+
+    constexpr SegmentID kSegmentId = 12;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "pending-status-error";
+    impl.getMetadata()->addLocalSegment(kSegmentId, "remote",
+                                        std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    std::array<size_t, 1> offsets{0};
+    std::array<size_t, 1> lengths{1};
+    std::vector<bool> fragment_ok;
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "remote",
+        .remote_base_offset = 0,
+        .remote_size = buffer.size(),
+        .local_buffer = buffer.data(),
+        .local_capacity = buffer.size(),
+        .local_offsets = offsets,
+        .remote_offsets = offsets,
+        .lengths = lengths,
+        .on_fragment_complete =
+            [&](size_t, const Status& status) {
+                fragment_ok.push_back(status.ok());
+            },
+    };
+
+    auto operation = engine.submitScatter({range});
+    EXPECT_TRUE(operation.waitFor(std::chrono::nanoseconds::zero()).IsClock());
+    EXPECT_TRUE(fragment_ok.empty());
+    transport->finishTasks();
+    EXPECT_FALSE(operation.wait().ok());
+    EXPECT_EQ(fragment_ok, (std::vector<bool>{false}));
 }
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION

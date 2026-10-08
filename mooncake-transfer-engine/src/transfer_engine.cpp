@@ -1401,6 +1401,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
 
     void poll() {
         size_t request_index = 0;
+        Status poll_error = Status::OK();
         for (size_t task_id = 0; task_id < task_sizes_.size(); ++task_id) {
             const size_t request_start = request_index;
             request_index += task_sizes_[task_id];
@@ -1409,6 +1410,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
             auto result = getStatus(batch_id_, task_id, status);
             if (!result.ok()) {
                 requestAbort(result);
+                if (poll_error.ok()) poll_error = result;
                 continue;
             }
 
@@ -1449,7 +1451,10 @@ class TransferEngine::ScatterTransferOperation::Impl {
                 fragment_status =
                     Status::Socket("scatter transfer fragment timed out");
                 requestAbort(fragment_status);
-                if (!useTent()) continue;
+                if (!useTent()) {
+                    if (poll_error.ok()) poll_error = fragment_status;
+                    continue;
+                }
             } else {
                 fragment_status =
                     Status::Socket("scatter transfer fragment failed");
@@ -1461,6 +1466,22 @@ class TransferEngine::ScatterTransferOperation::Impl {
         }
         assert(request_index == requests_.size());
 
+        // A legacy status error or logical timeout does not prove that the
+        // transport has stopped accessing the requests and their buffers.
+        // freeBatchID succeeds only after every published task has physically
+        // finished; preserve exact statuses already observed for other tasks.
+        if (remaining_ != 0 && !poll_error.ok() && !useTent()) {
+            const auto free_status = freeBatch(batch_id_);
+            if (free_status.IsBatchBusy()) return;
+            if (!free_status.ok()) {
+                remember(free_status);
+                return;
+            }
+            batch_id_ = INVALID_BATCH_ID;
+            failPending(poll_error);
+            finish();
+            return;
+        }
         if (remaining_ != 0) return;
         auto free_status = freeBatch(batch_id_);
         if (free_status.IsBatchBusy()) return;
