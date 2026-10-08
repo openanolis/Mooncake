@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <glog/logging.h>
 
@@ -108,6 +109,28 @@ class WorkerPoolTestPeer {
         pool.workers_running_.store(false);
         pool.cond_var_.notify_all();
         for (auto &entry : pool.worker_thread_) entry.join();
+    }
+
+    static void enqueuePrepared(WorkerPool &pool,
+                                const std::vector<Transport::Slice *> &slices) {
+        pool.enqueuePreparedSlices(slices, slices.size());
+    }
+
+    static uint64_t pendingForPeer(WorkerPool &pool, const std::string &path) {
+        const int owner = pool.postingThreadForPeer(path);
+        if (owner < 0) return 0;
+        return pool.pending_slice_state_[owner].load(std::memory_order_acquire);
+    }
+
+    static size_t queuedForPeer(WorkerPool &pool, const std::string &path) {
+        const int owner = pool.postingThreadForPeer(path);
+        if (owner < 0) return 0;
+        std::lock_guard<std::mutex> lock(pool.worker_slice_queue_lock_[owner]);
+        return pool.worker_slice_queue_[owner][path].size();
+    }
+
+    static uint64_t submittedCount(WorkerPool &pool) {
+        return pool.submitted_slice_count_.load(std::memory_order_acquire);
     }
 
     static int errorThreshold() { return WorkerPool::kRailErrorThreshold; }
@@ -222,6 +245,30 @@ class WorkerPoolRailStateTest : public ::testing::Test {
 
 TEST_F(WorkerPoolRailStateTest, UnknownRailIsAvailable) {
     EXPECT_TRUE(railAvailable(kPeerA));
+}
+
+TEST_F(WorkerPoolRailStateTest, BatchedEnqueuePublishesPerWorkerPendingState) {
+    Transport::Slice first{}, second{}, third{};
+    first.peer_nic_path = kPeerA;
+    second.peer_nic_path = kPeerB;
+    third.peer_nic_path = kPeerA;
+
+    WorkerPoolTestPeer::enqueuePrepared(*worker_pool_,
+                                        {&first, &second, &third});
+
+    EXPECT_EQ(WorkerPoolTestPeer::queuedForPeer(*worker_pool_, kPeerA), 2);
+    EXPECT_EQ(WorkerPoolTestPeer::queuedForPeer(*worker_pool_, kPeerB), 1);
+    EXPECT_EQ(WorkerPoolTestPeer::submittedCount(*worker_pool_), 3);
+    const auto pending_a =
+        WorkerPoolTestPeer::pendingForPeer(*worker_pool_, kPeerA);
+    const auto pending_b =
+        WorkerPoolTestPeer::pendingForPeer(*worker_pool_, kPeerB);
+    // Both peer paths may hash to the same worker. The queued-count bits
+    // describe that worker's entire cross-thread queue in either case.
+    EXPECT_GE(pending_a, 2 * 2);
+    EXPECT_GE(pending_b, 1 * 2);
+    EXPECT_EQ(pending_a & 1, 0);
+    EXPECT_EQ(pending_b & 1, 0);
 }
 
 // A single local fault must stay free: the endpoint is rebuilt and the slice
