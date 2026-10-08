@@ -1355,10 +1355,8 @@ Status TransferEngineImpl::executeScatterGather(const std::string& peer_address,
         return true;
     };
     const bool relative32 = command == kScatterGatherRelativeCommand;
-    if (relative32 && !contains(source_base, source_size)) {
-        return Status::AddressNotRegistered(
-            "scatter source window is not registered host memory");
-    }
+    const bool source_window_registered =
+        !relative32 || contains(source_base, source_size);
     if (fixed_relative32) {
         const size_t offsets_bytes =
             static_cast<size_t>(span_count) * sizeof(uint32_t);
@@ -1379,18 +1377,6 @@ Status TransferEngineImpl::executeScatterGather(const std::string& peer_address,
                         offsets_bytes);
             fixed_offsets = decoded_fixed_offsets.data();
         }
-        const uint32_t max_offset =
-            static_cast<uint32_t>(source_size - fixed_length);
-        if (remote_fixed_plan) {
-            defer_fixed_offset_validation = true;
-            fixed_max_offset = max_offset;
-        } else {
-            uint32_t invalid_offset = 0;
-            for (uint32_t i = 0; i < span_count; ++i)
-                invalid_offset |= fixed_offsets[i] > max_offset;
-            if (invalid_offset != 0)
-                return Status::InvalidArgument("invalid relative scatter span");
-        }
 #else
         decoded_fixed_offsets.resize(span_count);
         for (uint32_t i = 0; i < span_count; ++i) {
@@ -1403,6 +1389,24 @@ Status TransferEngineImpl::executeScatterGather(const std::string& peer_address,
         }
         fixed_offsets = decoded_fixed_offsets.data();
 #endif
+        const uint32_t max_offset =
+            static_cast<uint32_t>(source_size - fixed_length);
+        if (remote_fixed_plan && source_window_registered) {
+            defer_fixed_offset_validation = true;
+            fixed_max_offset = max_offset;
+        } else {
+            for (uint32_t i = 0; i < span_count; ++i) {
+                if (fixed_offsets[i] > max_offset) {
+                    return Status::InvalidArgument(
+                        "invalid relative scatter span");
+                }
+                if (!source_window_registered &&
+                    !contains(source_base + fixed_offsets[i], fixed_length)) {
+                    return Status::AddressNotRegistered(
+                        "scatter source is not registered host memory");
+                }
+            }
+        }
         if (!remote_fixed_plan) offset += offsets_bytes;
         decoded_bytes = total_bytes;
     } else {
@@ -1423,6 +1427,10 @@ Status TransferEngineImpl::executeScatterGather(const std::string& peer_address,
                 }
                 source = source_base + relative_offset;
                 length = relative_length;
+                if (!source_window_registered && !contains(source, length)) {
+                    return Status::AddressNotRegistered(
+                        "scatter source is not registered host memory");
+                }
             } else if (!readVarint(request, offset, source) ||
                        !readVarint(request, offset, length) || length == 0 ||
                        length > chunk_bytes || length > UINT32_MAX ||

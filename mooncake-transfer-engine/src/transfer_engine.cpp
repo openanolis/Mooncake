@@ -1206,14 +1206,10 @@ class TransferEngine::ScatterTransferOperation::Impl {
           synchronous_gather_(synchronous_gather) {
         callbacks_.reserve(ranges.size());
         batch_callbacks_.reserve(ranges.size());
-        size_t fragment_count = 0;
         for (const auto& range : ranges) {
             callbacks_.push_back(range.on_fragment_complete);
             batch_callbacks_.push_back(range.on_fragment_batch_complete);
-            fragment_count += range.lengths.size();
         }
-        requests_.reserve(fragment_count);
-        request_fragment_runs_.reserve(fragment_count);
         build(engine, ranges);
     }
 
@@ -1439,7 +1435,9 @@ class TransferEngine::ScatterTransferOperation::Impl {
         bool compact_plan = true;
         uint32_t fixed_span_length = 0;
         size_t fragment_count = 0;
+        size_t max_span_length = 0;
         bool direct_contiguous = true;
+        bool mixed_source_regions = false;
         size_t range_index = std::numeric_limits<size_t>::max();
         std::vector<TransferEngineImpl::ScatterSpan> spans;
         std::vector<uint32_t> span_fragment_counts;
@@ -1574,7 +1572,10 @@ class TransferEngine::ScatterTransferOperation::Impl {
                         run_offset = 0;
                     }
                 }
-                appendDirectTask(std::move(task));
+                if (direct.mixed_source_regions)
+                    direct_tasks.push_back(std::move(task));
+                else
+                    appendDirectTask(std::move(task));
                 destination += direct.spans[span_index].length;
             }
             DCHECK_EQ(run_index, direct.fragment_runs.size());
@@ -1605,6 +1606,16 @@ class TransferEngine::ScatterTransferOperation::Impl {
                 candidate.span_fragment_counts.reserve(fragment_capacity);
                 candidate.fragment_runs.reserve(ranges.size());
             };
+        const auto useAbsoluteSpanEncoding = [&] {
+            if (!candidate.compact_plan) return;
+            candidate.compact_plan = false;
+            candidate.fixed_span_length = 0;
+            candidate.encoded_span_bytes = 0;
+            for (const auto& span : candidate.spans) {
+                candidate.encoded_span_bytes +=
+                    varintBytes(span.source_address) + varintBytes(span.length);
+            }
+        };
         auto flush = [&] {
             if (candidate.fragment_count == 0) return;
             const auto decision = TransferEngineImpl::planScatter(
@@ -1614,14 +1625,12 @@ class TransferEngine::ScatterTransferOperation::Impl {
             if (decision.gather &&
                 backend_.legacy->supportsTransferCommand(candidate.peer)) {
                 const bool single_command_pipeline =
-                    all_gather_work && candidate.compact_plan &&
-                    candidate.fixed_span_length != 0 &&
-                    decision.pipeline_depth > 1;
+                    all_gather_work && decision.pipeline_depth > 1;
                 candidate.chunk_bytes =
                     single_command_pipeline
                         ? std::max<size_t>(
                               decision.chunk_bytes / decision.pipeline_depth,
-                              candidate.fixed_span_length)
+                              candidate.max_span_length)
                         : decision.chunk_bytes;
                 candidate.pipeline_depth =
                     single_command_pipeline ? decision.pipeline_depth : 1;
@@ -1756,6 +1765,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
             size_t direct_request_count = 0;
             bool first_fragment = true;
             bool prepare_attempted = false;
+            bool mixed_source_regions = false;
             const auto initializeFixed = [&](const auto& range) {
                 fixed.peer = range.remote_segment;
                 fixed.local_buffer = range.local_buffer;
@@ -1926,6 +1936,25 @@ class TransferEngine::ScatterTransferOperation::Impl {
                 fixed.fragment_runs.push_back({0, 0, count});
             } else {
                 allocateOwnedOffsets();
+                uint64_t source_window_base = UINT64_MAX;
+                uint64_t source_window_end = 0;
+                for (const auto& range : ranges) {
+                    if (range.local_offsets.empty()) continue;
+                    if (range.remote_size == 0 ||
+                        range.remote_base_offset >
+                            UINT64_MAX - range.remote_size) {
+                        return false;
+                    }
+                    source_window_base =
+                        std::min(source_window_base, range.remote_base_offset);
+                    source_window_end =
+                        std::max(source_window_end,
+                                 range.remote_base_offset + range.remote_size);
+                }
+                if (source_window_base == UINT64_MAX ||
+                    source_window_end - source_window_base > UINT32_MAX) {
+                    return false;
+                }
                 for (size_t range_index = 0; range_index < ranges.size();
                      ++range_index) {
                     const auto& range = ranges[range_index];
@@ -1942,13 +1971,17 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     }
                     if (fixed.fragment_count == 0) {
                         if (!initializeFixed(range)) return false;
+                        fixed.source_base = source_window_base;
+                        fixed.source_size =
+                            source_window_end - source_window_base;
                     } else if (fixed.peer != range.remote_segment ||
                                fixed.local_buffer != range.local_buffer ||
-                               fixed.local_capacity != range.local_capacity ||
-                               fixed.source_region_base !=
-                                   range.remote_base_offset ||
-                               fixed.source_region_size != range.remote_size) {
+                               fixed.local_capacity != range.local_capacity) {
                         return false;
+                    }
+                    if (fixed.source_region_base != range.remote_base_offset ||
+                        fixed.source_region_size != range.remote_size) {
+                        mixed_source_regions = true;
                     }
                     for (size_t fragment_index = 0; fragment_index < count;
                          ++fragment_index) {
@@ -1989,7 +2022,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
                             ++direct_request_count;
                         writeLittleEndian32(
                             relative_offset_output,
-                            static_cast<uint32_t>(remote_offset));
+                            static_cast<uint32_t>(source - fixed.source_base));
                         ++fixed.fragment_count;
                         prepareCommand();
                         fixed.total_bytes += length;
@@ -2031,12 +2064,11 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     const size_t lane_bytes =
                         (fixed.total_bytes + lanes - 1) / lanes;
                     constexpr size_t kChunkAlignment = 64ULL << 10;
-                    chunk_bytes =
-                        (lane_bytes + kChunkAlignment - 1) &
-                        ~(kChunkAlignment - 1);
+                    chunk_bytes = (lane_bytes + kChunkAlignment - 1) &
+                                  ~(kChunkAlignment - 1);
                 }
-                fixed.chunk_bytes = std::max<size_t>(
-                    chunk_bytes, payload->fixed_span_length);
+                fixed.chunk_bytes =
+                    std::max<size_t>(chunk_bytes, payload->fixed_span_length);
                 fixed.pipeline_depth = decision.pipeline_depth;
                 fixed.compact_plan = true;
                 fixed.fixed_span_length = payload->fixed_span_length;
@@ -2047,6 +2079,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
                 tasks.push_back(std::move(fixed));
                 return true;
             }
+            if (mixed_source_regions) return false;
             if (direct_request_count != 1) return false;
 
             DirectTask direct{
@@ -2123,14 +2156,9 @@ class TransferEngine::ScatterTransferOperation::Impl {
                         continue;
                     }
                     if (candidate.fragment_count != 0 &&
-                        ((candidate.range_index != range_index &&
-                          (candidate.peer != range.remote_segment ||
-                           candidate.local_buffer != range.local_buffer ||
-                           candidate.local_capacity != range.local_capacity ||
-                           candidate.source_region_base !=
-                               range.remote_base_offset ||
-                           candidate.source_region_size !=
-                               range.remote_size)) ||
+                        (candidate.peer != range.remote_segment ||
+                         candidate.local_buffer != range.local_buffer ||
+                         candidate.local_capacity != range.local_capacity ||
                          destination != expected_destination)) {
                         flush();
                     }
@@ -2155,6 +2183,21 @@ class TransferEngine::ScatterTransferOperation::Impl {
                                        length, count - fragment_index);
                     }
 
+                    bool same_source_region =
+                        candidate.source_region_base ==
+                            range.remote_base_offset &&
+                        candidate.source_region_size == range.remote_size;
+                    if (candidate.fragment_count != 0 && !same_source_region) {
+                        // Store ranged reads describe each object as a
+                        // separate source window even when all objects live on
+                        // the same peer. Keep one command across those object
+                        // boundaries, but use absolute spans so the owner
+                        // validates each registered region independently.
+                        candidate.mixed_source_regions = true;
+                        candidate.direct_contiguous = false;
+                        useAbsoluteSpanEncoding();
+                    }
+
                     if (candidate.fragment_count != 0 &&
                         source != expected_source)
                         candidate.direct_contiguous = false;
@@ -2169,18 +2212,12 @@ class TransferEngine::ScatterTransferOperation::Impl {
                             candidate.source_base = source_begin;
                             candidate.source_size = source_end - source_begin;
                         } else {
-                            candidate.compact_plan = false;
-                            candidate.encoded_span_bytes = 0;
-                            for (const auto& span : candidate.spans) {
-                                candidate.encoded_span_bytes +=
-                                    varintBytes(span.source_address) +
-                                    varintBytes(span.length);
-                            }
+                            useAbsoluteSpanEncoding();
                         }
                     }
 
                     bool coalesces =
-                        !candidate.spans.empty() &&
+                        same_source_region && !candidate.spans.empty() &&
                         candidate.spans.back().source_address <=
                             UINT64_MAX - candidate.spans.back().length &&
                         candidate.spans.back().source_address +
@@ -2224,6 +2261,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
                                        range.remote_base_offset,
                                        range.remote_size, range_index, source,
                                        length, count - fragment_index);
+                        same_source_region = true;
                         coalesces = false;
                         encoded_span_bytes =
                             candidate.compact_plan
@@ -2239,6 +2277,9 @@ class TransferEngine::ScatterTransferOperation::Impl {
                             {source, static_cast<uint32_t>(length)});
                         candidate.span_fragment_counts.push_back(1);
                     }
+                    candidate.max_span_length =
+                        std::max<size_t>(candidate.max_span_length,
+                                         candidate.spans.back().length);
                     if (candidate.compact_plan) {
                         if (candidate.spans.size() == 1) {
                             candidate.fixed_span_length =
@@ -2262,6 +2303,16 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     candidate.range_index = range_index;
                     expected_destination = destination + length;
                     expected_source = source + length;
+                    constexpr size_t kPrepareCommandMinFragments = 128;
+                    if (prepared_peer.empty() &&
+                        total_fragments >= kPrepareCommandMinFragments &&
+                        candidate.fragment_count >= total_fragments / 2 &&
+                        candidate.command_span_budget != 0) {
+                        prepared_peer = candidate.peer;
+                        prepared_command =
+                            backend_.legacy->prepareScatterCommand(
+                                candidate.peer);
+                    }
                 }
             }
             flush();
@@ -2614,6 +2665,10 @@ class TransferEngine::ScatterTransferOperation::Impl {
         std::vector<DirectTask> direct_tasks;
         const size_t optimized_fragments = buildScatterPlan(
             ranges, total_fragments, planned_fragments, direct_tasks);
+        const size_t direct_request_upper_bound =
+            direct_tasks.size() + (total_fragments - optimized_fragments);
+        requests_.reserve(direct_request_upper_bound);
+        request_fragment_runs_.reserve(direct_request_upper_bound);
         for (auto& task : direct_tasks) {
             auto [segment, inserted] = segment_handles_.emplace(
                 task.peer, static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT));
