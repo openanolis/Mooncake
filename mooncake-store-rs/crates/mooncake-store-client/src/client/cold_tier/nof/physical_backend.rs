@@ -11,10 +11,7 @@ use super::backend::NofBackend;
 use super::backing::validate_payload;
 use super::ensure_batch_len;
 use super::object::repeated_error;
-use super::physical::{
-    NofPhysicalDeleteRequest, NofPhysicalQueryRequest, NofPhysicalReadRequest,
-    NofPhysicalWriteRequest,
-};
+use super::physical::{NofPhysicalDeleteRequest, NofPhysicalReadRequest, NofPhysicalWriteRequest};
 
 const PHYSICAL_KEY_DOMAIN: &[u8] = b"mooncake:nof:physical";
 const ROOT_KEY_DOMAIN: &[u8] = b"root";
@@ -155,19 +152,6 @@ impl PersistentStorageBackend for NofPhysicalStorageBackend {
         Ok(value)
     }
 
-    fn query_object_length(&self, cold_backing: &ColdBackingRoute) -> Result<Option<u64>> {
-        one_batch_result(
-            "physical query",
-            self.target
-                .backing
-                .physical_query()
-                .expect("physical query capability was checked during construction")
-                .query_batch(&[NofPhysicalQueryRequest {
-                    key: self.root_key(cold_backing)?,
-                }]),
-        )
-    }
-
     fn get_objects_into_batch(
         &self,
         reads: &mut [ColdObjectRead<'_, '_>],
@@ -252,8 +236,8 @@ fn one_batch_result<T>(operation: &str, results: Vec<Result<T>>) -> Result<T> {
 mod tests {
     use super::*;
     use crate::{
-        NofBacking, NofHealth, NofPhysicalDelete, NofPhysicalQuery, NofPhysicalRead,
-        NofPhysicalWrite, NofStorageHealth,
+        NofBacking, NofHealth, NofPhysicalDelete, NofPhysicalRead, NofPhysicalWrite,
+        NofStorageHealth,
     };
     use mooncake_store_core::{ClientEpoch, ClientRuntimeId, ClientStableId};
     use std::collections::HashMap;
@@ -270,10 +254,6 @@ mod tests {
         }
 
         fn physical_read(&self) -> Option<&dyn NofPhysicalRead> {
-            Some(self)
-        }
-
-        fn physical_query(&self) -> Option<&dyn NofPhysicalQuery> {
             Some(self)
         }
 
@@ -311,16 +291,6 @@ mod tests {
             requests
                 .iter()
                 .map(|request| Ok(values.get(&request.key).cloned()))
-                .collect()
-        }
-    }
-
-    impl NofPhysicalQuery for MemoryExecutor {
-        fn query_batch(&self, requests: &[NofPhysicalQueryRequest]) -> Vec<Result<Option<u64>>> {
-            let values = self.values.lock().unwrap();
-            requests
-                .iter()
-                .map(|request| Ok(values.get(&request.key).map(|value| value.len() as u64)))
                 .collect()
         }
     }

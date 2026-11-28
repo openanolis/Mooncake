@@ -245,6 +245,39 @@ impl NofTargetManager {
         self.data_plane == Some(ProviderDataPlane::Managed)
     }
 
+    pub(in crate::client) fn is_object(&self) -> bool {
+        self.data_plane == Some(ProviderDataPlane::Object)
+    }
+
+    pub(in crate::client) fn is_physical(&self) -> bool {
+        self.data_plane == Some(ProviderDataPlane::Physical)
+    }
+
+    pub(in crate::client) fn is_physical_target(&self, target_id: &str) -> bool {
+        self.is_physical() && self.contains(target_id)
+    }
+
+    pub(in crate::client) fn physical_target_ids(&self) -> Vec<String> {
+        if self.data_plane != Some(ProviderDataPlane::Physical) {
+            return Vec::new();
+        }
+        self.state.targets.keys().cloned().collect()
+    }
+
+    pub(in crate::client) fn refresh_physical_target_health(
+        &self,
+        target_id: &str,
+    ) -> Result<Option<PersistentStorageBackendHealth>> {
+        if self.data_plane != Some(ProviderDataPlane::Physical) {
+            return Ok(None);
+        }
+        let target = self.state.targets.get(target_id).ok_or_else(|| {
+            StoreError::NotFound(format!("NoF target {target_id} is not registered"))
+        })?;
+        target.heartbeat(target_id);
+        target.health_snapshot().map(Some)
+    }
+
     pub(in crate::client) fn target_ids(&self) -> impl Iterator<Item = &str> {
         self.state.targets.keys().map(String::as_str)
     }
@@ -959,7 +992,7 @@ impl NofTargetManager {
         &self,
         route: &ObjectRoute,
     ) -> Result<Option<ColdBackingRoute>> {
-        if self.is_managed() {
+        if !self.is_object() {
             return Ok(None);
         }
         let locator = self.object_locator(route);
@@ -1063,13 +1096,36 @@ impl NofTargetManager {
                 None => Ok(deleted),
             };
         }
-        let object_locator = self.object_locator(route);
+        if self.is_object() {
+            let object_locator = self.object_locator(route);
+            let mut deleted = false;
+            let mut first_error = None;
+            for target_id in self.target_ids() {
+                let mut request = self.transient_backing(target_id, &object_locator);
+                request.state = ColdBackingState::PendingDelete;
+                match self.backend_for(target_id)?.delete_object(&request) {
+                    Ok(found) => deleted |= found,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            return match first_error {
+                Some(error) => Err(error),
+                None => Ok(deleted),
+            };
+        }
+        let Some(backing) = route.cold_backing.as_ref() else {
+            return Ok(false);
+        };
         let mut deleted = false;
         let mut first_error = None;
-        for target_id in self.target_ids() {
-            let mut request = self.transient_backing(target_id, &object_locator);
+        for mut request in crate::client::cold_tier::persistent_backing_targets(backing) {
             request.state = ColdBackingState::PendingDelete;
-            match self.backend_for(target_id)?.delete_object(&request) {
+            match self
+                .backend_for(&request.cold_tier_id)?
+                .delete_object(&request)
+            {
                 Ok(found) => deleted |= found,
                 Err(error) => {
                     first_error.get_or_insert(error);
@@ -1083,7 +1139,11 @@ impl NofTargetManager {
     }
 
     fn object_locator(&self, route: &ObjectRoute) -> String {
-        route.key.0.clone()
+        if self.is_physical() {
+            super::super::cold_backing_object_locator(route)
+        } else {
+            route.key.0.clone()
+        }
     }
 
     pub(in crate::client) fn release_ownership_on_shutdown(
@@ -1353,7 +1413,6 @@ fn provider_data_plane(backend: &NofBackend) -> Result<ProviderDataPlane> {
         && backend.backing.object_delete().is_some();
     let physical = backend.backing.physical_write().is_some()
         && backend.backing.physical_read().is_some()
-        && backend.backing.physical_query().is_some()
         && backend.backing.physical_delete().is_some();
     let managed = backend.backing.managed_allocator().is_some()
         && backend.backing.managed_read().is_some()

@@ -672,12 +672,21 @@ pub(in super::super) fn prepare_pending_offload_entry(
         }
     };
     let managed_nof = route.nof_backing.is_some();
-    if !transient_nof && !managed_nof && cold_backing.owner != storage_owner.runtime {
+    let physical_nof = !managed_nof
+        && storage_owner
+            .cold_tier_devices
+            .nof_targets
+            .is_physical_target(&cold_backing.cold_tier_id);
+    if !transient_nof
+        && !physical_nof
+        && !managed_nof
+        && cold_backing.owner != storage_owner.runtime
+    {
         storage_owner.sync_route(&route);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     }
     let device_id = cold_tier_device_id(&cold_backing);
-    let device = if transient_nof || managed_nof {
+    let device = if transient_nof || physical_nof || managed_nof {
         None
     } else {
         let Some(device) = devices.get(device_id).cloned() else {
@@ -754,6 +763,7 @@ pub(in super::super) fn prepare_pending_offload_entry(
             route,
             cold_backing,
             transient_nof,
+            physical_nof,
             managed_nof,
             payload,
             device,
@@ -1304,7 +1314,7 @@ fn rollback_ready_pending_offloads(
         // locators are idempotent and have no Mooncake capacity reservation, so retain them
         // for route confirmation/retry rather than risking an applied route pointing at data
         // we just deleted. Local Cold Tier keeps its established reservation rollback path.
-        if !pending[ready.index].transient_nof {
+        if !pending[ready.index].transient_nof && !pending[ready.index].physical_nof {
             remove_unpublished_persistent_backing(storage_owner, &ready.materialized_cold_backing);
         }
         reserved_release_bytes = checked_add_cold_tier_bytes(
@@ -1417,7 +1427,7 @@ fn apply_pending_offload_cas_result(
             // Per-item errors can also represent a lost CAS reply. See the batch-error path
             // above for why provider-managed NoF payloads are retained until retry confirms the
             // route; definite conflicts are handled by the preceding branch and cleaned up.
-            if !pending.transient_nof {
+            if !pending.transient_nof && !pending.physical_nof {
                 context
                     .outcome
                     .cleanup
@@ -1461,7 +1471,7 @@ fn reserve_pending_offload_batch(
     storage_owner: &StorageOwnerState,
     pending: &[PendingOffloadMaterialization],
 ) -> Result<()> {
-    if pending[0].transient_nof || pending[0].managed_nof {
+    if pending[0].transient_nof || pending[0].physical_nof || pending[0].managed_nof {
         return Ok(());
     }
     let reserved_bytes = sum_pending_offload_payload_bytes(pending)?;
@@ -1530,7 +1540,7 @@ fn settle_pending_offload_batch(
     used_add_bytes: i64,
     reserved_release_bytes: i64,
 ) -> Result<()> {
-    if pending[0].transient_nof || pending[0].managed_nof {
+    if pending[0].transient_nof || pending[0].physical_nof || pending[0].managed_nof {
         return Ok(());
     }
     storage_owner.apply_cold_tier_usage_delta(

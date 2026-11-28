@@ -3,9 +3,8 @@ use crate::{
     NofManagedLimits, NofManagedLocator, NofManagedRead, NofManagedReadRequest, NofManagedWrite,
     NofManagedWriteRequest, NofObjectDelete, NofObjectLimits, NofObjectQuery, NofObjectRead,
     NofObjectShardWrite, NofObjectState, NofObjectWrite, NofPhysicalDelete,
-    NofPhysicalDeleteRequest, NofPhysicalQuery, NofPhysicalQueryRequest, NofPhysicalRead,
-    NofPhysicalReadRequest, NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth,
-    NofTargetConfig,
+    NofPhysicalDeleteRequest, NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite,
+    NofPhysicalWriteRequest, NofStorageHealth, NofTargetConfig,
 };
 
 use super::cold_tier::nof::managed_backend::NofManagedStorageBackend;
@@ -17,6 +16,7 @@ struct FakePhysicalNof {
     available: AtomicBool,
     fail_next_read: AtomicBool,
     fail_next_write: AtomicBool,
+    capacity_bytes: Option<u64>,
 }
 
 impl Default for FakePhysicalNof {
@@ -26,6 +26,16 @@ impl Default for FakePhysicalNof {
             available: AtomicBool::new(true),
             fail_next_read: AtomicBool::new(false),
             fail_next_write: AtomicBool::new(false),
+            capacity_bytes: None,
+        }
+    }
+}
+
+impl FakePhysicalNof {
+    fn with_capacity(capacity_bytes: u64) -> Self {
+        Self {
+            capacity_bytes: Some(capacity_bytes),
+            ..Self::default()
         }
     }
 }
@@ -68,16 +78,6 @@ impl NofPhysicalRead for FakePhysicalNof {
     }
 }
 
-impl NofPhysicalQuery for FakePhysicalNof {
-    fn query_batch(&self, requests: &[NofPhysicalQueryRequest]) -> Vec<Result<Option<u64>>> {
-        let records = self.records.lock();
-        requests
-            .iter()
-            .map(|request| Ok(records.get(request.key.as_bytes()).map(|value| value.len() as u64)))
-            .collect()
-    }
-}
-
 impl NofPhysicalDelete for FakePhysicalNof {
     fn delete_batch(&self, requests: &[NofPhysicalDeleteRequest]) -> Vec<Result<()>> {
         let mut records = self.records.lock();
@@ -100,10 +100,6 @@ impl NofBacking for FakePhysicalNof {
         Some(self)
     }
 
-    fn physical_query(&self) -> Option<&dyn NofPhysicalQuery> {
-        Some(self)
-    }
-
     fn physical_delete(&self) -> Option<&dyn NofPhysicalDelete> {
         Some(self)
     }
@@ -116,7 +112,13 @@ impl NofBacking for FakePhysicalNof {
 impl NofHealth for FakePhysicalNof {
     fn health(&self) -> Result<NofStorageHealth> {
         if self.available.load(Ordering::Relaxed) {
-            Ok(NofStorageHealth::default())
+            let used_bytes = self.records.lock().values().map(Vec::len).sum::<usize>() as u64;
+            Ok(NofStorageHealth {
+                capacity_bytes: self.capacity_bytes,
+                available_bytes: self
+                    .capacity_bytes
+                    .map(|capacity| capacity.saturating_sub(used_bytes)),
+            })
         } else {
             Err(StoreError::Transport(
                 "fake NoF target is unavailable".to_string(),
@@ -408,6 +410,30 @@ fn physical_nof_client(
     (client, primary, replica)
 }
 
+fn single_physical_nof_client(
+    stable_id: &str,
+    target_id: &str,
+) -> (StoreClient, Arc<FakePhysicalNof>) {
+    let backend = Arc::new(FakePhysicalNof::default());
+    let target = NofTargetConfig::new(
+        target_id,
+        NofBackend::new(backend.clone()).expect("physical NoF backend should build"),
+    )
+    .expect("physical NoF target should build");
+    let client = StoreClientBuilder::new(Arc::new(InMemoryMetadataBackend::new()), stable_id)
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(Arc::new(TestTransport::new(&format!(
+            "{stable_id}-segment"
+        ))))
+        .local_memory(storage_config_with_bytes(512))
+        .nof_target(target)
+        .build(test_future_expiry_ms())
+        .expect("physical NoF client should build");
+    client.register_local_memory().unwrap();
+    (client, backend)
+}
+
 #[test]
 fn nof_targets_require_shared_embedded_route_metadata() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
@@ -433,7 +459,7 @@ fn nof_targets_require_shared_embedded_route_metadata() {
 }
 
 #[test]
-fn provider_owned_physical_nof_keeps_placement_out_of_object_route() {
+fn physical_nof_persists_placement_in_object_route() {
     let _cold_tier_env = enable_cold_tier_for_test();
     let (client, primary, replica) = physical_nof_client("nof-physical-runtime");
 
@@ -452,7 +478,26 @@ fn provider_owned_physical_nof_keeps_placement_out_of_object_route() {
         .query_route("physical-nof-key")
         .expect("physical NoF route query should succeed")
         .expect("physical NoF route should exist");
-    assert!(route.cold_backing.is_none());
+    let cold_backing = route
+        .cold_backing
+        .as_ref()
+        .expect("physical NoF placement should be persisted");
+    assert_eq!(
+        cold_backing.state,
+        mooncake_store_core::ColdBackingState::Materialized
+    );
+    let targets = std::iter::once(cold_backing.cold_tier_id.as_str())
+        .chain(
+            cold_backing
+                .replicas
+                .iter()
+                .map(|replica| replica.cold_tier_id.as_str()),
+        )
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        targets,
+        BTreeSet::from(["nof-physical-a", "nof-physical-b"])
+    );
     assert!(!primary.records.lock().is_empty());
     assert!(!replica.records.lock().is_empty());
 
@@ -472,17 +517,6 @@ fn provider_owned_physical_nof_keeps_placement_out_of_object_route() {
         0
     );
 
-    let mut replaced_route = route.clone();
-    replaced_route.replicas.clear();
-    client
-        .schedule_route_reclaim(&replaced_route)
-        .expect("storage-only reclaim should schedule");
-    client
-        .flush_due_reclaims()
-        .expect("storage-only reclaim should flush");
-    assert!(!primary.records.lock().is_empty());
-    assert!(!replica.records.lock().is_empty());
-
     force_cold_only_route(&client, "physical-nof-key");
     assert!(client
         .is_exist("physical-nof-key")
@@ -497,7 +531,7 @@ fn provider_owned_physical_nof_keeps_placement_out_of_object_route() {
     assert_eq!(
         client
             .get("physical-nof-key")
-            .expect("physical NoF restore should fail over to the queried replica"),
+            .expect("physical NoF restore should fail over to the recorded replica"),
         payload
     );
     client
@@ -516,6 +550,144 @@ fn provider_owned_physical_nof_keeps_placement_out_of_object_route() {
     assert!(replica.records.lock().is_empty());
 }
 
+
+#[test]
+fn physical_nof_read_miss_removes_recorded_placement() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let (client, backend) =
+        single_physical_nof_client("nof-physical-missing-runtime", "nof-physical-missing");
+
+    client.put("physical-nof-missing", &[7u8; 150]).unwrap();
+    assert_eq!(
+        client
+            .storage_owner
+            .materialize_pending_offloads_bounded(32)
+            .unwrap(),
+        1
+    );
+    force_cold_only_route(&client, "physical-nof-missing");
+    backend.records.lock().clear();
+
+    assert!(matches!(
+        client.get("physical-nof-missing"),
+        Err(StoreError::NotFound(_))
+    ));
+    let route = client.query_route("physical-nof-missing").unwrap();
+    assert!(route.is_none(), "stale physical route remains: {route:?}");
+}
+
+#[test]
+fn physical_nof_stale_miss_does_not_remove_newer_route() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let (client, _) =
+        single_physical_nof_client("nof-physical-stale-miss-runtime", "nof-physical-stale-miss");
+    client.put("physical-nof-stale-miss", &[9u8; 150]).unwrap();
+    assert_eq!(
+        client
+            .storage_owner
+            .materialize_pending_offloads_bounded(32)
+            .unwrap(),
+        1
+    );
+    let stale = client
+        .query_route("physical-nof-stale-miss")
+        .unwrap()
+        .unwrap();
+    let stale_backing = stale.cold_backing.clone().unwrap();
+    let mut newer = stale.clone();
+    newer.version = newer.version.next();
+    assert!(client
+        .cas_route("physical-nof-stale-miss", Some(stale.version), Some(&newer))
+        .unwrap()
+        .applied);
+
+    assert!(!client
+        .storage_owner
+        .reconcile_missing_physical_nof_backing(&stale, &stale_backing)
+        .unwrap());
+    assert_eq!(
+        client.query_route("physical-nof-stale-miss").unwrap(),
+        Some(newer)
+    );
+}
+
+#[test]
+fn physical_nof_watermark_uses_provider_capacity_and_existing_gc() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let backend = Arc::new(FakePhysicalNof::with_capacity(300));
+    let target = NofTargetConfig::new(
+        "nof-physical-watermark",
+        NofBackend::new(backend.clone()).expect("physical NoF backend should build"),
+    )
+    .expect("physical NoF target should build");
+    let client = StoreClientBuilder::new(
+        Arc::new(InMemoryMetadataBackend::new()),
+        "nof-physical-watermark-runtime",
+    )
+    .state(ClientLifecycleState::Active)
+    .label("storage", "true")
+    .transport(Arc::new(TestTransport::new(
+        "nof-physical-watermark-segment",
+    )))
+    .local_memory(storage_config_with_bytes(1024))
+    .cold_tier_watermarks(
+        ColdTierWatermarkConfig::default()
+            .high_bytes(250)
+            .low_bytes(150),
+    )
+    .nof_target(target)
+    .build(test_future_expiry_ms())
+    .expect("physical NoF client should build");
+    client.register_local_memory().unwrap();
+
+    for index in 0..3 {
+        client
+            .put(
+                &format!("physical-nof-watermark-{index}"),
+                &[index as u8; 100],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        client
+            .storage_owner
+            .materialize_pending_offloads_bounded(32)
+            .unwrap(),
+        3
+    );
+    assert_eq!(backend.records.lock().len(), 3);
+    for index in 0..3 {
+        let route = client
+            .query_route(&format!("physical-nof-watermark-{index}"))
+            .unwrap()
+            .unwrap();
+        assert!(!route.replicas.is_empty());
+        let backing = route.cold_backing.unwrap();
+        assert_eq!(backing.cold_tier_id, "nof-physical-watermark");
+        assert_eq!(
+            backing.state,
+            mooncake_store_core::ColdBackingState::Materialized
+        );
+    }
+    assert!(client.storage_owner.hot_replicas.eviction_budget() > 0);
+    let health = client
+        .storage_owner
+        .cold_tier_devices
+        .nof_targets
+        .refresh_physical_target_health("nof-physical-watermark")
+        .unwrap()
+        .unwrap();
+    assert_eq!(health.capacity_bytes, Some(300));
+    assert_eq!(health.available_bytes, Some(0));
+
+    let result = client
+        .storage_owner
+        .free_cold_tier_until_low_watermark_bounded(1, 8)
+        .unwrap();
+    assert_eq!(result.freed_backings, 2, "{result:?}");
+    assert!(result.reached_low_watermark);
+    assert_eq!(backend.records.lock().len(), 1);
+}
 
 #[test]
 fn managed_nof_persists_route_reads_cold_and_releases_locator() {
@@ -1187,7 +1359,7 @@ fn physical_nof_requires_the_configured_replica_count_before_offload() {
 }
 
 #[test]
-fn physical_nof_retries_a_partial_replica_write() {
+fn physical_nof_records_only_successful_replica_writes() {
     let _cold_tier_env = enable_cold_tier_for_test();
     let (client, primary, replica) = physical_nof_client("nof-partial-retry");
     replica.fail_next_write.store(true, Ordering::Relaxed);
@@ -1195,22 +1367,20 @@ fn physical_nof_retries_a_partial_replica_write() {
         .put("nof-partial-retry-key", &[29u8; 150])
         .expect("hot write should succeed");
 
-    assert!(client
-        .storage_owner
-        .materialize_pending_offloads_bounded(32)
-        .is_err());
-    assert!(!primary.records.lock().is_empty());
-    assert!(replica.records.lock().is_empty());
-    sleep(Duration::from_millis(125));
     assert_eq!(
         client
             .storage_owner
             .materialize_pending_offloads_bounded(32)
-            .expect("NoF retry should complete the missing replica"),
+            .expect("primary write should materialize even if a replica write fails"),
         1
     );
     assert!(!primary.records.lock().is_empty());
-    assert!(!replica.records.lock().is_empty());
+    assert!(replica.records.lock().is_empty());
+    let route = client
+        .query_route("nof-partial-retry-key")
+        .expect("route query should succeed")
+        .expect("route should exist");
+    assert!(route.cold_backing.is_some());
 }
 
 #[test]

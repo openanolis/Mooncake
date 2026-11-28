@@ -167,6 +167,16 @@ impl StorageOwnerState {
         allow_nof: bool,
     ) -> Result<Option<super::super::PendingBackingRoute>> {
         let replica_count = cold_tier_replica_count();
+        // A provider-addressed physical target publishes its placement in `cold_backing` so the
+        // route stays the only placement authority; logical-object NoF targets keep their
+        // request-local backing out of the route.
+        let wrap_nof = |backing| {
+            if self.cold_tier_devices.nof_targets.is_physical() {
+                super::super::PendingBackingRoute::Cold(backing)
+            } else {
+                super::super::PendingBackingRoute::Nof(backing)
+            }
+        };
         if !self.cold_tier_devices.has_any_local_backend() {
             if !allow_nof {
                 return Ok(None);
@@ -185,7 +195,7 @@ impl StorageOwnerState {
                 .cold_tier_devices
                 .nof_targets
                 .pending_backing(route, length, checksum)?
-                .map(super::super::PendingBackingRoute::Nof));
+                .map(&wrap_nof));
         }
         let select_devices = |s: &Self| -> Result<Vec<ColdTierDeviceRecord>> {
             if replica_count > 1 {
@@ -220,7 +230,7 @@ impl StorageOwnerState {
                     .nof_targets
                     .pending_backing(route, length, checksum)?
                 {
-                    return Ok(Some(super::super::PendingBackingRoute::Nof(backing)));
+                    return Ok(Some(wrap_nof(backing)));
                 }
             }
             tracing::debug!(
@@ -231,14 +241,7 @@ impl StorageOwnerState {
             );
             return Ok(None);
         };
-        let object_locator = format!(
-            "{}@v{}",
-            route
-                .canonical_key
-                .clone()
-                .unwrap_or_else(|| route.key.0.clone()),
-            route.version.0,
-        );
+        let object_locator = super::cold_backing_object_locator(route);
         let owner = self
             .cold_tier_devices
             .current_target_owner(&primary.device_id, None)?;

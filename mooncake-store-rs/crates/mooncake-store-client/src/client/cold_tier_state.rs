@@ -547,6 +547,8 @@ struct PendingOffloadMaterialization {
     route: ObjectRoute,
     cold_backing: mooncake_store_core::ColdBackingRoute,
     transient_nof: bool,
+    /// The backing targets a provider-addressed physical KV target registered through NoF.
+    physical_nof: bool,
     managed_nof: bool,
     payload: PendingOffloadPayload,
     device: Option<ColdTierDeviceRecord>,

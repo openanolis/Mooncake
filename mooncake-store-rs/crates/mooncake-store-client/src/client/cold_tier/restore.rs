@@ -35,6 +35,20 @@ impl StoreClient {
     }
 }
 
+/// Report a cold payload miss without letting a stale route outlive the observation.
+///
+/// Only a provider-addressed physical target reconciles here; local devices and logical-object
+/// NoF targets keep their existing miss handling.
+fn missing_cold_payload<T>(
+    storage_owner: &StorageOwnerState,
+    route: &ObjectRoute,
+    cold_backing: &mooncake_store_core::ColdBackingRoute,
+    message: String,
+) -> Result<T> {
+    storage_owner.reconcile_missing_physical_nof_backing(route, cold_backing)?;
+    Err(StoreError::NotFound(message))
+}
+
 pub(in super::super) fn enqueue_restore_promotion(
     client: &StoreClient,
     resolved: &ResolvedObject,
@@ -921,25 +935,29 @@ fn read_cold_backing_once(
     backend_tracker.finish(&backend_result, 0);
     let result = backend_result.and_then(|backend| {
         let read_tracker = OperationTracker::new("cold_restore_backend_read_into_caller");
-        let result = backend
-            .get_object_into(cold_backing, buffer)?
-            .ok_or_else(|| {
-                StoreError::NotFound(format!(
+        let result = match backend.get_object_into(cold_backing, buffer)? {
+            Some(length) => Ok(length),
+            None => missing_cold_payload(
+                client.storage_owner.as_ref(),
+                &resolved.route,
+                cold_backing,
+                format!(
                     "tenant={} key={} cold backing payload is unavailable",
                     resolved.tenant, resolved.key
+                ),
+            ),
+        }
+        .and_then(|length| {
+            (length <= buffer.len()).then_some(length).ok_or_else(|| {
+                StoreError::Allocator(format!(
+                    "buffer too small for tenant={} key={}: need {}, have {}",
+                    resolved.tenant,
+                    resolved.key,
+                    length,
+                    buffer.len()
                 ))
             })
-            .and_then(|length| {
-                (length <= buffer.len()).then_some(length).ok_or_else(|| {
-                    StoreError::Allocator(format!(
-                        "buffer too small for tenant={} key={}: need {}, have {}",
-                        resolved.tenant,
-                        resolved.key,
-                        length,
-                        buffer.len()
-                    ))
-                })
-            });
+        });
         read_tracker.finish(&result, result.as_ref().copied().unwrap_or_default() as u64);
         result
     });
@@ -1195,11 +1213,17 @@ fn restore_batch_leaders_from_same_cold_tier(
                             ))
                         })?
                     })
-                    .and_then(|result| {
-                        result.ok_or_else(|| StoreError::NotFound(format!(
-                            "tenant={} key={} cold backing payload is unavailable",
-                            resolved[index].tenant, resolved[index].key
-                        )))
+                    .and_then(|result| match result {
+                        Some(length) => Ok(length),
+                        None => missing_cold_payload(
+                            client.storage_owner.as_ref(),
+                            &resolved[index].route,
+                            &cold_backing,
+                            format!(
+                                "tenant={} key={} cold backing payload is unavailable",
+                                resolved[index].tenant, resolved[index].key
+                            ),
+                        ),
                     })
                     .and_then(|length| {
                         (length <= buffers[index].len()).then_some(length).ok_or_else(|| {
@@ -1458,12 +1482,17 @@ fn promote_materialized_cold_backing(
             "cold_restore_owner_direct_to_segment",
         )?;
         let read_result = backend.get_object_into(&cold_backing, dst)?;
-        let bytes_read = read_result.ok_or_else(|| {
-            StoreError::NotFound(format!(
-                "route {} cold backing payload is unavailable (direct read)",
-                route.key.0
-            ))
-        })?;
+        let Some(bytes_read) = read_result else {
+            return missing_cold_payload(
+                storage_owner,
+                route,
+                &cold_backing,
+                format!(
+                    "route {} cold backing payload is unavailable (direct read)",
+                    route.key.0
+                ),
+            );
+        };
         if bytes_read != cold_backing.length as usize {
             return Err(StoreError::InvalidState(format!(
                 "route {} cold backing length mismatch: expected {} actual {}",
@@ -2557,12 +2586,17 @@ pub(in super::super) fn execute_owner_cold_restore_ssd_phase_staging(
             })?;
         ssd_io_us = t_io.elapsed().as_micros() as u64;
 
-        let bytes_read = read_result.ok_or_else(|| {
-            StoreError::NotFound(format!(
-                "route {} cold backing payload is unavailable (staging_ssd)",
-                route.key.0
-            ))
-        })?;
+        let Some(bytes_read) = read_result else {
+            return missing_cold_payload(
+                storage_owner,
+                &route,
+                &cold_backing,
+                format!(
+                    "route {} cold backing payload is unavailable (staging_ssd)",
+                    route.key.0
+                ),
+            );
+        };
         if bytes_read != cold_backing.length as usize {
             return Err(StoreError::InvalidState(format!(
                 "route {} cold backing length mismatch: expected {} actual {}",

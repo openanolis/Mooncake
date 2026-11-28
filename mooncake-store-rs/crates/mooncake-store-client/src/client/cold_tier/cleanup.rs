@@ -247,11 +247,19 @@ impl StorageOwnerState {
             if removed_pending_source {
                 result.pending_source_deleted = result.pending_source_deleted.saturating_add(1);
             }
-            self.apply_cold_tier_usage_delta(
-                cold_tier_device_id(&cold_backing),
-                -(cold_backing.length as i64),
-                0,
-            )?;
+            // A provider-addressed physical target accounts its own bytes; the route only holds
+            // placement, so there is no local device usage to release.
+            if !self
+                .cold_tier_devices
+                .nof_targets
+                .is_physical_target(cold_tier_device_id(&cold_backing))
+            {
+                self.apply_cold_tier_usage_delta(
+                    cold_tier_device_id(&cold_backing),
+                    -(cold_backing.length as i64),
+                    0,
+                )?;
+            }
             result.used_bytes_released = result
                 .used_bytes_released
                 .saturating_add(cold_backing.length);
@@ -358,6 +366,89 @@ impl StorageOwnerState {
             }
             Ok(None)
         }
+    }
+
+    /// CAS a Materialized backing into PendingDelete, keeping the payload described by
+    /// `expected_backing`.
+    fn mark_materialized_cold_backing_pending_delete(
+        &self,
+        route: &ObjectRoute,
+        expected_backing: &mooncake_store_core::ColdBackingRoute,
+        require_hot_replica: bool,
+    ) -> Result<Option<ObjectRoute>> {
+        let Some(current_backing) = route.cold_backing.as_ref() else {
+            self.sync_route(route);
+            return Ok(None);
+        };
+        if route.state != RouteState::Active
+            || current_backing.state != mooncake_store_core::ColdBackingState::Materialized
+            || !same_cold_payload(current_backing, expected_backing)
+            || (require_hot_replica && route.replicas.is_empty())
+        {
+            self.sync_route(route);
+            return Ok(None);
+        }
+        let mut pending = route.clone();
+        pending.version = pending.version.next();
+        pending
+            .cold_backing
+            .as_mut()
+            .expect("materialized cold backing was checked")
+            .state = mooncake_store_core::ColdBackingState::PendingDelete;
+        let cas = self.route_ops.compare_and_swap_route(
+            &route.key,
+            Some(route.version),
+            Some(&pending),
+        )?;
+        if cas.applied {
+            self.sync_route(&pending);
+            return Ok(Some(pending));
+        }
+        if let Some(current) = cas.current.as_ref() {
+            self.sync_route(current);
+        } else {
+            self.hot_replicas.remove_key(&route.key);
+        }
+        Ok(None)
+    }
+
+    /// Reconcile an explicit provider miss: drop only the replica the caller observed, and only
+    /// while the route still has the version that observed it.
+    pub(in super::super) fn reconcile_missing_physical_nof_backing(
+        &self,
+        listed_route: &ObjectRoute,
+        listed_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> Result<bool> {
+        if !self
+            .cold_tier_devices
+            .nof_targets
+            .is_physical_target(cold_tier_device_id(listed_backing))
+        {
+            return Ok(false);
+        }
+        let Some(current) = self.route_ops.load_route(&listed_route.key)? else {
+            self.hot_replicas.remove_key(&listed_route.key);
+            return Ok(true);
+        };
+        if current.version != listed_route.version {
+            self.sync_route(&current);
+            return Ok(false);
+        }
+        let Some(pending) =
+            self.mark_materialized_cold_backing_pending_delete(&current, listed_backing, false)?
+        else {
+            return Ok(false);
+        };
+        let backing = pending
+            .cold_backing
+            .as_ref()
+            .expect("pending route retains its cold backing")
+            .clone();
+        let mut result = PendingDeleteGcResult::default();
+        Ok(matches!(
+            self.reclaim_pending_delete_cold_route(&pending, &backing, &mut result)?,
+            ColdReclaimDisposition::Reclaimed | ColdReclaimDisposition::Gone
+        ))
     }
 
     fn enqueue_local_hot_reclaims(&self, route: &ObjectRoute) {
@@ -476,6 +567,13 @@ impl StorageOwnerState {
             max_victims_per_device,
         )?;
         Self::merge_cleanup_result(&mut nof_downline, nof_watermark);
+        let physical_nof_watermark = self.free_physical_nof_targets_until_low_watermark(
+            high_bytes,
+            low_bytes,
+            max_devices,
+            max_victims_per_device,
+        )?;
+        Self::merge_cleanup_result(&mut nof_downline, physical_nof_watermark);
         let nof_result = nof_downline;
         let devices = self
             .metadata
@@ -543,6 +641,50 @@ impl StorageOwnerState {
                 low_bytes,
                 max_victims_per_target,
             )
+        })
+    }
+
+    fn free_physical_nof_targets_until_low_watermark(
+        &self,
+        high_bytes: u64,
+        low_bytes: u64,
+        max_targets: usize,
+        max_victims_per_target: usize,
+    ) -> Result<ColdTierCleanupResult> {
+        let targets = self
+            .cold_tier_devices
+            .nof_targets
+            .physical_target_ids()
+            .into_iter()
+            .filter_map(|target_id| match self.physical_nof_used_bytes(&target_id) {
+                Ok(Some(used_bytes)) if used_bytes >= high_bytes => {
+                    Some(Ok((target_id, used_bytes)))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.free_targets_until_low_watermark(targets, low_bytes, max_targets, |target_id| {
+            Self::free_backings_until_low_watermark(
+                low_bytes,
+                max_victims_per_target,
+                || self.physical_nof_used_bytes(target_id),
+                || self.free_one_cold_tier_backing_lru(target_id, true),
+            )
+        })
+    }
+
+    fn physical_nof_used_bytes(&self, target_id: &str) -> Result<Option<u64>> {
+        let Some(health) = self
+            .cold_tier_devices
+            .nof_targets
+            .refresh_physical_target_health(target_id)?
+        else {
+            return Ok(None);
+        };
+        Ok(match (health.capacity_bytes, health.available_bytes) {
+            (Some(capacity), Some(available)) => Some(capacity.saturating_sub(available)),
+            _ => None,
         })
     }
 
@@ -644,7 +786,7 @@ impl StorageOwnerState {
                     .get_cold_tier_device(device_id)?
                     .map(|device| device.used_bytes.saturating_add(device.reserved_bytes)))
             },
-            || self.free_one_cold_tier_backing_lru(device_id),
+            || self.free_one_cold_tier_backing_lru(device_id, false),
         )
     }
 
@@ -731,7 +873,7 @@ impl StorageOwnerState {
             // Step 1: Mark Materialized cold backings as PendingDelete.
             let mut marked = 0usize;
             for _ in 0..MAX_INLINE_GC_VICTIMS {
-                if self.free_one_cold_tier_backing_lru(&device.device_id)? {
+                if self.free_one_cold_tier_backing_lru(&device.device_id, false)? {
                     marked += 1;
                 } else {
                     break;
@@ -962,7 +1104,11 @@ impl StorageOwnerState {
         Ok(restored)
     }
 
-    fn free_one_cold_tier_backing_lru(&self, device_id: &str) -> Result<bool> {
+    fn free_one_cold_tier_backing_lru(
+        &self,
+        device_id: &str,
+        reclaim_immediately: bool,
+    ) -> Result<bool> {
         Self::free_one_clock_backing(
             || self.hot_replicas.eviction_budget(),
             || {
@@ -972,7 +1118,27 @@ impl StorageOwnerState {
                     self.offload_priority.eviction_scan_limit,
                 )
             },
-            |victim| self.free_cold_tier_candidate(victim, device_id),
+            |victim| {
+                if !self.free_cold_tier_candidate(victim, device_id)? {
+                    return Ok(false);
+                }
+                if !reclaim_immediately {
+                    return Ok(true);
+                }
+                // The provider reports capacity, not per-route usage, so a watermark pass must
+                // delete the value in the same pass that marks it.
+                let Some(route) = self.route_ops.load_route(&victim.route_key)? else {
+                    return Ok(true);
+                };
+                let Some(backing) = route.cold_backing.clone() else {
+                    return Ok(true);
+                };
+                let mut result = PendingDeleteGcResult::default();
+                Ok(matches!(
+                    self.reclaim_pending_delete_cold_route(&route, &backing, &mut result)?,
+                    ColdReclaimDisposition::Reclaimed | ColdReclaimDisposition::Gone
+                ))
+            },
             || self.rebuild_clock(),
         )
     }
@@ -990,22 +1156,14 @@ impl StorageOwnerState {
             self.sync_route(&route);
             return Ok(false);
         };
-        if cold_backing.cold_tier_id != device_id
-            || cold_backing.state != mooncake_store_core::ColdBackingState::Materialized
-            || route.replicas.is_empty()
-        {
+        if cold_backing.cold_tier_id != device_id {
             self.sync_route(&route);
             return Ok(false);
         }
-        let mut next = route.clone();
-        next.version = next.version.next();
-        if let Some(next_backing) = next.cold_backing.as_mut() {
-            next_backing.state = mooncake_store_core::ColdBackingState::PendingDelete;
-        }
-        let cas =
-            self.route_ops
-                .compare_and_swap_route(&route.key, Some(route.version), Some(&next))?;
-        if cas.applied {
+        if self
+            .mark_materialized_cold_backing_pending_delete(&route, cold_backing, true)?
+            .is_some()
+        {
             info!(
                 runtime = %self.runtime,
                 key = %route.key.0,
@@ -1013,12 +1171,7 @@ impl StorageOwnerState {
                 cold_backing_length = cold_backing.length,
                 "cold_tier_backing_marked_pending_delete"
             );
-            self.sync_route(&next);
             return Ok(true);
-        }
-        match cas.current.as_ref() {
-            Some(current) => self.sync_route(current),
-            None => self.hot_replicas.remove_id(victim),
         }
         Ok(false)
     }

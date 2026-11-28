@@ -15,6 +15,21 @@ pub(in super::super) fn payload_checksum(payload: &[u8]) -> u64 {
     xxh3_64(payload)
 }
 
+/// Provider locator for a physical Cold Tier record.
+///
+/// Physical providers such as KVCS store one value per logical object, keyed by the canonical
+/// key and the route version that published it.
+pub(in super::super) fn cold_backing_object_locator(route: &ObjectRoute) -> String {
+    format!(
+        "{}@v{}",
+        route
+            .canonical_key
+            .clone()
+            .unwrap_or_else(|| route.key.0.clone()),
+        route.version.0,
+    )
+}
+
 #[allow(dead_code)]
 pub(in super::super) fn backend_store_cold_payload_batch(
     backend: &dyn PersistentStorageBackend,
