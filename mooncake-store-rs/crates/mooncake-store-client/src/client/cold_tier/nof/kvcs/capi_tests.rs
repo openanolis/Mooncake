@@ -17,7 +17,15 @@ fn incomplete_is_not_mapped_to_not_found() {
 }
 
 #[test]
-fn capi_config_layout_matches_the_extended_sdk_abi() {
-    assert_eq!(std::mem::size_of::<KvcsClientConfig>(), 96);
-    assert_eq!(std::mem::size_of::<KvcsLlConfig>(), 72);
+fn deleting_namespace_is_retryable() {
+    assert!(matches!(
+        map_call_status(-10011, "create namespace"),
+        StoreError::Backpressure(_)
+    ));
+}
+
+#[test]
+fn low_level_capi_layout_matches_the_sdk_abi() {
+    assert_eq!(std::mem::size_of::<KvcsLlConfig>(), 80);
+    assert_eq!(std::mem::size_of::<KvcsMountpointStat>(), 288);
 }

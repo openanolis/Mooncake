@@ -9,6 +9,11 @@ mod placement;
 mod route_directory;
 mod transport;
 
+#[cfg(feature = "kvcs-capi")]
+pub use client::cold_tier::nof::{
+    build_targets as kvcs_build_targets, configurations_from_env as kvcs_configurations_from_env,
+    KvcsBackendConfig, KvcsCapiExecutor, KvcsLowLevelClient, KvcsMode,
+};
 pub use client::cold_tier::nof::{
     derive_physical_key, NofBackend, NofBacking, NofHealth, NofManagedAllocationRequest,
     NofManagedAllocator, NofManagedLimits, NofManagedLocator, NofManagedRead,
@@ -19,8 +24,6 @@ pub use client::cold_tier::nof::{
     NofPhysicalWriteRequest, NofStorageHealth, NofTargetConfig, OpaquePhysicalKey,
     PhysicalKeyInput,
 };
-#[cfg(feature = "kvcs-capi")]
-pub use client::cold_tier::nof::{KvcsCapiExecutor, KvcsLowLevelClient, KvcsMode};
 
 #[cfg(feature = "nof-spdk")]
 pub use client::cold_tier::nof::extent_store::{

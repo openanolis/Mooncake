@@ -1,4 +1,4 @@
-const SUPPORTED_KVCS_SDK_VERSION: &str = "0.4.0";
+const SUPPORTED_KVCS_SDK_VERSION: &str = "0.6.0";
 const DEFAULT_KVCS_SDK_ROOT: &str = "/opt/kvcs-sdk/latest";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

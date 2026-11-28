@@ -51,7 +51,10 @@ pub use crate::client::cold_tier::layout::{
 };
 
 #[cfg(feature = "kvcs-capi")]
-pub use kvcs::{KvcsCapiExecutor, KvcsLowLevelClient, KvcsMode};
+pub use kvcs::{
+    build_targets, configurations_from_env, KvcsBackendConfig, KvcsCapiExecutor,
+    KvcsLowLevelClient, KvcsMode,
+};
 
 pub(crate) fn ensure_batch_len(operation: &str, expected: usize, actual: usize) -> Result<()> {
     if expected == actual {

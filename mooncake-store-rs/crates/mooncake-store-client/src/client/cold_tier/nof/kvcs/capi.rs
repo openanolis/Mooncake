@@ -4,9 +4,12 @@ use std::sync::Mutex;
 use libc::size_t;
 use mooncake_store_core::error::QuotaKind;
 
-const SDK_DEFAULT_MAX_VALUE_SIZE: u64 = 4 * 1024 * 1024;
+pub(super) const SDK_DEFAULT_MAX_VALUE_SIZE: u64 = 4 * 1024 * 1024;
 const SDK_MAX_VALUE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+/// Default raw key size passed to the SDK.
 const DEFAULT_MAX_KEY_SIZE: usize = 256;
+/// The SDK rejects a larger inclusive raw key.
+const MAX_KEY_SIZE_LIMIT: usize = 1024;
 const KVCS_NAMESPACE_MAX_BYTES: usize = 127;
 
 #[allow(dead_code, non_camel_case_types)]
@@ -15,102 +18,17 @@ mod sdk_ffi {
 }
 
 use sdk_ffi::{
-    kvcs_batch_delete_items, kvcs_batch_get_into, kvcs_batch_put, kvcs_batch_query,
-    kvcs_client_create, kvcs_client_destroy, kvcs_client_t as KvcsClient, kvcs_create_namespace,
-    kvcs_create_ns_opts_t as KvcsCreateNamespaceOptions,
-    kvcs_delete_item_t as KvcsDeleteItem, kvcs_delete_result_t as KvcsDeleteResult,
-    kvcs_get_item_t as KvcsGetItem, kvcs_ll_batch_delete, kvcs_ll_batch_get,
-    kvcs_ll_batch_get_into,
-    kvcs_ll_batch_opts_t as KvcsLlBatchOptions, kvcs_ll_batch_put, kvcs_ll_batch_query,
+    kvcs_client_t as KvcsClient, kvcs_ll_batch_delete, kvcs_ll_batch_get,
+    kvcs_ll_batch_opts_t as KvcsLlBatchOptions, kvcs_ll_batch_put,
     kvcs_ll_config_t as KvcsLlConfig, kvcs_ll_create, kvcs_ll_get_item_t as KvcsLlGetItem,
-    kvcs_ll_put_item_t as KvcsLlPutItem, kvcs_put_item_t as KvcsPutItem,
-    kvcs_put_result_t as KvcsPutResult, kvcs_query_opts_t as KvcsQueryOptions,
-    kvcs_query_result_free, kvcs_query_result_t as KvcsQueryResult,
+    kvcs_ll_mp_stat, kvcs_ll_put_item_t as KvcsLlPutItem,
+    kvcs_mountpoint_stat_t as KvcsMountpointStat, kvcs_put_result_t as KvcsPutResult,
+    KVCS_MOUNTPOINT_MAX,
 };
-
-impl Default for sdk_ffi::kvcs_client_config_t {
-    fn default() -> Self {
-        unsafe { std::mem::zeroed() }
-    }
-}
 
 impl Default for sdk_ffi::kvcs_ll_config_t {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
-    }
-}
-
-type KvcsClientConfig = sdk_ffi::kvcs_client_config_t;
-
-struct QueryResults {
-    raw: Vec<KvcsQueryResult>,
-    initialized: c_int,
-}
-
-impl QueryResults {
-    fn new(count: c_int) -> Self {
-        let len = usize::try_from(count).expect("KVCS query result count is non-negative");
-        Self {
-            raw: (0..len)
-                .map(|_| unsafe { std::mem::zeroed() })
-                .collect(),
-            initialized: 0,
-        }
-    }
-
-    fn as_mut_ptr(&mut self) -> *mut KvcsQueryResult {
-        self.raw.as_mut_ptr()
-    }
-
-    fn as_slice(&self) -> &[KvcsQueryResult] {
-        &self.raw[..self.initialized as usize]
-    }
-
-    fn complete(&mut self, returned: c_int, operation: &str) -> Result<()> {
-        if returned < 0 {
-            return Err(map_call_status(returned, operation));
-        }
-        let requested = self.raw.len();
-        let requested_c = c_int::try_from(requested)
-            .expect("query result allocation count came from a C integer");
-        self.initialized = if returned == 0 {
-            requested_c
-        } else {
-            returned.min(requested_c)
-        };
-        if returned != 0 && returned != requested_c {
-            return Err(StoreError::Transport(format!(
-                "KVCS {operation} returned {returned} results for {requested} requests"
-            )));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for QueryResults {
-    fn drop(&mut self) {
-        if !self.raw.is_empty() {
-            unsafe { kvcs_query_result_free(self.raw.as_mut_ptr(), self.initialized) };
-        }
-    }
-}
-
-#[cfg(test)]
-mod query_result_tests {
-    use super::*;
-
-    #[test]
-    fn query_completion_accepts_zero_as_the_full_requested_count() {
-        let mut results = QueryResults::new(2);
-        results.complete(0, "test query").unwrap();
-        assert_eq!(results.as_slice().len(), 2);
-    }
-
-    #[test]
-    fn query_completion_tracks_only_the_initialized_prefix() {
-        let mut results = QueryResults::new(2);
-        assert!(results.complete(1, "test query").is_err());
-        assert_eq!(results.as_slice().len(), 1);
     }
 }
 
@@ -143,9 +61,10 @@ impl ClientSlot {
         create: impl FnOnce() -> *mut KvcsClient,
         destroy: unsafe extern "C" fn(*mut KvcsClient),
     ) -> Result<*mut KvcsClient> {
-        let mut slot = self.0.lock().map_err(|_| {
-            StoreError::InvalidState(format!("KVCS {mode} client lock poisoned"))
-        })?;
+        let mut slot = self
+            .0
+            .lock()
+            .map_err(|_| StoreError::InvalidState(format!("KVCS {mode} client lock poisoned")))?;
         if let Some(handle) = slot.as_ref() {
             return Ok(handle.client);
         }
@@ -161,24 +80,11 @@ impl ClientSlot {
 }
 
 fn env_u32(name: &str, default: u32) -> Result<u32> {
-    match std::env::var(name) {
-        Ok(value) => value.parse().map_err(|_| {
+    match env_value(name)? {
+        Some(value) => value.parse().map_err(|_| {
             StoreError::InvalidState(format!("{name} must be a non-negative integer"))
         }),
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(std::env::VarError::NotUnicode(_)) => Err(StoreError::InvalidState(format!(
-            "{name} is not valid UTF-8"
-        ))),
-    }
-}
-
-fn optional_env(name: &str) -> Result<Option<String>> {
-    match std::env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(StoreError::InvalidState(format!(
-            "{name} is not valid UTF-8"
-        ))),
+        None => Ok(default),
     }
 }
 
@@ -186,6 +92,26 @@ fn checked_batch_len(len: usize) -> Result<c_int> {
     c_int::try_from(len).map_err(|_| {
         StoreError::InvalidState(format!("KVCS batch size {len} exceeds the C ABI limit"))
     })
+}
+
+/// The SDK takes an absolute `CLOCK_MONOTONIC`
+/// timestamp and reads `0` as "no deadline", so a zero timeout disables the deadline instead
+/// of expiring the call immediately.
+fn operation_deadline_ns(timeout_ms: u64) -> i64 {
+    if timeout_ms == 0 {
+        return 0;
+    }
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid writable `timespec` and CLOCK_MONOTONIC is always present.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+        return 0;
+    }
+    let elapsed_ns = i128::from(now.tv_sec) * 1_000_000_000 + i128::from(now.tv_nsec);
+    let timeout_ns = i128::from(timeout_ms) * 1_000_000;
+    i64::try_from(elapsed_ns + timeout_ns).unwrap_or(i64::MAX)
 }
 
 fn input_segments<'a>(
@@ -213,80 +139,39 @@ fn put_results(len: usize) -> Vec<KvcsPutResult> {
         .collect()
 }
 
-fn output_buffer_parts(
-    buffer: &mut [u8],
-    capacities: &[size_t],
-) -> Result<(Vec<*mut c_void>, Vec<c_int>, Vec<size_t>)> {
-    let total_capacity = capacities.iter().try_fold(0usize, |total, capacity| {
-        total.checked_add(*capacity).ok_or_else(|| {
-            StoreError::InvalidState("KVCS output buffer capacity overflow".to_string())
-        })
-    })?;
-    if total_capacity != buffer.len() {
-        return Err(StoreError::InvalidState(format!(
-            "KVCS output buffer length {} differs from requested capacity {total_capacity}",
-            buffer.len()
-        )));
-    }
-    let mut offset = 0usize;
-    let pointers = capacities
-        .iter()
-        .map(|capacity| {
-            let pointer = if *capacity == 0 {
-                std::ptr::null_mut()
-            } else {
-                unsafe { buffer.as_mut_ptr().add(offset).cast() }
-            };
-            offset += capacity;
-            pointer
-        })
-        .collect::<Vec<_>>();
-    let count = capacities.len();
-    Ok((pointers, vec![0; count], vec![0; count]))
-}
-
-fn validate_get_results(
-    statuses: &[c_int],
-    lengths: &[size_t],
-    expected: &[size_t],
-    operation: &str,
-) -> Result<usize> {
-    let mut found = 0;
-    for (index, ((status, length), expected)) in statuses
-        .iter()
-        .zip(lengths)
-        .zip(expected)
-        .enumerate()
-    {
-        if *status > 0 {
-            found += 1;
-            if length != expected {
-                return Err(StoreError::InvalidState(format!(
-                    "KVCS {operation} item {index} returned {length} bytes, expected {expected}"
-                )));
-            }
-        } else if *status < 0 {
-            return Err(map_item_status(*status, operation, false));
-        }
-    }
-    Ok(found)
-}
-
 fn map_call_status(status: c_int, operation: &str) -> StoreError {
+    if status >= 0 {
+        return StoreError::Transport(format!(
+            "KVCS {operation} returned unexpected call status {status}"
+        ));
+    }
     match status.unsigned_abs() {
         1 => StoreError::NotFound(format!("KVCS {operation}")),
         2 => StoreError::Backpressure(format!("KVCS {operation} is incomplete")),
         3 => StoreError::Transport(format!("KVCS {operation} provider is unavailable")),
-        6 => StoreError::NotFound(format!("KVCS {operation} namespace")),
         4 => StoreError::Backpressure(format!("KVCS {operation} resource exhausted")),
         5 => StoreError::InvalidState(format!("KVCS {operation} invalid argument")),
+        6 => StoreError::NotFound(format!("KVCS {operation} namespace")),
         7 => StoreError::Backpressure(format!("KVCS {operation} buffer too small")),
         8 => StoreError::Conflict(format!("KVCS {operation} already exists")),
+        // Treat an unconfigured mountpoint as unavailable so the caller retries instead of
+        // giving up.
+        code if code == libc::ENODEV as u32 => {
+            StoreError::Transport(format!("KVCS {operation} mountpoint unavailable"))
+        }
+        10009 => StoreError::Transport(format!("KVCS {operation} invalid mount point")),
+        10010 => StoreError::InvalidState(format!("KVCS {operation} invalid shard ID")),
+        10011 => StoreError::Backpressure(format!("KVCS {operation} namespace is deleting")),
         _ => StoreError::Transport(format!("KVCS {operation} failed: status={status}")),
     }
 }
 
 fn map_item_status(status: c_int, operation: &str, write: bool) -> StoreError {
+    if status >= 0 {
+        return StoreError::Transport(format!(
+            "KVCS {operation} returned unexpected item status {status}"
+        ));
+    }
     let code = status.unsigned_abs();
     if code == libc::ENOENT as u32 {
         StoreError::NotFound(format!("KVCS {operation}"))
