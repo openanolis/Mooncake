@@ -39,7 +39,7 @@ rollback; ExtentStore alone owns extent alignment and record layout.
 
 ## Install KVCS SDK and EFC
 
-The supported SDK version is **0.4.0**. Official entry points:
+The supported SDK version is **0.6.0**. Official entry points:
 
 - [KVCacheStore quick start](https://www.alibabacloud.com/help/en/kvcachestore/quick-start)
 - [KVCS installation script](https://kvcachestore.oss-accelerate.aliyuncs.com/scripts/install-kvcs.sh)
@@ -61,11 +61,11 @@ SDK-only archives:
 
 | Architecture | Download | SHA-256 |
 | --- | --- | --- |
-| x86_64 | [kvcs-sdk-0.4.0-x86_64.tar.gz](https://kvcachestore.oss-accelerate.aliyuncs.com/sdk/kvcs-sdk-0.4.0-x86_64.tar.gz) | `61b1cee7c0e87975d8e3d723c1e3335cabc46a6af2efeced233918f688f2b3c9` |
-| aarch64 | [kvcs-sdk-0.4.0-aarch64.tar.gz](https://kvcachestore.oss-accelerate.aliyuncs.com/sdk/kvcs-sdk-0.4.0-aarch64.tar.gz) | `22159a8fa911799857db6c8d084220efc4d6ac9adc79302a7e35371a71d1fd6c` |
+| x86_64 | [kvcs-sdk-0.6.0-x86_64.tar.gz](https://kvcachestore.oss-accelerate.aliyuncs.com/sdk/kvcs-sdk-0.6.0-x86_64.tar.gz) | `87d9ea69997bd359a14670ec4192fcd7ad95fe7a2638e4254becdfeb99f3e424` |
+| aarch64 | [kvcs-sdk-0.6.0-aarch64.tar.gz](https://kvcachestore.oss-accelerate.aliyuncs.com/sdk/kvcs-sdk-0.6.0-aarch64.tar.gz) | `75a17418e1974d664bb6c0f2df1880075b1db7e756bd2be8d8517b8b70a47c16` |
 
 ```shell
-KVCS_VERSION=0.4.0
+KVCS_VERSION=0.6.0
 KVCS_ARCH="$(uname -m)" # x86_64 or aarch64
 curl -fL \
   "https://kvcachestore.oss-accelerate.aliyuncs.com/sdk/kvcs-sdk-${KVCS_VERSION}-${KVCS_ARCH}.tar.gz" \
@@ -91,7 +91,7 @@ tarball path.
 
 The default feature set has no KVCS dependency. `kvcs-capi` links the public shared C API and uses
 the installed SDK's generated `rust/src/ffi.rs`; Mooncake does not build the vendor C++ sources,
-run bindgen, or add the vendor Rust wrapper to the Cargo graph. SDK 0.4.0 omits
+run bindgen, or add the vendor Rust wrapper to the Cargo graph. SDK 0.6.0 omits
 `kvcs_ll_client_destroy` from that generated Rust file, so Mooncake declares that one function
 from the installed public C header until the SDK binding includes it.
 
@@ -155,29 +155,29 @@ lifecycle reuse existing Rust components.
 | Variable | Mode | Meaning |
 | --- | --- | --- |
 | `MC_STORE_RS_ENABLE_COLD_TIER` | both | set to `1` to enable the shared Cold Tier lifecycle |
-| `MOONCAKE_KVCS_MODE` | both | `standard` or `low-level`; unset defaults to `low-level` |
-| `MOONCAKE_KVCS_EFC_SOCKET` | both | EFC Unix socket; Low-Level defaults to `/var/run/kvcs/efc-grpc.sock` |
-| `MOONCAKE_KVCS_REDIS_ENDPOINTS` | Standard | comma-separated Redis endpoints, for example `tcp://host:6379` |
-| `MOONCAKE_KVCS_REDIS_PASSWORD` | Standard | optional Redis password |
-| `MOONCAKE_KVCS_MOUNTPOINT_INDEX` | Low-Level | KVCS mountpoint index; defaults to 0 |
-| `MOONCAKE_KVCS_MAX_VALUE_SIZE` | both | SDK single-value limit; defaults to 4 MiB, maximum 4 GiB |
+| `MOONCAKE_KVCS_MODE` | required | must be `low-level`; unset leaves KVCS disabled |
+| `MOONCAKE_KVCS_EFC_SOCKET` | optional | EFC Unix socket; defaults to `/var/run/kvcs/efc-grpc.sock` |
+| `MOONCAKE_KVCS_MOUNTPOINT_INDEX` | optional | KVCS mountpoint index; defaults to 0 |
+| `MOONCAKE_KVCS_NAMESPACE` | optional | storage-domain identifier used in the target ID; defaults to `mooncake` |
+| `MOONCAKE_KVCS_MAX_VALUE_SIZE` | optional | SDK single-value limit; defaults to 4 MiB, maximum 4 GiB |
+| `MOONCAKE_KVCS_MAX_KEY_SIZE` | optional | raw key limit passed to the SDK; defaults to 256, maximum 1024 |
+| `MOONCAKE_KVCS_MAX_KEYS_PER_BATCH` | optional | pipeline window; defaults to 8, `0` keeps the SDK default |
+| `MOONCAKE_KVCS_GET_WORKERS` | optional | SDK Get workers; defaults to 1, `0` keeps the SDK default |
+| `MOONCAKE_KVCS_SET_WORKERS` | optional | SDK Set workers; defaults to 1, `0` keeps the SDK default |
+| `MOONCAKE_KVCS_SIMPLE_WORKERS` | optional | SDK simple-op workers; defaults to 1, `0` keeps the SDK default |
+| `MOONCAKE_KVCS_OPERATION_TIMEOUT_MS` | optional | per-batch deadline; defaults to 30000 |
 
 ```shell
-# Standard
 export MC_STORE_RS_ENABLE_COLD_TIER=1
-export MOONCAKE_KVCS_MODE=standard
-export MOONCAKE_KVCS_EFC_SOCKET=/var/run/kvcs/efc-grpc.sock
-export MOONCAKE_KVCS_REDIS_ENDPOINTS=tcp://redis.example:6379
-
-# Low-Level
 export MOONCAKE_KVCS_MODE=low-level
+export MOONCAKE_KVCS_EFC_SOCKET=/var/run/kvcs/efc-grpc.sock
 export MOONCAKE_KVCS_MOUNTPOINT_INDEX=0
 export MOONCAKE_KVCS_MAX_VALUE_SIZE=3221225472
 ```
 
 ### Static target registration
 
-KVCS 0.4.0 does not enumerate Low-Level mountpoints or expose a mountpoint change stream. The
+KVCS 0.6.0 does not expose a mountpoint change stream. The
 deployment inventory is therefore the target-list authority. The same inventory must generate the
 server-side EFC mountpoints and the Mooncake application configuration. It supplies a stable
 `target_id` and the corresponding local `mountpoint_index`; an index is not a stable target ID.
@@ -233,9 +233,10 @@ let client = StoreClientBuilder::new(metadata, "storage-0")
 ```
 
 `KvcsCapiExecutor::new()` is the environment-variable convenience constructor for a single target.
-`with_low_level_config` remains a single-target convenience API. Standard mode uses
-`with_standard_config`; the provider owns its internal placement, so it is registered as one
-logical target.
+`with_low_level_config` remains a single-target convenience API, and `kvcs_build_targets`
+turns `KvcsBackendConfig` entries into the corresponding `NofTargetConfig`. The adapter accepts
+exactly one storage domain; Mooncake records that target, its locator, length and checksum in
+`ObjectRoute`, so a second target is rejected during initialization.
 
 The target list is immutable for the lifetime of a `StoreClient`. Temporary target availability is
 dynamic: the existing owner heartbeat excludes a target after three consecutive failures. One
@@ -251,10 +252,18 @@ configuration. The ownership fingerprint identifies target IDs, data-plane shape
 count; it cannot verify that two processes mapped a target ID to the same provider endpoint or mountpoint.
 Deployment configuration must enforce that mapping.
 
-Standard sharded writes return an SDK error when any shard fails, after which Mooncake may retry the
-object write. Mooncake does not maintain a second shard manifest or independently clean up a
-partially accepted write. Correct retry and incomplete-manifest behavior therefore depends on the
-KVCS Standard API's idempotency and manifest contract.
+Each object is one Low Level value derived from the canonical key and the publishing route version.
+Writes are insert-only: an identical value is an idempotent success and a different value under the
+same key is a conflict, so a retry never overwrites a value that Mooncake did not observe. A
+superseded route version is reclaimed by Cold Tier once its route stops referencing it. Oversized
+values are rejected before any provider I/O, and `MOONCAKE_KVCS_MAX_VALUE_SIZE` bounds what a
+single object may occupy.
+
+Capacity comes from `kvcs_ll_mp_stat` during the periodic Cold Tier refresh, never from the read or
+write path. A missing mountpoint, an SDK error, or inconsistent usage clears the cached snapshot, so
+a stale value cannot drive eviction; usage above the high watermark removes the coldest eligible
+routes through the existing clock index until the low watermark is reached. Keep KVCS provider-side
+GC at its maximum setting so the provider does not delete values Mooncake still references.
 
 ## Four-node managed NoF validation
 
@@ -438,11 +447,6 @@ MOONCAKE_SKIP_NATIVE_BUILD=1 \
 
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
   cargo test -p mooncake-store-client --features kvcs-capi --lib \
-  client::cold_tier::nof::kvcs::executor::standard::tests::live_standard_round_trip_smoke \
-  --offline -- --exact --ignored --test-threads=1
-
-MOONCAKE_SKIP_NATIVE_BUILD=1 \
-  cargo test -p mooncake-store-client --features kvcs-capi --lib \
   client::cold_tier::nof::kvcs::executor::low_level::tests::live_low_level_round_trip_smoke \
   --offline -- --exact --ignored --test-threads=1
 
@@ -456,20 +460,13 @@ MOONCAKE_SKIP_NATIVE_BUILD=1 \
   --offline -- -D warnings
 ```
 
-Live Standard validation requires EFC plus Redis; live Low-Level validation requires EFC plus a
-configured mountpoint:
+Live Low Level validation requires EFC plus a configured mountpoint:
 
 ```shell
 export KVCS_SDK_ROOT=/opt/kvcs-sdk/latest
 export KVCS_SDK_USE_MOCK=0
 export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export MOONCAKE_KVCS_EFC_SOCKET=/var/run/kvcs/efc-grpc.sock
-export MOONCAKE_KVCS_REDIS_ENDPOINTS=tcp://127.0.0.1:6379
-
-MOONCAKE_KVCS_MODE=standard MOONCAKE_SKIP_NATIVE_BUILD=1 \
-  cargo test -p mooncake-store-client --features kvcs-capi --lib \
-  client::cold_tier::nof::kvcs::executor::standard::tests::live_standard_round_trip_smoke \
-  --offline -- --exact --ignored --nocapture --test-threads=1
 
 MOONCAKE_KVCS_MODE=low-level MOONCAKE_SKIP_NATIVE_BUILD=1 \
   cargo test -p mooncake-store-client --features kvcs-capi --lib \
@@ -478,9 +475,8 @@ MOONCAKE_KVCS_MODE=low-level MOONCAKE_SKIP_NATIVE_BUILD=1 \
 ```
 
 The official mock validates ABI marshalling, error handling, and executor behavior. It does not
-exercise real I/O, shared memory, Redis, timeouts, failover, disk faults, capacity, watermarks, or
-performance. It also omits the full shard details needed for a Standard sharded-object read, so
-that path requires live EFC and Redis.
+exercise real I/O, shared memory, timeouts, failover, disk faults, capacity, watermarks, or
+performance, so watermark eviction still needs a live EFC with a configured mountpoint.
 
 ## Compatibility
 

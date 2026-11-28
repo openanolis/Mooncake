@@ -19,25 +19,25 @@ capabilities:
 | Capability | Trait | Responsibility |
 | --- | --- | --- |
 | logical-object I/O | `NofObjectWrite`, `NofObjectRead`, `NofObjectQuery`, `NofObjectDelete` | provider namespace, object, and manifest semantics |
-| provider-addressed physical I/O | `NofPhysicalWrite`, `NofPhysicalRead`, `NofPhysicalQuery`, `NofPhysicalDelete` | complete-object I/O by deterministic key; the provider owns lookup metadata and privately chooses its record layout |
+| provider-addressed physical I/O | `NofPhysicalWrite`, `NofPhysicalRead`, `NofPhysicalDelete` | complete-object I/O by deterministic key; a configured provider target is one placement unit whose bytes Mooncake records in `ObjectRoute.cold_backing` |
 | Mooncake-managed I/O | `NofManagedWrite`, `NofManagedRead`, `NofManagedAllocator` | complete-object I/O that returns an opaque locator; Mooncake persists placement in `ObjectRoute.nof_backing` and the target owner drives reserve/release/recovery through route CAS |
 | health | `NofHealth` | liveness and optional capacity information |
 
 Missing capabilities remain missing. Mooncake does not recreate them with a provider CLI, a
 private service API, or a parallel disk-management implementation.
 
-For KVCS, no provider placement is stored in `ObjectRoute`. Mooncake does not persist a KVCS
-target, owner, locator, manifest, shard map, object length, or checksum. The route keeps only the
-logical object identity. Each request derives the provider key from the stable scoped logical key
-and asks the configured KVCS targets directly. `ObjectRoute.version` is control-plane state and is
-not part of that key. Target and owner information is a request-local I/O descriptor and is never
-published through route CAS or exposed by the admin API.
+KVCS is one provider-addressed physical target and stores one value per logical object, so
+Mooncake owns its placement metadata. `ObjectRoute.cold_backing` records the target, owner,
+locator, length, checksum, commit state and replica set; the locator is derived from the canonical
+key and route version that published the value. Reads use the recorded length and checksum, an
+explicit provider miss removes only the observed replica, and deletion goes through the route.
+Mooncake never asks KVCS to reconstruct metadata and keeps no second client-side metadata cache.
 
-This route-free rule follows metadata authority, not the Standard/Low-Level or logical/physical
-API shape. The included ExtentStore executor is the opposite case: its allocator returns an opaque
-location, so Mooncake persists a distinct `NofBackingRoute`. That route is authoritative for target
-and replica placement and is replayed at startup to rebuild the allocator. Record framing, aligned
-extent layout, and free-range management remain private to ExtentStore. KVCS never enters this
+This placement rule follows metadata authority, not the logical/physical API shape. The included
+ExtentStore executor also persists placement: its allocator returns an opaque location, so
+Mooncake keeps a distinct `NofBackingRoute` that is authoritative for target and replica placement
+and is replayed at startup to rebuild the allocator. Record framing, aligned extent layout, and
+free-range management remain private to ExtentStore. KVCS never enters this
 managed-route path.
 
 ### Target registration and owner assignment
